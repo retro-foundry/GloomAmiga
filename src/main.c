@@ -17,7 +17,8 @@ enum {
   BASE_WIDTH = 320,
   BASE_HEIGHT = 224,
   WIDESCREEN_WIDTH = 400,
-  FIXED_TICK_HZ = 50,
+  GLOOM_AMIGA_GAME_TICK_HZ = 25,
+  FIXED_TICK_HZ = 60,
   GLOOM_MAX_ACTIVE_DOORS = 16,
   GLOOM_MAX_ACTIVE_ROTPOLYS = 32,
   GLOOM_MAX_ROTPOLY_ZONES = 32,
@@ -49,7 +50,7 @@ typedef struct {
   int16_t base_z1;
   int16_t base_x2;
   int16_t base_z2;
-  int16_t frac;
+  float frac;
   int16_t frac_add;
 } RuntimeDoor;
 
@@ -67,7 +68,7 @@ typedef struct {
   size_t first_zone_index;
   uint16_t zone_count;
   int16_t speed;
-  int16_t rot;
+  float rot;
   uint16_t flags;
   int16_t center_x;
   int16_t center_z;
@@ -87,7 +88,7 @@ typedef struct {
   float camera_angle;
   int32_t player_rot_fixed;
   int32_t player_rotspeed;
-  int16_t player_bounce;
+  float player_bounce;
   int16_t player_radius;
   bool triggered_events[GLOOM_EVENT_COUNT + 1];
   bool teleport_active;
@@ -226,12 +227,30 @@ static float clampf(float value, float lo, float hi);
 static int32_t amiga_rotation_to_fixed(int16_t rotation);
 static float amiga_rotation_to_radians(int16_t rotation);
 static float player_rotation_fixed_to_radians(int32_t rotation_fixed);
+static void apply_mouse_look(AppState *state, int mouse_dx);
 static void update_player_camera_y(AppState *state);
 static bool resolve_runtime_file_path(const char *input_path, char *out_path, size_t out_path_size);
 static bool resolve_player_wall_collision(AppState *state, float *x, float *z);
 static void update_rotpolys(AppState *state);
 static void update_doors(AppState *state);
 static void check_event_triggers(AppState *state);
+
+static uint64_t sim_ticks_to_amiga_ticks(uint64_t ticks) {
+  return (ticks * (uint64_t)GLOOM_AMIGA_GAME_TICK_HZ) / (uint64_t)FIXED_TICK_HZ;
+}
+
+static uint8_t amiga_ticks_to_sim_ticks(uint8_t ticks) {
+  uint32_t scaled = ((uint32_t)ticks * (uint32_t)FIXED_TICK_HZ + ((uint32_t)GLOOM_AMIGA_GAME_TICK_HZ / 2u)) /
+                    (uint32_t)GLOOM_AMIGA_GAME_TICK_HZ;
+
+  if (scaled > 255u) {
+    scaled = 255u;
+  }
+  if (scaled == 0u && ticks != 0u) {
+    scaled = 1u;
+  }
+  return (uint8_t)scaled;
+}
 
 static void compute_map_bounds(AppState *state) {
   size_t i = 0;
@@ -1309,6 +1328,7 @@ static uint8_t choose_zone_texture_index(const GloomZone *zone, uint64_t tick_co
   uint8_t sequence[8] = {0};
   size_t count = 0;
   size_t i = 0;
+  uint64_t amiga_ticks = sim_ticks_to_amiga_ticks(tick_count);
 
   if (zone == NULL) {
     return 0u;
@@ -1327,7 +1347,7 @@ static uint8_t choose_zone_texture_index(const GloomZone *zone, uint64_t tick_co
     return sequence[0];
   }
 
-  return sequence[(tick_count / 10u) % count];
+  return sequence[(amiga_ticks / 10u) % count];
 }
 
 static uint32_t sample_wall_texture_argb_ex(const WallTextureSet *set, uint8_t texture_index, float u, float v,
@@ -1685,7 +1705,8 @@ static const ObjectFrame *select_object_visual_frame(const ObjectVisual *visual,
   if (visual->use_fixed_frame) {
     frame_number = visual->fixed_frame;
   } else if (visual->frame_count_per_rotation > 0u) {
-    frame_number = (size_t)(state->tick_count / 8u) % (size_t)visual->frame_count_per_rotation;
+    frame_number = (size_t)(sim_ticks_to_amiga_ticks(state->tick_count) / 8u) %
+                   (size_t)visual->frame_count_per_rotation;
   }
 
   if (visual->eight_rotations && visual->rotation_shift < 8u) {
@@ -1949,9 +1970,48 @@ static int32_t wrap_player_rotation_fixed(int64_t rotation_fixed) {
   return (int32_t)wrapped;
 }
 
-static void update_player_rotation(AppState *state, const PlayerControls *controls, int mouse_dx) {
+static float fixed_step_amiga_scale(void) {
+  return (float)GLOOM_AMIGA_GAME_TICK_HZ / (float)FIXED_TICK_HZ;
+}
+
+static int32_t scale_player_fixed_step_value(int32_t value) {
+  float scaled = (float)value * fixed_step_amiga_scale();
+
+  return scaled >= 0.0f ? (int32_t)(scaled + 0.5f) : (int32_t)(scaled - 0.5f);
+}
+
+static int32_t round_float_to_int32(float value) {
+  return value >= 0.0f ? (int32_t)(value + 0.5f) : (int32_t)(value - 0.5f);
+}
+
+static float wrap_player_bounce_phase(float phase) {
+  while (phase >= 65536.0f) {
+    phase -= 65536.0f;
+  }
+  while (phase < 0.0f) {
+    phase += 65536.0f;
+  }
+  return phase;
+}
+
+static void apply_mouse_look(AppState *state, int mouse_dx) {
+  if (state == NULL || mouse_dx == 0) {
+    return;
+  }
+
+  state->player_rot_fixed =
+      wrap_player_rotation_fixed((int64_t)state->player_rot_fixed +
+                                 ((int64_t)mouse_dx * (int64_t)GLOOM_MOUSE_LOOK_FIXED_PER_PIXEL));
+  state->camera_angle = player_rotation_fixed_to_radians(state->player_rot_fixed);
+}
+
+static void update_player_keyboard_rotation(AppState *state, const PlayerControls *controls) {
   int16_t joyx = 0;
   int16_t joys = 0;
+  int32_t rot_acc = scale_player_fixed_step_value(GLOOM_PLAYER_ROT_ACC);
+  int32_t rot_rev_acc = scale_player_fixed_step_value(GLOOM_PLAYER_ROT_REV_ACC);
+  int32_t rot_set_acc = scale_player_fixed_step_value(GLOOM_PLAYER_ROT_SET_ACC);
+  int32_t max_rot_speed = scale_player_fixed_step_value(GLOOM_PLAYER_MAX_ROT_SPEED);
 
   if (state == NULL) {
     return;
@@ -1963,64 +2023,60 @@ static void update_player_rotation(AppState *state, const PlayerControls *contro
   }
 
   if (joys == 0 && joyx != 0) {
-    int32_t accel = GLOOM_PLAYER_ROT_ACC;
+    int32_t accel = rot_acc;
 
     if ((state->player_rotspeed < 0 && joyx > 0) || (state->player_rotspeed > 0 && joyx < 0)) {
-      accel = GLOOM_PLAYER_ROT_REV_ACC;
+      accel = rot_rev_acc;
     }
     if (joyx < 0) {
       accel = -accel;
     }
 
     state->player_rotspeed += accel;
-    if (state->player_rotspeed > GLOOM_PLAYER_MAX_ROT_SPEED) {
-      state->player_rotspeed = GLOOM_PLAYER_MAX_ROT_SPEED;
-    } else if (state->player_rotspeed < -GLOOM_PLAYER_MAX_ROT_SPEED) {
-      state->player_rotspeed = -GLOOM_PLAYER_MAX_ROT_SPEED;
+    if (state->player_rotspeed > max_rot_speed) {
+      state->player_rotspeed = max_rot_speed;
+    } else if (state->player_rotspeed < -max_rot_speed) {
+      state->player_rotspeed = -max_rot_speed;
     }
   } else if (state->player_rotspeed < 0) {
-    state->player_rotspeed += GLOOM_PLAYER_ROT_SET_ACC;
+    state->player_rotspeed += rot_set_acc;
     if (state->player_rotspeed > 0) {
       state->player_rotspeed = 0;
     }
   } else if (state->player_rotspeed > 0) {
-    state->player_rotspeed -= GLOOM_PLAYER_ROT_SET_ACC;
+    state->player_rotspeed -= rot_set_acc;
     if (state->player_rotspeed < 0) {
       state->player_rotspeed = 0;
     }
   }
 
-  state->player_rot_fixed =
-      wrap_player_rotation_fixed((int64_t)state->player_rot_fixed + (int64_t)state->player_rotspeed +
-                                 ((int64_t)mouse_dx * (int64_t)GLOOM_MOUSE_LOOK_FIXED_PER_PIXEL));
+  state->player_rot_fixed = wrap_player_rotation_fixed((int64_t)state->player_rot_fixed +
+                                                       (int64_t)state->player_rotspeed);
   state->camera_angle = player_rotation_fixed_to_radians(state->player_rot_fixed);
 }
 
 static void advance_player_bounce(AppState *state) {
-  uint16_t bounce = 0u;
-
   if (state == NULL) {
     return;
   }
 
-  bounce = (uint16_t)state->player_bounce;
-  bounce = (uint16_t)(bounce + (uint16_t)GLOOM_PLAYER_BOUNCE_STEP);
-  state->player_bounce = (int16_t)bounce;
+  state->player_bounce =
+      wrap_player_bounce_phase(state->player_bounce + ((float)GLOOM_PLAYER_BOUNCE_STEP * fixed_step_amiga_scale()));
 }
 
 static void settle_player_bounce(AppState *state) {
-  uint16_t bounce = 0u;
+  uint16_t bounce_phase = 0u;
 
-  if (state == NULL || state->player_bounce == 0) {
+  if (state == NULL || state->player_bounce == 0.0f) {
     return;
   }
 
-  bounce = (uint16_t)state->player_bounce;
-  bounce = (uint16_t)(bounce + (uint16_t)GLOOM_PLAYER_UNBOUNCE_STEP);
-  state->player_bounce = (int16_t)bounce;
+  state->player_bounce =
+      wrap_player_bounce_phase(state->player_bounce + ((float)GLOOM_PLAYER_UNBOUNCE_STEP * fixed_step_amiga_scale()));
+  bounce_phase = (uint16_t)state->player_bounce;
 
-  if ((bounce & 127u) < (uint16_t)GLOOM_PLAYER_UNBOUNCE_STEP) {
-    state->player_bounce = 0;
+  if ((bounce_phase & 127u) < (uint16_t)GLOOM_PLAYER_UNBOUNCE_STEP) {
+    state->player_bounce = 0.0f;
   }
 }
 
@@ -2040,6 +2096,7 @@ static void update_player_camera_y(AppState *state) {
 static void update_player_movement(AppState *state, const PlayerControls *controls) {
   float forward = 0.0f;
   float strafe = 0.0f;
+  float move_speed = (float)GLOOM_PLAYER_MOVESPEED * fixed_step_amiga_scale();
   float sin_a = 0.0f;
   float cos_a = 0.0f;
 
@@ -2054,10 +2111,10 @@ static void update_player_movement(AppState *state, const PlayerControls *contro
   }
 
   if (controls->joyy != 0) {
-    forward = -(float)controls->joyy * (float)GLOOM_PLAYER_MOVESPEED;
+    forward = -(float)controls->joyy * move_speed;
   }
   if (controls->joys != 0 && controls->joyx != 0) {
-    strafe = (float)controls->joyx * (float)GLOOM_PLAYER_MOVESPEED;
+    strafe = (float)controls->joyx * move_speed;
   }
 
   sin_a = SDL_sinf(state->camera_angle);
@@ -2082,7 +2139,7 @@ static void update_player_movement(AppState *state, const PlayerControls *contro
   update_player_camera_y(state);
 }
 
-static void update(AppState *state, const uint8_t *keyboard, int mouse_dx) {
+static void update(AppState *state, const uint8_t *keyboard) {
   PlayerControls controls;
 
   state->tick_count += 1;
@@ -2120,7 +2177,7 @@ static void update(AppState *state, const uint8_t *keyboard, int mouse_dx) {
   check_event_triggers(state);
 
   controls = read_modern_player_controls(keyboard);
-  update_player_rotation(state, &controls, mouse_dx);
+  update_player_keyboard_rotation(state, &controls);
   update_player_movement(state, &controls);
 }
 
@@ -2737,7 +2794,7 @@ static void start_pending_teleport(AppState *state, const GloomTeleportCommand *
   }
 
   state->teleport_active = true;
-  state->teleport_ticks = GLOOM_TELEPORT_DELAY_TICKS;
+  state->teleport_ticks = amiga_ticks_to_sim_ticks((uint8_t)GLOOM_TELEPORT_DELAY_TICKS);
   state->teleport_x = command->x;
   state->teleport_z = command->z;
   state->teleport_rotation = command->rotation;
@@ -2902,16 +2959,17 @@ static void update_rotpolys(AppState *state) {
       continue;
     }
 
-    rotpoly->rot = (int16_t)((uint16_t)rotpoly->rot + (uint16_t)rotpoly->speed);
+    rotpoly->rot += (float)rotpoly->speed * fixed_step_amiga_scale();
 
     if ((rotpoly->flags & 1u) != 0u) {
-      int32_t frac = rotpoly->rot;
+      float frac_float = rotpoly->rot;
+      int32_t frac = 0;
 
-      if (frac <= 0) {
-        frac = 0;
+      if (frac_float <= 0.0f) {
+        frac_float = 0.0f;
         rotpoly->speed = (int16_t)-rotpoly->speed;
-      } else if (frac >= 0x4000) {
-        frac = 0x4000;
+      } else if (frac_float >= 16384.0f) {
+        frac_float = 16384.0f;
         if ((rotpoly->flags & 2u) != 0u) {
           rotpoly->speed = (int16_t)-rotpoly->speed;
         } else {
@@ -2919,7 +2977,8 @@ static void update_rotpolys(AppState *state) {
         }
       }
 
-      rotpoly->rot = (int16_t)frac;
+      rotpoly->rot = frac_float;
+      frac = round_float_to_int32(frac_float);
 
       for (zone_index = 0u; zone_index < zone_count; ++zone_index) {
         const RuntimeRotPolyVertex *vertex = &rotpoly->vertices[zone_index];
@@ -2932,12 +2991,22 @@ static void update_rotpolys(AppState *state) {
         new_z[zone_index] = clamp_int16((int32_t)vertex->base_z + move_z);
       }
     } else {
+      int16_t rot_word = 0;
+
+      while (rotpoly->rot >= 65536.0f) {
+        rotpoly->rot -= 65536.0f;
+      }
+      while (rotpoly->rot < 0.0f) {
+        rotpoly->rot += 65536.0f;
+      }
+      rot_word = (int16_t)((uint16_t)round_float_to_int32(rotpoly->rot));
+
       for (zone_index = 0u; zone_index < zone_count; ++zone_index) {
         const RuntimeRotPolyVertex *vertex = &rotpoly->vertices[zone_index];
         int16_t rel_x = 0;
         int16_t rel_z = 0;
 
-        rotate_amiga_1024(vertex->base_x, vertex->base_z, rotpoly->rot, &rel_x, &rel_z);
+        rotate_amiga_1024(vertex->base_x, vertex->base_z, rot_word, &rel_x, &rel_z);
         new_x[zone_index] = clamp_int16((int32_t)rotpoly->center_x + (int32_t)rel_x);
         new_z[zone_index] = clamp_int16((int32_t)rotpoly->center_z + (int32_t)rel_z);
       }
@@ -2958,13 +3027,15 @@ static void update_rotpolys(AppState *state) {
         recalculate_zone_vectors(&state->map.zones[first_zone + zone_index]);
       }
     } else {
+      int16_t rot_word = (int16_t)((uint16_t)round_float_to_int32(rotpoly->rot));
+
       for (zone_index = 0u; zone_index < zone_count; ++zone_index) {
         const RuntimeRotPolyVertex *vertex = &rotpoly->vertices[zone_index];
         GloomZone *zone = &state->map.zones[first_zone + zone_index];
         int16_t na = 0;
         int16_t nb = 0;
 
-        rotate_amiga_1024(vertex->base_na, vertex->base_nb, rotpoly->rot, &na, &nb);
+        rotate_amiga_1024(vertex->base_na, vertex->base_nb, rot_word, &na, &nb);
         zone->na = na;
         zone->nb = nb;
         zone->a = clamp_int16(-(int32_t)nb);
@@ -2984,7 +3055,7 @@ static void update_doors(AppState *state) {
   for (i = 0u; i < GLOOM_MAX_ACTIVE_DOORS; ++i) {
     RuntimeDoor *door = &state->doors[i];
     GloomZone *zone = NULL;
-    int32_t frac = 0;
+    int32_t frac_fixed = 0;
     int32_t width_x = 0;
     int32_t width_z = 0;
     int32_t move_x = 0;
@@ -2995,28 +3066,28 @@ static void update_doors(AppState *state) {
     }
 
     zone = &state->map.zones[door->zone_index];
-    frac = (int32_t)door->frac + (int32_t)door->frac_add;
-    if (frac < 0) {
-      frac = 0;
+    door->frac += (float)door->frac_add * fixed_step_amiga_scale();
+    if (door->frac < 0.0f) {
+      door->frac = 0.0f;
     }
-    if (frac > 0x4000) {
-      frac = 0x4000;
+    if (door->frac > 16384.0f) {
+      door->frac = 16384.0f;
     }
 
-    door->frac = (int16_t)frac;
-    zone->event_id = (int16_t)(uint16_t)(frac * 2);
+    frac_fixed = round_float_to_int32(door->frac);
+    zone->event_id = (int16_t)(uint16_t)(frac_fixed * 2);
 
     width_x = (int32_t)door->base_x2 - (int32_t)door->base_x1;
     width_z = (int32_t)door->base_z2 - (int32_t)door->base_z1;
-    move_x = amiga_arithmetic_shift_right_16((int64_t)width_x * (int64_t)frac * 4);
-    move_z = amiga_arithmetic_shift_right_16((int64_t)width_z * (int64_t)frac * 4);
+    move_x = amiga_arithmetic_shift_right_16((int64_t)width_x * (int64_t)frac_fixed * 4);
+    move_z = amiga_arithmetic_shift_right_16((int64_t)width_z * (int64_t)frac_fixed * 4);
 
     zone->x1 = (int16_t)((int32_t)door->base_x1 - move_x);
     zone->z1 = (int16_t)((int32_t)door->base_z1 - move_z);
     zone->x2 = (int16_t)((int32_t)zone->x1 + width_x);
     zone->z2 = (int16_t)((int32_t)zone->z1 + width_z);
 
-    if (frac == 0 || frac == 0x4000) {
+    if (frac_fixed == 0 || frac_fixed == 0x4000) {
       door->active = false;
     }
   }
@@ -3676,6 +3747,97 @@ static void update_render_dimensions(SDL_Renderer *renderer, bool classic_viewpo
   }
 }
 
+static int16_t interpolate_int16(int16_t previous, int16_t current, float alpha) {
+  return clamp_int16(round_float_to_int32((float)previous + (((float)current - (float)previous) * alpha)));
+}
+
+static bool zone_event_id_is_open_progress(int16_t event_id) {
+  uint16_t raw = (uint16_t)event_id;
+
+  return raw > (uint16_t)GLOOM_EVENT_COUNT && raw <= 32768u;
+}
+
+static void interpolate_render_zones(const AppState *previous, const AppState *current, float alpha,
+                                     GloomZone *render_zones, size_t render_zone_count) {
+  size_t i = 0u;
+
+  if (previous == NULL || current == NULL || render_zones == NULL || previous->map.zones == NULL ||
+      current->map.zones == NULL || render_zone_count != current->map.zone_count ||
+      previous->map.zone_count != current->map.zone_count) {
+    return;
+  }
+
+  memcpy(render_zones, current->map.zones, current->map.zone_count * sizeof(*render_zones));
+
+  for (i = 0u; i < current->map.zone_count; ++i) {
+    const GloomZone *prev_zone = &previous->map.zones[i];
+    const GloomZone *cur_zone = &current->map.zones[i];
+    GloomZone *render_zone = &render_zones[i];
+    bool endpoints_changed = prev_zone->x1 != cur_zone->x1 || prev_zone->z1 != cur_zone->z1 ||
+                             prev_zone->x2 != cur_zone->x2 || prev_zone->z2 != cur_zone->z2;
+
+    if (endpoints_changed) {
+      render_zone->x1 = interpolate_int16(prev_zone->x1, cur_zone->x1, alpha);
+      render_zone->z1 = interpolate_int16(prev_zone->z1, cur_zone->z1, alpha);
+      render_zone->x2 = interpolate_int16(prev_zone->x2, cur_zone->x2, alpha);
+      render_zone->z2 = interpolate_int16(prev_zone->z2, cur_zone->z2, alpha);
+      recalculate_zone_vectors(render_zone);
+    }
+
+    if (zone_event_id_is_open_progress(prev_zone->event_id) || zone_event_id_is_open_progress(cur_zone->event_id)) {
+      uint16_t prev_open = (uint16_t)prev_zone->event_id;
+      uint16_t cur_open = (uint16_t)cur_zone->event_id;
+      int32_t open = round_float_to_int32((float)prev_open + (((float)cur_open - (float)prev_open) * alpha));
+
+      if (open < 0) open = 0;
+      if (open > 32768) open = 32768;
+      render_zone->event_id = (int16_t)(uint16_t)open;
+    }
+  }
+}
+
+static AppState interpolate_render_state(const AppState *previous, const AppState *current, float alpha,
+                                         GloomZone *render_zones, size_t render_zone_count) {
+  AppState render_state;
+  float dx = 0.0f;
+  float dz = 0.0f;
+  float dy = 0.0f;
+
+  if (current == NULL) {
+    memset(&render_state, 0, sizeof(render_state));
+    return render_state;
+  }
+
+  render_state = *current;
+  if (previous == NULL) {
+    return render_state;
+  }
+
+  alpha = clampf(alpha, 0.0f, 1.0f);
+  interpolate_render_zones(previous, current, alpha, render_zones, render_zone_count);
+  if (render_zones != NULL && render_zone_count == current->map.zone_count) {
+    render_state.map.zones = render_zones;
+  }
+
+  dx = current->camera_x - previous->camera_x;
+  dz = current->camera_z - previous->camera_z;
+  dy = current->camera_y - previous->camera_y;
+
+  if (dx < 0.0f) dx = -dx;
+  if (dz < 0.0f) dz = -dz;
+  if (dy < 0.0f) dy = -dy;
+
+  if (!previous->teleport_active && !current->teleport_active && dx < 512.0f && dz < 512.0f && dy < 64.0f) {
+    render_state.camera_x = previous->camera_x + ((current->camera_x - previous->camera_x) * alpha);
+    render_state.camera_z = previous->camera_z + ((current->camera_z - previous->camera_z) * alpha);
+    render_state.camera_y = previous->camera_y + ((current->camera_y - previous->camera_y) * alpha);
+  }
+
+  render_state.player_rot_fixed = current->player_rot_fixed;
+  render_state.camera_angle = current->camera_angle;
+  return render_state;
+}
+
 int main(int argc, char **argv) {
   const char *map_path = "amiga/maps/map1_1";
   const char *resolved_map_path = map_path;
@@ -3687,6 +3849,8 @@ int main(int argc, char **argv) {
   WallTextureSet wall_textures;
   FlatTextureSet flat_textures;
   ObjectVisualSet object_visuals;
+  GloomZone *previous_zones = NULL;
+  GloomZone *render_zones = NULL;
   uint64_t perf_frequency = 0;
   uint64_t perf_prev = 0;
   double accumulator = 0.0;
@@ -3698,6 +3862,7 @@ int main(int argc, char **argv) {
   int render_height = BASE_HEIGHT;
   bool classic_viewport = false;
   AppState state;
+  AppState previous_state;
 
   memset(&grid_offsets, 0, sizeof(grid_offsets));
   memset(&wall_textures, 0, sizeof(wall_textures));
@@ -3754,6 +3919,7 @@ int main(int argc, char **argv) {
   }
 
   memset(&state, 0, sizeof(state));
+  memset(&previous_state, 0, sizeof(previous_state));
 
   if (!gloom_map_load(resolved_map_path, &state.map, error, sizeof(error))) {
     fprintf(stderr, "Map parse failed: %s\n", error[0] ? error : "unknown error");
@@ -3818,8 +3984,28 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  if (state.map.zone_count > 0u) {
+    previous_zones = (GloomZone *)malloc(state.map.zone_count * sizeof(*previous_zones));
+    render_zones = (GloomZone *)malloc(state.map.zone_count * sizeof(*render_zones));
+    if (previous_zones == NULL || render_zones == NULL) {
+      fprintf(stderr, "Out of memory while preparing render interpolation zone buffers\n");
+      free(previous_zones);
+      free(render_zones);
+      free_grid_offset_set(&grid_offsets);
+      free_object_visual_set(&object_visuals);
+      free_flat_texture_set(&flat_textures);
+      free_wall_texture_set(&wall_textures);
+      gloom_map_free(&state.map);
+      return 1;
+    }
+    memcpy(previous_zones, state.map.zones, state.map.zone_count * sizeof(*previous_zones));
+    memcpy(render_zones, state.map.zones, state.map.zone_count * sizeof(*render_zones));
+  }
+
   if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
     fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
+    free(previous_zones);
+    free(render_zones);
     free_grid_offset_set(&grid_offsets);
     free_object_visual_set(&object_visuals);
     free_flat_texture_set(&flat_textures);
@@ -3833,6 +4019,8 @@ int main(int argc, char **argv) {
   if (window == NULL) {
     fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
     SDL_Quit();
+    free(previous_zones);
+    free(render_zones);
     free_grid_offset_set(&grid_offsets);
     free_object_visual_set(&object_visuals);
     free_flat_texture_set(&flat_textures);
@@ -3841,7 +4029,7 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+  renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
   if (renderer == NULL) {
     renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
   }
@@ -3849,6 +4037,8 @@ int main(int argc, char **argv) {
     fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
     SDL_DestroyWindow(window);
     SDL_Quit();
+    free(previous_zones);
+    free(render_zones);
     free_grid_offset_set(&grid_offsets);
     free_object_visual_set(&object_visuals);
     free_flat_texture_set(&flat_textures);
@@ -3863,11 +4053,17 @@ int main(int argc, char **argv) {
   (void)SDL_SetRelativeMouseMode(SDL_TRUE);
   (void)SDL_ShowCursor(SDL_DISABLE);
 
+  previous_state = state;
+  if (previous_zones != NULL) {
+    previous_state.map.zones = previous_zones;
+  }
   perf_frequency = SDL_GetPerformanceFrequency();
   perf_prev = SDL_GetPerformanceCounter();
 
   while (running) {
     SDL_Event event;
+    AppState render_state;
+    float render_alpha = 0.0f;
     uint64_t perf_now = SDL_GetPerformanceCounter();
     double elapsed = (double)(perf_now - perf_prev) / (double)perf_frequency;
     perf_prev = perf_now;
@@ -3891,12 +4087,18 @@ int main(int argc, char **argv) {
       }
     }
 
+    apply_mouse_look(&state, mouse_dx_accum);
+    mouse_dx_accum = 0;
+
     while (accumulator >= dt) {
       const uint8_t *keyboard = SDL_GetKeyboardState(NULL);
-      int mouse_dx = mouse_dx_accum;
-      mouse_dx_accum = 0;
 
-      update(&state, keyboard, mouse_dx);
+      previous_state = state;
+      if (previous_zones != NULL) {
+        memcpy(previous_zones, state.map.zones, state.map.zone_count * sizeof(*previous_zones));
+        previous_state.map.zones = previous_zones;
+      }
+      update(&state, keyboard);
       accumulator -= dt;
     }
 
@@ -3909,10 +4111,14 @@ int main(int argc, char **argv) {
     }
 
     update_render_dimensions(renderer, classic_viewport, &render_width, &render_height);
-    render(renderer, &state, &grid_offsets, &wall_textures, &flat_textures, &object_visuals, render_width,
+    render_alpha = (float)(accumulator / dt);
+    render_state = interpolate_render_state(&previous_state, &state, render_alpha, render_zones, state.map.zone_count);
+    render(renderer, &render_state, &grid_offsets, &wall_textures, &flat_textures, &object_visuals, render_width,
            render_height);
   }
 
+  free(previous_zones);
+  free(render_zones);
   free_grid_offset_set(&grid_offsets);
   free_object_visual_set(&object_visuals);
   free_flat_texture_set(&flat_textures);
