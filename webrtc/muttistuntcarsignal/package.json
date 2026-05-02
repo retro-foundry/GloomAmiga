@@ -1,0 +1,16 @@
+{
+  "name": "gloom-tiny-signal",
+  "private": true,
+  "devDependencies": {
+    "wrangler": "^4.74.0"
+  },
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": ""
+}

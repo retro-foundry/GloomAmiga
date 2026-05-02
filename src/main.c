@@ -9,6 +9,10 @@
 #include "iff.h"
 #include "map.h"
 
+#ifdef __EMSCRIPTEN__
+#include <emscripten.h>
+#endif
+
 #ifdef _WIN32
 #include <windows.h>
 #endif
@@ -32,6 +36,7 @@ enum {
   GLOOM_MAX_ROTPOLY_ZONES = 32,
   GLOOM_LEVEL_EXIT_EVENT_ID = 24,
   GLOOM_LEVEL_COMPLETE_FINISHED = 3,
+  GLOOM_COMBAT_ROUND_FINISHED = 4,
   GLOOM_AMIGA_FOCAL_SHIFT = 6,
   GLOOM_AMIGA_FOCAL = 1 << GLOOM_AMIGA_FOCAL_SHIFT,
   GLOOM_AMIGA_VIEW_COLUMNS = 106,
@@ -48,6 +53,7 @@ enum {
   GLOOM_PLAYER_MAX_ROT_SPEED = 0x40000,
   GLOOM_PLAYER_BOUNCE_STEP = 20,
   GLOOM_PLAYER_UNBOUNCE_STEP = 30,
+  GLOOM_PLAYER_FRAME_SPEED_FIXED = 0x6000,
   GLOOM_PLAYER_BOB_HEIGHT = 20,
   GLOOM_PLAYER_INITIAL_HEALTH = 25,
   GLOOM_PLAYER_RED_PAL_TIMER = 2,
@@ -99,7 +105,28 @@ enum {
   GLOOM_GUN_SIDE_LIFT = 4,
   GLOOM_PLAYER_INITIAL_LIVES = 3,
   GLOOM_AUDIO_CHANNEL_COUNT = 4,
-  GLOOM_PAULA_PAL_CLOCK_HZ = 3546895
+  GLOOM_PAULA_PAL_CLOCK_HZ = 3546895,
+  GLOOM_UI_BEEP_HZ = 880,
+  GLOOM_UI_BEEP_MS = 45,
+  GLOOM_UI_SELECT_BEEP_HZ = 1320,
+  GLOOM_UI_SELECT_BEEP_MS = 55,
+  GLOOM_MENU_BIG_FONT_WIDTH = 8,
+  GLOOM_MENU_BIG_FONT_HEIGHT = 10,
+  GLOOM_MENU_FLASH_TICKS = 13,
+  GLOOM_GAMEPAD_COUNT = 2,
+  GLOOM_GAMEPAD_MOVE_DEADZONE = 8000,
+  GLOOM_GAMEPAD_LOOK_DEADZONE = 7000,
+  GLOOM_GAMEPAD_MOVE_THRESHOLD = 7000,
+  GLOOM_GAMEPAD_TRIGGER_THRESHOLD = 12000,
+  GLOOM_GAMEPAD_LOOK_AXIS_TO_MOUSE_DIV = 1500,
+  GLOOM_GAMEPAD_LOOK_MIN_DELTA_AXIS = 12000,
+  GLOOM_WEBRTC_INPUT_LEFT = 1,
+  GLOOM_WEBRTC_INPUT_RIGHT = 2,
+  GLOOM_WEBRTC_INPUT_FORWARD = 4,
+  GLOOM_WEBRTC_INPUT_BACK = 8,
+  GLOOM_WEBRTC_INPUT_STRAFE_LEFT = 16,
+  GLOOM_WEBRTC_INPUT_STRAFE_RIGHT = 32,
+  GLOOM_WEBRTC_INPUT_FIRE = 64
 };
 
 enum {
@@ -176,6 +203,11 @@ typedef struct {
   SfxSample samples[GLOOM_SFX_COUNT];
   AudioChannel channels[GLOOM_AUDIO_CHANNEL_COUNT];
   uint8_t last_grunt;
+  uint32_t ui_beep_remaining;
+  uint32_t ui_beep_total;
+  double ui_beep_phase;
+  double ui_beep_phase_step;
+  float ui_beep_volume;
 } AudioSystem;
 
 typedef struct {
@@ -216,6 +248,7 @@ typedef struct {
   bool barrel_origin;
   bool enemy;
   bool homing;
+  uint8_t player_owner_index;
   uint8_t bounce_count;
   float x;
   float y;
@@ -311,6 +344,7 @@ typedef struct {
   int32_t player_rot_fixed;
   int32_t player_rotspeed;
   float player_bounce;
+  uint32_t player_frame_fixed;
   float player_eye_y;
   int16_t player_hitpoints;
   int16_t player_lives;
@@ -351,6 +385,7 @@ typedef struct {
   int32_t player_rot_fixed;
   int32_t player_rotspeed;
   float player_bounce;
+  uint32_t player_frame_fixed;
   float player_eye_y;
   int16_t player_hitpoints;
   int16_t player_lives;
@@ -382,6 +417,11 @@ typedef struct {
   int16_t player_respawn_z;
   int16_t player_respawn_rotation;
   bool two_player_mode;
+  bool combat_mode;
+  uint8_t combat_series;
+  int16_t combat_start_lives;
+  uint8_t combat_maps[8];
+  int16_t combat_maps_left;
   uint8_t active_player_index;
   int16_t active_other_player_lives;
   RuntimePlayerState player2;
@@ -422,6 +462,7 @@ typedef struct {
 typedef struct {
   SDL_Texture *texture;
   uint32_t *pixels;
+  uint32_t *last_frame_pixels;
   float *depth_buffer;
   float *sprite_depth_buffer;
   uint32_t *filled_stamps;
@@ -430,6 +471,40 @@ typedef struct {
   int width;
   int height;
 } RenderFramebuffer;
+
+typedef struct {
+  char picture[64];
+  char text[192];
+} ScriptCompletion;
+
+typedef enum {
+  SCRIPT_PLAY_NEXT_ERROR = 0,
+  SCRIPT_PLAY_NEXT_MAP = 1,
+  SCRIPT_PLAY_NEXT_DONE = 2
+} ScriptPlayNextResult;
+
+typedef enum {
+  PAUSE_MENU_QUIT = -1,
+  PAUSE_MENU_CONTINUE = 0,
+  PAUSE_MENU_MAIN_MENU = 1
+} PauseMenuResult;
+
+typedef enum {
+  GLOOM_GAME_MODE_ONE_PLAYER = 0,
+  GLOOM_GAME_MODE_TWO_PLAYER = 1,
+  GLOOM_GAME_MODE_COMBAT = 2
+} GloomGameMode;
+
+typedef enum {
+  GLOOM_CONTROL_KEYBOARD = 0,
+  GLOOM_CONTROL_GAMEPAD_1 = 1,
+  GLOOM_CONTROL_GAMEPAD_2 = 2
+} GloomControlSource;
+
+typedef struct {
+  GloomControlSource player1;
+  GloomControlSource player2;
+} RuntimeControlConfig;
 
 typedef struct {
   uint32_t *argb_pixels;
@@ -443,6 +518,18 @@ typedef struct {
   size_t glyph_count;
   HudGlyph *glyphs;
 } HudFont;
+
+typedef struct {
+  bool loaded;
+  uint32_t *pixels;
+  int width;
+  int height;
+} MenuImage;
+
+typedef struct {
+  MenuImage title;
+  HudFont big_font;
+} MenuAssets;
 
 enum {
   GLOOM_FLAT_TEXTURE_SIZE = 128,
@@ -633,9 +720,24 @@ typedef struct {
   bool fire;
 } PlayerControls;
 
+typedef struct {
+  float screen_x;
+  float screen_y;
+  float screen_w;
+  float screen_h;
+  float depth;
+  const ObjectFrame *frame;
+} DebugSprite;
+
+typedef struct {
+  SDL_GameController *controller;
+  SDL_JoystickID instance_id;
+} RuntimeGamepad;
+
 static float clampf(float value, float lo, float hi);
 static int32_t amiga_rotation_to_fixed(int16_t rotation);
 static float amiga_rotation_to_radians(int16_t rotation);
+static int16_t player_rotation_fixed_to_amiga(int32_t rotation_fixed);
 static float player_rotation_fixed_to_radians(int32_t rotation_fixed);
 static void apply_mouse_look(AppState *state, int mouse_dx);
 static void update_player_camera_y(AppState *state);
@@ -659,6 +761,7 @@ static const ObjectCombatDefinition *object_type_combat_definition(int16_t objec
 static bool object_type_is_enemy(int16_t object_type);
 static bool object_type_is_pickup(int16_t object_type);
 static bool object_type_is_player(int16_t object_type);
+static int runtime_object_collides_player_index(const AppState *state, const RuntimeObjectState *object);
 static void initialize_runtime_objects(AppState *state);
 static uint16_t runtime_random_word(AppState *state);
 static bool spawn_enemy_projectile_params(AppState *state, const RuntimeObjectState *object, uint8_t weapon_index,
@@ -671,6 +774,34 @@ static bool audio_start(AudioSystem *audio);
 static void audio_shutdown(AudioSystem *audio);
 static void audio_play_sfx(int sfx_id, int volume, int priority);
 static void audio_vblank_tick(void);
+static void audio_pause_output(AudioSystem *audio, bool paused, bool clear_channels);
+static void gamepad_init(void);
+static void gamepad_shutdown(void);
+static void gamepad_handle_device_added(int device_index);
+static void gamepad_handle_device_removed(SDL_JoystickID instance_id);
+static PlayerControls read_gamepad_player_controls(size_t gamepad_index, unsigned player_index);
+static PlayerControls read_webrtc_player2_controls(void);
+static int gamepad_look_delta(size_t gamepad_index);
+static bool gamepad_button_down(size_t gamepad_index, SDL_GameControllerButton button);
+static bool gamepad_menu_activate_event(const SDL_Event *event);
+static bool gamepad_menu_back_event(const SDL_Event *event);
+static void gamepad_handle_event(const SDL_Event *event);
+static int control_source_gamepad_index(GloomControlSource source);
+static const char *control_source_menu_name(GloomControlSource source);
+static void normalize_control_config(RuntimeControlConfig *config);
+static void cycle_control_config(RuntimeControlConfig *config, unsigned player_index);
+static bool player1_receives_keyboard_input(void);
+static bool set_runtime_mouse_capture(SDL_Window *window, bool captured);
+static void runtime_force_cursor_visible(void);
+void runtime_emscripten_install_pointer_lock_listener(void);
+static bool runtime_emscripten_consume_pointer_lock_lost(void);
+void runtime_emscripten_canvas_cursor_default(void);
+void runtime_emscripten_install_fullscreen_listeners(void);
+void runtime_emscripten_canvas_fullscreen_toggle(void);
+static bool runtime_emscripten_consume_fullscreen_resize(void);
+static void select_aspect_720p_resolution(int *io_width, int *io_height);
+static void initialize_combat_rotation_state(AppState *state, uint8_t series, int16_t start_lives);
+static bool resolve_next_combat_map(AppState *state, char *out_map_path, size_t out_map_path_size);
 static void initialize_wall_texture_remap(AppState *state);
 static void update_wall_animations(AppState *state);
 static void update_rotpolys(AppState *state);
@@ -680,6 +811,11 @@ static void update_with_controls(AppState *state, const PlayerControls *controls
                                  const ObjectVisualSet *object_visuals);
 
 static AudioSystem g_audio;
+static RuntimeGamepad g_gamepads[GLOOM_GAMEPAD_COUNT];
+static RuntimeControlConfig g_control_config = {GLOOM_CONTROL_KEYBOARD, GLOOM_CONTROL_GAMEPAD_1};
+static bool g_webrtc_guest_connected = false;
+static uint32_t g_webrtc_guest_player2_input = 0u;
+static bool g_runtime_mouse_capture_active = false;
 static bool g_depth_tables_initialized = false;
 static uint8_t g_depth_dark_indices[GLOOM_AMIGA_MAX_Z];
 static uint8_t g_depth_subtract_values[GLOOM_AMIGA_MAX_Z];
@@ -884,6 +1020,7 @@ static bool initialize_camera_from_map_spawn(AppState *state) {
   state->player_rot_fixed = amiga_rotation_to_fixed(spawn->rotation);
   state->player_rotspeed = 0;
   state->player_bounce = 0;
+  state->player_frame_fixed = 0u;
   state->player_eye_y = (float)GLOOM_PLAYER_EYE_Y;
   state->player_hitpoints = GLOOM_PLAYER_INITIAL_HEALTH;
   state->player_lives = GLOOM_PLAYER_INITIAL_LIVES;
@@ -909,6 +1046,9 @@ static bool initialize_camera_from_map_spawn(AppState *state) {
   state->finished2 = 0;
   state->level_transition_reported = false;
   state->lock_teleport_reported = false;
+  if (state->combat_mode && state->combat_start_lives > 0) {
+    state->player_lives = state->combat_start_lives;
+  }
   state->rng_state = 0x47524F4Fu ^ ((uint32_t)(uint16_t)spawn->x << 16u) ^ (uint32_t)(uint16_t)spawn->z;
   state->violence_mode = GLOOM_VIOLENCE_MEATY_MESSY;
   state->camera_angle = player_rotation_fixed_to_radians(state->player_rot_fixed);
@@ -921,9 +1061,13 @@ static bool initialize_camera_from_map_spawn(AppState *state) {
   state->player2.player_respawn_rotation = spawn2->rotation;
   state->player2.player_rot_fixed = amiga_rotation_to_fixed(spawn2->rotation);
   state->player2.camera_angle = player_rotation_fixed_to_radians(state->player2.player_rot_fixed);
+  state->player2.player_frame_fixed = 0u;
   state->player2.player_eye_y = (float)GLOOM_PLAYER_EYE_Y;
   state->player2.player_hitpoints = GLOOM_PLAYER_INITIAL_HEALTH;
   state->player2.player_lives = GLOOM_PLAYER_INITIAL_LIVES;
+  if (state->combat_mode && state->combat_start_lives > 0) {
+    state->player2.player_lives = state->combat_start_lives;
+  }
   state->player2.player_reload = (uint8_t)GLOOM_PLAYER_INITIAL_RELOAD;
   state->player2.camera_y = state->player2.player_eye_y;
   return true;
@@ -1311,6 +1455,7 @@ static void audio_callback(void *userdata, Uint8 *stream, int len) {
   float *out = (float *)stream;
   int frames = len / (int)(sizeof(float) * 2u);
   int frame = 0;
+  static const double pi = 3.14159265358979323846;
 
   memset(stream, 0, (size_t)len);
   if (audio == NULL) {
@@ -1341,7 +1486,7 @@ static void audio_callback(void *userdata, Uint8 *stream, int len) {
         continue;
       }
 
-      if (channel->busy_passes > 1u) {
+      if (channel->busy_passes > 0u) {
         value = (float)sample->samples[sample_index] / 128.0f;
         scaled = value * ((float)channel->volume / 64.0f);
         if (channel_index == 1 || channel_index == 2) {
@@ -1353,15 +1498,21 @@ static void audio_callback(void *userdata, Uint8 *stream, int len) {
 
       channel->position += channel->increment;
       if (channel->position >= (double)sample->sample_count) {
-        if (channel->busy_passes > 1u) {
-          channel->busy_passes -= 1u;
-          while (channel->position >= (double)sample->sample_count) {
-            channel->position -= (double)sample->sample_count;
-          }
-        } else {
-          channel->active = false;
-        }
+        channel->active = false;
       }
+    }
+
+    if (audio->ui_beep_remaining > 0u && audio->ui_beep_total > 0u) {
+      float envelope = (float)audio->ui_beep_remaining / (float)audio->ui_beep_total;
+      float value = SDL_sinf((float)audio->ui_beep_phase) * audio->ui_beep_volume * envelope;
+
+      left += value;
+      right += value;
+      audio->ui_beep_phase += audio->ui_beep_phase_step;
+      if (audio->ui_beep_phase >= pi * 2.0) {
+        audio->ui_beep_phase -= pi * 2.0;
+      }
+      audio->ui_beep_remaining -= 1u;
     }
 
     out[frame * 2] = clampf(left, -1.0f, 1.0f);
@@ -1432,7 +1583,7 @@ static void audio_start_channel_locked(AudioSystem *audio, AudioChannel *channel
   channel->sfx_id = sfx_id;
   channel->volume = volume < 0 ? 0 : (volume > 64 ? 64 : volume);
   channel->priority = priority;
-  channel->busy_passes = 2u;
+  channel->busy_passes = 1u;
   channel->position = 0.0;
   channel->increment = sample->sample_rate / (double)audio->obtained.freq;
 }
@@ -1473,6 +1624,41 @@ static void audio_play_sfx(int sfx_id, int volume, int priority) {
   SDL_UnlockAudioDevice(audio->device);
 }
 
+static void audio_play_ui_beep(int hz, int duration_ms, float volume) {
+  AudioSystem *audio = &g_audio;
+  uint32_t total = 0u;
+
+  if (!audio->initialized || audio->device == 0u || audio->obtained.freq <= 0) {
+    return;
+  }
+
+  total = (uint32_t)((audio->obtained.freq * duration_ms) / 1000);
+  if (total == 0u) {
+    total = 1u;
+  }
+
+  SDL_LockAudioDevice(audio->device);
+  audio->ui_beep_total = total;
+  audio->ui_beep_remaining = total;
+  audio->ui_beep_phase = 0.0;
+  audio->ui_beep_phase_step =
+      (2.0 * 3.14159265358979323846 * (double)hz) / (double)audio->obtained.freq;
+  audio->ui_beep_volume = volume;
+  SDL_UnlockAudioDevice(audio->device);
+}
+
+static void audio_play_ui_move(void) {
+  audio_play_ui_beep(GLOOM_UI_BEEP_HZ, GLOOM_UI_BEEP_MS, 0.12f);
+}
+
+static void audio_play_ui_activate(void) {
+  audio_play_ui_beep(GLOOM_UI_SELECT_BEEP_HZ, GLOOM_UI_SELECT_BEEP_MS, 0.22f);
+}
+
+static void audio_play_ui_back(void) {
+  audio_play_ui_beep(GLOOM_UI_BEEP_HZ, GLOOM_UI_BEEP_MS, 0.12f);
+}
+
 static void audio_vblank_tick(void) {
   AudioSystem *audio = &g_audio;
   int i = 0;
@@ -1501,6 +1687,24 @@ static void audio_vblank_tick(void) {
     }
   }
   SDL_UnlockAudioDevice(audio->device);
+}
+
+static void audio_pause_output(AudioSystem *audio, bool paused, bool clear_channels) {
+  if (audio == NULL || !audio->initialized || audio->device == 0u) {
+    return;
+  }
+
+  if (clear_channels) {
+    SDL_LockAudioDevice(audio->device);
+    memset(audio->channels, 0, sizeof(audio->channels));
+    audio->ui_beep_remaining = 0u;
+    audio->ui_beep_total = 0u;
+    audio->ui_beep_phase = 0.0;
+    audio->ui_beep_phase_step = 0.0;
+    audio->ui_beep_volume = 0.0f;
+    SDL_UnlockAudioDevice(audio->device);
+  }
+  SDL_PauseAudioDevice(audio->device, paused ? 1 : 0);
 }
 
 static void trim_trailing_slashes(char *path) {
@@ -1705,6 +1909,24 @@ static bool resolve_object_asset_path(const char *name, char *out_path, size_t o
 static bool resolve_hud_font_path(char *out_path, size_t out_path_size) {
   const char *candidates[4] = {"amiga/misc/smallfont2.bin", "amiga/prog/misc/smallfont2.bin", "misc/smallfont2.bin",
                                "data/misc/smallfont2.bin"};
+  size_t i = 0u;
+
+  if (out_path == NULL || out_path_size == 0u) {
+    return false;
+  }
+
+  for (i = 0u; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
+    if (resolve_runtime_file_path(candidates[i], out_path, out_path_size)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+static bool resolve_menu_big_font_path(char *out_path, size_t out_path_size) {
+  const char *candidates[4] = {"amiga/misc/bigfont2.bin", "amiga/prog/misc/bigfont.bin", "misc/bigfont2.bin",
+                               "data/misc/bigfont2.bin"};
   size_t i = 0u;
 
   if (out_path == NULL || out_path_size == 0u) {
@@ -2094,7 +2316,7 @@ static bool load_hud_font(HudFont *font) {
     uint32_t *pixels = NULL;
     int py = 0;
 
-    if (glyph_offset + 8u > glyph_limit || glyph_limit > palette_offset || glyph_limit > data_size) {
+    if (glyph_offset + 10u > glyph_limit || glyph_limit > palette_offset || glyph_limit > data_size) {
       fprintf(stderr, "HUD font %s glyph %zu is out of bounds\n", resolved_path, glyph_index);
       goto fail;
     }
@@ -2169,6 +2391,162 @@ static bool load_hud_font(HudFont *font) {
 
   free(data);
   printf("Loaded %zu HUD glyphs from original smallfont shape table\n", glyph_count);
+  return true;
+
+fail:
+  for (glyph_index = 0u; glyph_index < glyph_count; ++glyph_index) {
+    free(glyphs[glyph_index].argb_pixels);
+  }
+  free(glyphs);
+  free(data);
+  return false;
+}
+
+static bool load_menu_big_font(HudFont *font) {
+  char resolved_path[1024] = {0};
+  uint8_t *data = NULL;
+  size_t data_size = 0u;
+  char error[256] = {0};
+  uint32_t palette_offset = 0u;
+  uint32_t first_glyph_offset = 0u;
+  size_t glyph_count = 0u;
+  HudGlyph *glyphs = NULL;
+  uint32_t palette[256];
+  size_t glyph_index = 0u;
+
+  if (font == NULL) {
+    return false;
+  }
+
+  free_hud_font(font);
+
+  if (!resolve_menu_big_font_path(resolved_path, sizeof(resolved_path))) {
+    fprintf(stderr, "Missing original menu font amiga/misc/bigfont2.bin\n");
+    return false;
+  }
+  if (!read_binary_blob(resolved_path, &data, &data_size)) {
+    fprintf(stderr, "Failed to read menu font %s\n", resolved_path);
+    return false;
+  }
+  if (!gloom_decrunch_crm_buffer(&data, &data_size, error, sizeof(error))) {
+    fprintf(stderr, "Failed to decrunch menu font %s: %s\n", resolved_path, error[0] ? error : "unknown error");
+    free(data);
+    return false;
+  }
+  if (data_size < 12u) {
+    fprintf(stderr, "Menu font %s is too small after decrunch (%zu bytes)\n", resolved_path, data_size);
+    free(data);
+    return false;
+  }
+
+  palette_offset = main_read_be32(data + 0u);
+  first_glyph_offset = main_read_be32(data + 4u);
+  if (first_glyph_offset < 8u || first_glyph_offset > palette_offset || palette_offset >= data_size ||
+      ((first_glyph_offset - 4u) % 4u) != 0u) {
+    fprintf(stderr, "Menu font %s has invalid original font shape table\n", resolved_path);
+    free(data);
+    return false;
+  }
+
+  glyph_count = (size_t)(first_glyph_offset - 4u) / 4u;
+  glyphs = (HudGlyph *)calloc(glyph_count, sizeof(*glyphs));
+  if (glyphs == NULL) {
+    free(data);
+    return false;
+  }
+
+  set_default_texture_palette(palette);
+  load_packed_palette(palette, data, data_size, (size_t)palette_offset);
+
+  for (glyph_index = 0u; glyph_index < glyph_count; ++glyph_index) {
+    uint32_t glyph_offset = main_read_be32(data + 4u + glyph_index * 4u);
+    uint32_t glyph_limit = glyph_index + 1u < glyph_count ? main_read_be32(data + 4u + (glyph_index + 1u) * 4u)
+                                                          : palette_offset;
+    uint32_t mask_offset = 0u;
+    uint16_t blit_size = 0u;
+    uint16_t plane_count = 0u;
+    uint16_t blit_rows = 0u;
+    uint16_t blit_words = 0u;
+    size_t source_words = 0u;
+    size_t row_stride = 0u;
+    size_t source_size = 0u;
+    int pixel_width = 0;
+    int pixel_height = 0;
+    uint32_t *pixels = NULL;
+    int py = 0;
+
+    if (glyph_offset + 8u > glyph_limit || glyph_limit > palette_offset || glyph_limit > data_size) {
+      fprintf(stderr, "Menu font %s glyph %zu is out of bounds\n", resolved_path, glyph_index);
+      goto fail;
+    }
+
+    mask_offset = main_read_be32(data + glyph_offset + 0u);
+    blit_size = main_read_be16(data + glyph_offset + 6u);
+    plane_count = main_read_be16(data + glyph_offset + 8u);
+    blit_rows = (uint16_t)(blit_size >> 6u);
+    blit_words = (uint16_t)(blit_size & 0x3Fu);
+    if (blit_words < 2u || blit_rows == 0u || plane_count == 0u || plane_count > GLOOM_HUD_FONT_PLANE_COUNT) {
+      fprintf(stderr, "Menu font %s glyph %zu has invalid blitter dimensions rows=%u words=%u planes=%u\n",
+              resolved_path, glyph_index, (unsigned)blit_rows, (unsigned)blit_words, (unsigned)plane_count);
+      goto fail;
+    }
+
+    source_words = (size_t)blit_words - 1u;
+    row_stride = source_words * 2u;
+    source_size = (size_t)plane_count * (size_t)blit_rows * row_stride;
+    pixel_width = (int)(source_words * 16u);
+    pixel_height = (int)blit_rows;
+    if (glyph_offset + 10u + source_size > glyph_limit || mask_offset < 10u + source_size ||
+        glyph_offset + mask_offset + source_size > glyph_limit || pixel_width <= 0 || pixel_height <= 0) {
+      fprintf(stderr, "Menu font %s glyph %zu has invalid source/mask layout\n", resolved_path, glyph_index);
+      goto fail;
+    }
+
+    pixels = (uint32_t *)malloc((size_t)pixel_width * (size_t)pixel_height * sizeof(*pixels));
+    if (pixels == NULL) {
+      goto fail;
+    }
+
+    for (py = 0; py < pixel_height; ++py) {
+      int px = 0;
+
+      for (px = 0; px < pixel_width; ++px) {
+        uint8_t palette_index = 0u;
+        bool covered = false;
+        int plane = 0;
+        size_t word_offset = (size_t)(px / 16) * 2u;
+        unsigned bit_shift = (unsigned)(15 - (px % 16));
+
+        for (plane = 0; plane < (int)plane_count; ++plane) {
+          size_t row = ((size_t)plane * (size_t)pixel_height) + (size_t)py;
+          size_t src_offset = (size_t)glyph_offset + 10u + row * row_stride + word_offset;
+          size_t mask_src_offset = (size_t)glyph_offset + (size_t)mask_offset + row * row_stride + word_offset;
+          uint16_t src_word = main_read_be16(data + src_offset);
+          uint16_t mask_word = main_read_be16(data + mask_src_offset);
+
+          if (((src_word >> bit_shift) & 1u) != 0u) {
+            palette_index = (uint8_t)(palette_index | (uint8_t)(1u << (unsigned)plane));
+          }
+          if (((mask_word >> bit_shift) & 1u) != 0u) {
+            covered = true;
+          }
+        }
+
+        pixels[(size_t)py * (size_t)pixel_width + (size_t)px] = covered ? palette[palette_index] : 0x00000000u;
+      }
+    }
+
+    glyphs[glyph_index].argb_pixels = pixels;
+    glyphs[glyph_index].width = pixel_width;
+    glyphs[glyph_index].height = pixel_height;
+  }
+
+  font->loaded = true;
+  font->glyph_count = glyph_count;
+  font->glyphs = glyphs;
+  (void)snprintf(font->source_name, sizeof(font->source_name), "%s", resolved_path);
+  free(data);
+  printf("Loaded %zu menu glyphs from original bigfont asset\n", glyph_count);
   return true;
 
 fail:
@@ -2597,7 +2975,9 @@ static bool load_game_script_blob(uint8_t **out_script, size_t *out_script_size)
   return false;
 }
 
-static bool resolve_next_script_play_map(const char *current_map_path, char *out_map_path, size_t out_map_path_size) {
+static ScriptPlayNextResult resolve_next_script_play_map_or_done(const char *current_map_path, char *out_map_path,
+                                                                 size_t out_map_path_size,
+                                                                 ScriptCompletion *out_completion) {
   char current_map_name[64] = {0};
   uint8_t *script = NULL;
   size_t script_size = 0u;
@@ -2606,11 +2986,14 @@ static bool resolve_next_script_play_map(const char *current_map_path, char *out
 
   if (!map_leaf_name(current_map_path, current_map_name, sizeof(current_map_name)) || out_map_path == NULL ||
       out_map_path_size == 0u) {
-    return false;
+    return SCRIPT_PLAY_NEXT_ERROR;
+  }
+  if (out_completion != NULL) {
+    memset(out_completion, 0, sizeof(*out_completion));
   }
 
   if (!load_game_script_blob(&script, &script_size)) {
-    return false;
+    return SCRIPT_PLAY_NEXT_ERROR;
   }
 
   while (pos < script_size) {
@@ -2643,22 +3026,40 @@ static bool resolve_next_script_play_map(const char *current_map_path, char *out
       if (found_current) {
         if (map_len + strlen("amiga/maps/") >= out_map_path_size) {
           free(script);
-          return false;
+          return SCRIPT_PLAY_NEXT_ERROR;
         }
         (void)snprintf(out_map_path, out_map_path_size, "amiga/maps/%.*s", (int)map_len, map_name);
         free(script);
-        return true;
+        return SCRIPT_PLAY_NEXT_MAP;
       }
 
       found_current = map_len == strlen(current_map_name) && memcmp(map_name, current_map_name, map_len) == 0;
+    } else if (found_current && line_len > 5u && memcmp(line, "pict_", 5u) == 0) {
+      if (out_completion != NULL &&
+          !copy_script_token(out_completion->picture, sizeof(out_completion->picture), line + 5u, line_len - 5u)) {
+        free(script);
+        return SCRIPT_PLAY_NEXT_ERROR;
+      }
+    } else if (found_current && line_len > 5u && memcmp(line, "text_", 5u) == 0) {
+      if (out_completion != NULL &&
+          !copy_script_token(out_completion->text, sizeof(out_completion->text), line + 5u, line_len - 5u)) {
+        free(script);
+        return SCRIPT_PLAY_NEXT_ERROR;
+      }
     } else if (found_current && line_len >= 5u && memcmp(line, "done_", 5u) == 0) {
-      break;
+      free(script);
+      return SCRIPT_PLAY_NEXT_DONE;
     }
   }
 
   fprintf(stderr, "No following play_ command found in misc/script after play_%s\n", current_map_name);
   free(script);
-  return false;
+  return SCRIPT_PLAY_NEXT_ERROR;
+}
+
+static bool resolve_next_script_play_map(const char *current_map_path, char *out_map_path, size_t out_map_path_size) {
+  return resolve_next_script_play_map_or_done(current_map_path, out_map_path, out_map_path_size, NULL) ==
+         SCRIPT_PLAY_NEXT_MAP;
 }
 
 static bool resolve_flat_texture_path(const char *kind, const char *tile_tag, char *out_path, size_t out_path_size) {
@@ -3236,6 +3637,10 @@ static bool load_object_visual_set_for_map(const GloomMap *map, ObjectVisualSet 
       needed[object_type] = 1u;
     }
   }
+  if (needed[0] || needed[1]) {
+    needed[0] = 1u;
+    needed[1] = 1u;
+  }
 
   for (i = 0u; i < GLOOM_OBJECT_TYPE_COUNT; ++i) {
     const char *asset_name = definitions[i].asset_name;
@@ -3579,6 +3984,373 @@ static int16_t player_control_axis(bool negative_pressed, bool positive_pressed)
   return 0;
 }
 
+static int32_t gamepad_abs_i32(int32_t value) {
+  return value < 0 ? -value : value;
+}
+
+static int32_t gamepad_axis_with_deadzone(Sint16 raw_value, int deadzone) {
+  int32_t value = (int32_t)raw_value;
+  int32_t abs_value = gamepad_abs_i32(value);
+  int32_t max_value = 32767;
+  int32_t scaled = 0;
+
+  if (abs_value <= deadzone) {
+    return 0;
+  }
+  scaled = ((abs_value - deadzone) * max_value) / (max_value - deadzone);
+  if (scaled > max_value) {
+    scaled = max_value;
+  }
+  return value < 0 ? -scaled : scaled;
+}
+
+static int gamepad_axis_to_mouse_delta(int32_t axis_value) {
+  int32_t abs_value = gamepad_abs_i32(axis_value);
+  int sign = axis_value < 0 ? -1 : 1;
+  int delta = 0;
+
+  if (abs_value < GLOOM_GAMEPAD_LOOK_MIN_DELTA_AXIS) {
+    return 0;
+  }
+
+  delta = (int)(abs_value / GLOOM_GAMEPAD_LOOK_AXIS_TO_MOUSE_DIV);
+  if (delta < 1) {
+    delta = 1;
+  }
+  return delta * sign;
+}
+
+static bool gamepad_slot_has_instance(SDL_JoystickID instance_id) {
+  size_t i = 0u;
+
+  for (i = 0u; i < (size_t)GLOOM_GAMEPAD_COUNT; ++i) {
+    if (g_gamepads[i].controller != NULL && g_gamepads[i].instance_id == instance_id) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static size_t gamepad_first_free_slot(void) {
+  size_t i = 0u;
+
+  for (i = 0u; i < (size_t)GLOOM_GAMEPAD_COUNT; ++i) {
+    if (g_gamepads[i].controller == NULL) {
+      return i;
+    }
+  }
+  return (size_t)GLOOM_GAMEPAD_COUNT;
+}
+
+static void gamepad_close_slot(size_t gamepad_index) {
+  SDL_GameController *controller = NULL;
+  const char *name = NULL;
+
+  if (gamepad_index >= (size_t)GLOOM_GAMEPAD_COUNT || g_gamepads[gamepad_index].controller == NULL) {
+    return;
+  }
+
+  controller = g_gamepads[gamepad_index].controller;
+  name = SDL_GameControllerName(controller);
+  printf("Gamepad %zu disconnected: %s\n", gamepad_index + 1u, name != NULL ? name : "(unnamed)");
+  SDL_GameControllerClose(controller);
+  g_gamepads[gamepad_index].controller = NULL;
+  g_gamepads[gamepad_index].instance_id = -1;
+}
+
+static void gamepad_handle_device_added(int device_index) {
+  SDL_GameController *controller = NULL;
+  SDL_Joystick *joystick = NULL;
+  SDL_JoystickID instance_id = -1;
+  size_t slot = 0u;
+
+  if (device_index < 0 || device_index >= SDL_NumJoysticks() || !SDL_IsGameController(device_index)) {
+    return;
+  }
+  instance_id = SDL_JoystickGetDeviceInstanceID(device_index);
+  if (instance_id >= 0 && gamepad_slot_has_instance(instance_id)) {
+    return;
+  }
+  slot = gamepad_first_free_slot();
+  if (slot >= (size_t)GLOOM_GAMEPAD_COUNT) {
+    return;
+  }
+
+  controller = SDL_GameControllerOpen(device_index);
+  if (controller == NULL) {
+    fprintf(stderr, "SDL_GameControllerOpen(%d) failed: %s\n", device_index, SDL_GetError());
+    return;
+  }
+  joystick = SDL_GameControllerGetJoystick(controller);
+  if (joystick == NULL) {
+    fprintf(stderr, "SDL_GameControllerGetJoystick(%d) failed: %s\n", device_index, SDL_GetError());
+    SDL_GameControllerClose(controller);
+    return;
+  }
+
+  g_gamepads[slot].controller = controller;
+  g_gamepads[slot].instance_id = SDL_JoystickInstanceID(joystick);
+  {
+    const char *name = SDL_GameControllerName(controller);
+
+    printf("Gamepad %zu connected: %s\n", slot + 1u, name != NULL ? name : "(unnamed)");
+  }
+}
+
+static void gamepad_handle_device_removed(SDL_JoystickID instance_id) {
+  size_t i = 0u;
+
+  for (i = 0u; i < (size_t)GLOOM_GAMEPAD_COUNT; ++i) {
+    if (g_gamepads[i].controller != NULL && g_gamepads[i].instance_id == instance_id) {
+      gamepad_close_slot(i);
+      break;
+    }
+  }
+}
+
+static void gamepad_init(void) {
+  int joystick_count = 0;
+  int i = 0;
+
+  memset(g_gamepads, 0, sizeof(g_gamepads));
+  for (i = 0; i < GLOOM_GAMEPAD_COUNT; ++i) {
+    g_gamepads[i].instance_id = -1;
+  }
+
+  SDL_GameControllerEventState(SDL_ENABLE);
+  joystick_count = SDL_NumJoysticks();
+  for (i = 0; i < joystick_count; ++i) {
+    gamepad_handle_device_added(i);
+  }
+}
+
+static void gamepad_shutdown(void) {
+  size_t i = 0u;
+
+  for (i = 0u; i < (size_t)GLOOM_GAMEPAD_COUNT; ++i) {
+    gamepad_close_slot(i);
+  }
+}
+
+static bool gamepad_button_down(size_t gamepad_index, SDL_GameControllerButton button) {
+  if (gamepad_index >= (size_t)GLOOM_GAMEPAD_COUNT || g_gamepads[gamepad_index].controller == NULL) {
+    return false;
+  }
+  return SDL_GameControllerGetButton(g_gamepads[gamepad_index].controller, button) != 0;
+}
+
+static PlayerControls read_gamepad_player_controls(size_t gamepad_index, unsigned player_index) {
+  PlayerControls controls;
+  SDL_GameController *controller = NULL;
+  int32_t left_x = 0;
+  int32_t left_y = 0;
+  int32_t right_x = 0;
+  int32_t right_trigger = 0;
+  bool dpad_up = false;
+  bool dpad_down = false;
+  bool dpad_left = false;
+  bool dpad_right = false;
+  int16_t strafe = 0;
+  int16_t turn = 0;
+
+  memset(&controls, 0, sizeof(controls));
+  if (gamepad_index >= (size_t)GLOOM_GAMEPAD_COUNT || g_gamepads[gamepad_index].controller == NULL) {
+    return controls;
+  }
+
+  controller = g_gamepads[gamepad_index].controller;
+  left_x = gamepad_axis_with_deadzone(SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_LEFTX),
+                                      GLOOM_GAMEPAD_MOVE_DEADZONE);
+  left_y = gamepad_axis_with_deadzone(SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_LEFTY),
+                                      GLOOM_GAMEPAD_MOVE_DEADZONE);
+  right_x = gamepad_axis_with_deadzone(SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_RIGHTX),
+                                       GLOOM_GAMEPAD_LOOK_DEADZONE);
+  right_trigger = gamepad_axis_with_deadzone(SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_TRIGGERRIGHT),
+                                             GLOOM_GAMEPAD_MOVE_DEADZONE);
+  dpad_up = gamepad_button_down(gamepad_index, SDL_CONTROLLER_BUTTON_DPAD_UP);
+  dpad_down = gamepad_button_down(gamepad_index, SDL_CONTROLLER_BUTTON_DPAD_DOWN);
+  dpad_left = gamepad_button_down(gamepad_index, SDL_CONTROLLER_BUTTON_DPAD_LEFT);
+  dpad_right = gamepad_button_down(gamepad_index, SDL_CONTROLLER_BUTTON_DPAD_RIGHT);
+
+  controls.joyy = player_control_axis(left_y < -GLOOM_GAMEPAD_MOVE_THRESHOLD || dpad_up,
+                                      left_y > GLOOM_GAMEPAD_MOVE_THRESHOLD || dpad_down);
+  strafe = player_control_axis(left_x < -GLOOM_GAMEPAD_MOVE_THRESHOLD,
+                               left_x > GLOOM_GAMEPAD_MOVE_THRESHOLD);
+  turn = player_control_axis((player_index != 0u && right_x < -GLOOM_GAMEPAD_MOVE_THRESHOLD) || dpad_left,
+                             (player_index != 0u && right_x > GLOOM_GAMEPAD_MOVE_THRESHOLD) || dpad_right);
+  controls.fire = right_trigger > GLOOM_GAMEPAD_TRIGGER_THRESHOLD ||
+                  gamepad_button_down(gamepad_index, SDL_CONTROLLER_BUTTON_A) ||
+                  gamepad_button_down(gamepad_index, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
+
+  if (strafe != 0) {
+    controls.joyx = strafe;
+    controls.joys = -1;
+  } else {
+    controls.joyx = turn;
+  }
+
+  return controls;
+}
+
+static void merge_player_controls(PlayerControls *dst, const PlayerControls *src) {
+  if (dst == NULL || src == NULL) {
+    return;
+  }
+  if (src->joyy != 0) {
+    dst->joyy = src->joyy;
+  }
+  if (src->joyx != 0 || src->joys != 0) {
+    dst->joyx = src->joyx;
+    dst->joys = src->joys;
+  }
+  dst->fire = dst->fire || src->fire;
+}
+
+static int gamepad_look_delta(size_t gamepad_index) {
+  SDL_GameController *controller = NULL;
+  int32_t right_x = 0;
+
+  if (gamepad_index >= (size_t)GLOOM_GAMEPAD_COUNT || g_gamepads[gamepad_index].controller == NULL) {
+    return 0;
+  }
+
+  controller = g_gamepads[gamepad_index].controller;
+  right_x = gamepad_axis_with_deadzone(SDL_GameControllerGetAxis(controller, SDL_CONTROLLER_AXIS_RIGHTX),
+                                       GLOOM_GAMEPAD_LOOK_DEADZONE);
+  return gamepad_axis_to_mouse_delta(right_x);
+}
+
+static int player1_gamepad_look_delta(void) {
+  int gamepad_index = control_source_gamepad_index(g_control_config.player1);
+
+  if (gamepad_index < 0) {
+    return 0;
+  }
+  return gamepad_look_delta((size_t)gamepad_index);
+}
+
+static bool gamepad_menu_activate_event(const SDL_Event *event) {
+  if (event == NULL || event->type != SDL_CONTROLLERBUTTONDOWN) {
+    return false;
+  }
+  return event->cbutton.button == SDL_CONTROLLER_BUTTON_A || event->cbutton.button == SDL_CONTROLLER_BUTTON_START;
+}
+
+static bool gamepad_menu_back_event(const SDL_Event *event) {
+  if (event == NULL || event->type != SDL_CONTROLLERBUTTONDOWN) {
+    return false;
+  }
+  return event->cbutton.button == SDL_CONTROLLER_BUTTON_B || event->cbutton.button == SDL_CONTROLLER_BUTTON_BACK;
+}
+
+static void gamepad_handle_event(const SDL_Event *event) {
+  if (event == NULL) {
+    return;
+  }
+  if (event->type == SDL_CONTROLLERDEVICEADDED) {
+    gamepad_handle_device_added(event->cdevice.which);
+  } else if (event->type == SDL_CONTROLLERDEVICEREMOVED) {
+    gamepad_handle_device_removed(event->cdevice.which);
+  }
+}
+
+static int control_source_gamepad_index(GloomControlSource source) {
+  if (source == GLOOM_CONTROL_GAMEPAD_1) {
+    return 0;
+  }
+  if (source == GLOOM_CONTROL_GAMEPAD_2) {
+    return 1;
+  }
+  return -1;
+}
+
+static const char *control_source_menu_name(GloomControlSource source) {
+  if (source == GLOOM_CONTROL_GAMEPAD_1) {
+    return "JOYSTICK 1";
+  }
+  if (source == GLOOM_CONTROL_GAMEPAD_2) {
+    return "JOYSTICK 2";
+  }
+  return "KEYBOARD";
+}
+
+static GloomControlSource next_control_source(GloomControlSource source) {
+  if (source == GLOOM_CONTROL_KEYBOARD) {
+    return GLOOM_CONTROL_GAMEPAD_1;
+  }
+  if (source == GLOOM_CONTROL_GAMEPAD_1) {
+    return GLOOM_CONTROL_GAMEPAD_2;
+  }
+  return GLOOM_CONTROL_KEYBOARD;
+}
+
+static void normalize_control_config(RuntimeControlConfig *config) {
+  if (config == NULL) {
+    return;
+  }
+  if (config->player1 < GLOOM_CONTROL_KEYBOARD || config->player1 > GLOOM_CONTROL_GAMEPAD_2) {
+    config->player1 = GLOOM_CONTROL_KEYBOARD;
+  }
+  if (config->player2 < GLOOM_CONTROL_KEYBOARD || config->player2 > GLOOM_CONTROL_GAMEPAD_2) {
+    config->player2 = GLOOM_CONTROL_GAMEPAD_1;
+  }
+  if (config->player1 == config->player2) {
+    if (config->player1 == GLOOM_CONTROL_KEYBOARD) {
+      config->player2 = GLOOM_CONTROL_GAMEPAD_1;
+    } else if (config->player1 == GLOOM_CONTROL_GAMEPAD_1) {
+      config->player2 = GLOOM_CONTROL_GAMEPAD_2;
+    } else {
+      config->player1 = GLOOM_CONTROL_GAMEPAD_1;
+    }
+  }
+}
+
+static void cycle_control_config(RuntimeControlConfig *config, unsigned player_index) {
+  GloomControlSource *changed = NULL;
+  GloomControlSource *other = NULL;
+  GloomControlSource candidate = GLOOM_CONTROL_KEYBOARD;
+
+  if (config == NULL || (player_index != 0u && player_index != 1u)) {
+    return;
+  }
+
+  normalize_control_config(config);
+  changed = player_index == 0u ? &config->player1 : &config->player2;
+  other = player_index == 0u ? &config->player2 : &config->player1;
+  candidate = next_control_source(*changed);
+  if (candidate == *other) {
+    if (candidate == GLOOM_CONTROL_GAMEPAD_1) {
+      *other = GLOOM_CONTROL_GAMEPAD_2;
+    } else if (candidate == GLOOM_CONTROL_GAMEPAD_2) {
+      *other = GLOOM_CONTROL_GAMEPAD_1;
+    } else {
+      *other = GLOOM_CONTROL_GAMEPAD_1;
+    }
+  }
+  *changed = candidate;
+  normalize_control_config(config);
+}
+
+static bool player1_receives_keyboard_input(void) {
+  normalize_control_config(&g_control_config);
+  return g_control_config.player1 == GLOOM_CONTROL_KEYBOARD ||
+         (g_control_config.player1 != GLOOM_CONTROL_KEYBOARD &&
+          g_control_config.player2 != GLOOM_CONTROL_KEYBOARD);
+}
+
+#ifdef __EMSCRIPTEN__
+EMSCRIPTEN_KEEPALIVE void SetWebRTCGuestConnected(int connected) {
+  g_webrtc_guest_connected = connected != 0;
+  if (!g_webrtc_guest_connected) {
+    g_webrtc_guest_player2_input = 0u;
+  }
+}
+
+EMSCRIPTEN_KEEPALIVE void SetWebRTCGuestPlayer2Input(unsigned int input) {
+  g_webrtc_guest_player2_input = input;
+}
+#endif
+
 static PlayerControls read_modern_player_controls(const uint8_t *keyboard, bool mouse_fire) {
   PlayerControls controls;
   int16_t strafe = 0;
@@ -3621,6 +4393,34 @@ static PlayerControls read_second_player_controls(const uint8_t *keyboard) {
   strafe = player_control_axis(keyboard[SDL_SCANCODE_U], keyboard[SDL_SCANCODE_O]);
   turn = player_control_axis(keyboard[SDL_SCANCODE_J], keyboard[SDL_SCANCODE_L]);
   controls.fire = keyboard[SDL_SCANCODE_RETURN] || keyboard[SDL_SCANCODE_RCTRL];
+
+  if (strafe != 0) {
+    controls.joyx = strafe;
+    controls.joys = -1;
+  } else {
+    controls.joyx = turn;
+  }
+
+  return controls;
+}
+
+static PlayerControls read_webrtc_player2_controls(void) {
+  PlayerControls controls;
+  int16_t strafe = 0;
+  int16_t turn = 0;
+
+  memset(&controls, 0, sizeof(controls));
+  if (!g_webrtc_guest_connected) {
+    return controls;
+  }
+
+  controls.joyy = player_control_axis((g_webrtc_guest_player2_input & GLOOM_WEBRTC_INPUT_FORWARD) != 0u,
+                                      (g_webrtc_guest_player2_input & GLOOM_WEBRTC_INPUT_BACK) != 0u);
+  strafe = player_control_axis((g_webrtc_guest_player2_input & GLOOM_WEBRTC_INPUT_STRAFE_LEFT) != 0u,
+                               (g_webrtc_guest_player2_input & GLOOM_WEBRTC_INPUT_STRAFE_RIGHT) != 0u);
+  turn = player_control_axis((g_webrtc_guest_player2_input & GLOOM_WEBRTC_INPUT_LEFT) != 0u,
+                             (g_webrtc_guest_player2_input & GLOOM_WEBRTC_INPUT_RIGHT) != 0u);
+  controls.fire = (g_webrtc_guest_player2_input & GLOOM_WEBRTC_INPUT_FIRE) != 0u;
 
   if (strafe != 0) {
     controls.joyx = strafe;
@@ -3763,6 +4563,7 @@ static void settle_player_bounce(AppState *state, bool play_footstep) {
 
   if ((bounce_phase & 127u) < (uint16_t)GLOOM_PLAYER_UNBOUNCE_STEP) {
     state->player_bounce = 0.0f;
+    state->player_frame_fixed = 0u;
     if (play_footstep) {
       play_player_footstep_sfx();
     }
@@ -3794,6 +4595,7 @@ static void capture_primary_player_state(const AppState *state, RuntimePlayerSta
   out_player->player_rot_fixed = state->player_rot_fixed;
   out_player->player_rotspeed = state->player_rotspeed;
   out_player->player_bounce = state->player_bounce;
+  out_player->player_frame_fixed = state->player_frame_fixed;
   out_player->player_eye_y = state->player_eye_y;
   out_player->player_hitpoints = state->player_hitpoints;
   out_player->player_lives = state->player_lives;
@@ -3831,6 +4633,7 @@ static void apply_primary_player_state(AppState *state, const RuntimePlayerState
   state->player_rot_fixed = player->player_rot_fixed;
   state->player_rotspeed = player->player_rotspeed;
   state->player_bounce = player->player_bounce;
+  state->player_frame_fixed = player->player_frame_fixed;
   state->player_eye_y = player->player_eye_y;
   state->player_hitpoints = player->player_hitpoints;
   state->player_lives = player->player_lives;
@@ -3859,6 +4662,15 @@ static void apply_primary_player_state(AppState *state, const RuntimePlayerState
 static bool player_can_take_damage(const AppState *state) {
   return state != NULL && state->player_death_phase == GLOOM_PLAYER_DEATH_NONE && !state->player_dead &&
          state->player_hitpoints > 0;
+}
+
+static bool runtime_player_fields_can_take_damage(int16_t hitpoints, bool dead, uint8_t death_phase) {
+  return death_phase == GLOOM_PLAYER_DEATH_NONE && !dead && hitpoints > 0;
+}
+
+static bool secondary_player_can_take_damage(const RuntimePlayerState *player) {
+  return player != NULL && runtime_player_fields_can_take_damage(player->player_hitpoints, player->player_dead,
+                                                                 player->player_death_phase);
 }
 
 static bool player_death_blocks_controls(const AppState *state) {
@@ -3954,7 +4766,12 @@ static void advance_player_death_amiga_tick(AppState *state) {
         state->player_eye_y = (float)GLOOM_PLAYER_DEATH_EYE_CLAMP;
         state->player_death_phase = GLOOM_PLAYER_DEATH_DEAD_DELAY;
         state->player_death_timer = (float)GLOOM_PLAYER_DEAD_DELAY;
-        if (state->player_lives > 0) {
+        if (state->combat_mode) {
+          /* amiga/gloom2.s: playerdeath combat branch subtracts one life from the loser. */
+          if (state->player_lives > 0) {
+            state->player_lives -= 1;
+          }
+        } else if (state->player_lives > 0) {
           state->player_lives -= 1;
           if (state->two_player_mode && state->active_player_index == 0u && state->player_lives > 0) {
             state->player2.player_lives = state->player_lives;
@@ -3966,7 +4783,13 @@ static void advance_player_death_amiga_tick(AppState *state) {
     case GLOOM_PLAYER_DEATH_DEAD_DELAY:
       state->player_death_timer -= 1.0f;
       if (state->player_death_timer <= 0.0f) {
-        if (state->player_lives == 0) {
+        if (state->combat_mode) {
+          /* amiga/gloom2.s: playerdead combat branch sets finished2=4 and pixels both players out. */
+          state->finished2 = GLOOM_COMBAT_ROUND_FINISHED;
+          state->finished = GLOOM_COMBAT_ROUND_FINISHED;
+          state->player_pixsizeadd = 1;
+          state->player2.player_pixsizeadd = 1;
+        } else if (state->player_lives == 0) {
           if (state->two_player_mode && state->active_other_player_lives > 0) {
             state->player_death_phase = GLOOM_PLAYER_DEATH_OUT_OF_LIVES;
           } else {
@@ -4069,6 +4892,10 @@ static void update_player_movement(AppState *state, const PlayerControls *contro
   }
 
   advance_player_bounce(state);
+  state->player_frame_fixed =
+      (uint32_t)((int32_t)state->player_frame_fixed +
+                 (int32_t)((float)GLOOM_PLAYER_FRAME_SPEED_FIXED * fixed_step_amiga_scale())) &
+      0x0003ffffu;
   update_player_camera_y(state);
 }
 
@@ -4437,11 +5264,33 @@ static void runtime_object_dir(int16_t rotation, float *out_x, float *out_z) {
 }
 
 static int16_t runtime_angle_to_player(const AppState *state, const RuntimeObjectState *object) {
+  float target_x = 0.0f;
+  float target_z = 0.0f;
+
   if (state == NULL || object == NULL) {
     return 0;
   }
 
-  return radians_to_amiga_rotation(SDL_atan2f(state->camera_x - object->x, state->camera_z - object->z));
+  target_x = state->camera_x;
+  target_z = state->camera_z;
+  if (state->two_player_mode && secondary_player_can_take_damage(&state->player2)) {
+    bool use_player2 = !player_can_take_damage(state);
+
+    if (!use_player2) {
+      float p1_dx = state->camera_x - object->x;
+      float p1_dz = state->camera_z - object->z;
+      float p2_dx = state->player2.camera_x - object->x;
+      float p2_dz = state->player2.camera_z - object->z;
+      use_player2 = (p2_dx * p2_dx + p2_dz * p2_dz) < (p1_dx * p1_dx + p1_dz * p1_dz);
+    }
+    if (use_player2) {
+      target_x = state->player2.camera_x;
+      target_z = state->player2.camera_z;
+    }
+  }
+
+  /* amiga/gloom2.s: pickplayer chooses the live nearest player before aiming. */
+  return radians_to_amiga_rotation(SDL_atan2f(target_x - object->x, target_z - object->z));
 }
 
 static bool runtime_object_checkvecs(AppState *state, RuntimeObjectState *object, float move) {
@@ -4529,39 +5378,67 @@ static void runtime_advance_monster_frame(RuntimeObjectState *object, int32_t fr
 }
 
 static bool runtime_object_collides_player(const AppState *state, const RuntimeObjectState *object) {
+  return runtime_object_collides_player_index(state, object) >= 0;
+}
+
+static int runtime_object_collides_player_index(const AppState *state, const RuntimeObjectState *object) {
   float dx = 0.0f;
   float dz = 0.0f;
   float radius = 0.0f;
 
   if (state == NULL || object == NULL) {
-    return false;
+    return -1;
   }
 
   radius = (float)(object->radius + state->player_radius);
-  dx = state->camera_x - object->x;
-  if (SDL_fabsf(dx) >= radius) {
-    return false;
-  }
-  dz = state->camera_z - object->z;
-  if (SDL_fabsf(dz) >= radius) {
-    return false;
+  if (player_can_take_damage(state)) {
+    dx = state->camera_x - object->x;
+    dz = state->camera_z - object->z;
+    if (SDL_fabsf(dx) < radius && SDL_fabsf(dz) < radius && (dx * dx + dz * dz) < (radius * radius)) {
+      return 0;
+    }
   }
 
-  return (dx * dx + dz * dz) < (radius * radius);
+  if (state->two_player_mode && secondary_player_can_take_damage(&state->player2)) {
+    dx = state->player2.camera_x - object->x;
+    dz = state->player2.camera_z - object->z;
+    if (SDL_fabsf(dx) < radius && SDL_fabsf(dz) < radius && (dx * dx + dz * dz) < (radius * radius)) {
+      return 1;
+    }
+  }
+
+  return -1;
 }
 
 static void damage_player_from_object(AppState *state, const RuntimeObjectState *object) {
-  if (state == NULL || object == NULL || object->damage <= 0 || !player_can_take_damage(state)) {
+  int player_index = 0;
+
+  if (state == NULL || object == NULL || object->damage <= 0) {
     return;
   }
 
-  state->player_hitpoints -= object->damage;
-  if (state->player_hitpoints < 0) {
-    state->player_hitpoints = 0;
+  player_index = runtime_object_collides_player_index(state, object);
+  if (player_index < 0) {
+    player_index = 0;
   }
-  player_redpal(state);
-  if (state->player_hitpoints == 0) {
-    start_player_death(state);
+  if (player_index == 0) {
+    if (!player_can_take_damage(state)) {
+      return;
+    }
+    state->player_hitpoints -= object->damage;
+    if (state->player_hitpoints < 0) {
+      state->player_hitpoints = 0;
+    }
+    player_redpal(state);
+    if (state->player_hitpoints == 0) {
+      start_player_death(state);
+    }
+  } else if (player_index == 1) {
+    state->player2.player_hitpoints -= object->damage;
+    if (state->player2.player_hitpoints < 0) {
+      state->player2.player_hitpoints = 0;
+    }
+    state->player2.player_palette_timer = (float)GLOOM_PLAYER_RED_PAL_TIMER;
   }
 }
 
@@ -5096,14 +5973,16 @@ static void update_runtime_objects(AppState *state) {
 
   if (state->dragon_dead_delay > 0.0f) {
     state->dragon_dead_delay -= step_scale;
-    if (state->dragon_dead_delay <= 0.0f && !state->dragon_finished_reported) {
-      fprintf(stderr, "Cannot complete dragondead: original finished=3 end flow is not ported\n");
+    if (state->dragon_dead_delay <= 0.0f) {
+      /* amiga/gloom2.s: dragondead waits ob_delay then sets finished=3. */
+      state->finished = GLOOM_LEVEL_COMPLETE_FINISHED;
       state->dragon_finished_reported = true;
       state->dragon_dead_delay = 0.0f;
     }
   }
 
-  if (player_death_blocks_controls(state) || state->player_hitpoints <= 0) {
+  if ((player_death_blocks_controls(state) || state->player_hitpoints <= 0) &&
+      (!state->two_player_mode || !secondary_player_can_take_damage(&state->player2))) {
     return;
   }
 
@@ -5314,39 +6193,112 @@ static bool damage_projectile_enemy(AppState *state, const ObjectVisualSet *obje
 static bool damage_projectile_player(AppState *state, RuntimeProjectile *projectile, float prev_x, float prev_z) {
   float hit_radius = 0.0f;
 
-  if (state == NULL || projectile == NULL || !player_can_take_damage(state)) {
+  if (state == NULL || projectile == NULL) {
     return false;
   }
 
   hit_radius = (float)state->player_radius + (float)GLOOM_PROJECTILE_RADIUS;
-  if (distance_sq_point_to_segment(state->camera_x, state->camera_z, prev_x, prev_z, projectile->x, projectile->z) >
-      hit_radius * hit_radius) {
+  if (player_can_take_damage(state) &&
+      distance_sq_point_to_segment(state->camera_x, state->camera_z, prev_x, prev_z, projectile->x, projectile->z) <=
+          hit_radius * hit_radius) {
+    state->player_hitpoints -= projectile->damage;
+    if (state->player_hitpoints < 0) {
+      state->player_hitpoints = 0;
+    }
+    player_redpal(state);
+    if (state->player_hitpoints == 0) {
+      start_player_death(state);
+    }
+    spawn_runtime_sparks(state, projectile->weapon_index, state->camera_x, (float)GLOOM_PLAYER_FIRE_Y,
+                         state->camera_z);
+    return true;
+  }
+
+  if (state->two_player_mode && secondary_player_can_take_damage(&state->player2) &&
+      distance_sq_point_to_segment(state->player2.camera_x, state->player2.camera_z, prev_x, prev_z, projectile->x,
+                                   projectile->z) <= hit_radius * hit_radius) {
+    state->player2.player_hitpoints -= projectile->damage;
+    if (state->player2.player_hitpoints < 0) {
+      state->player2.player_hitpoints = 0;
+    }
+    state->player2.player_palette_timer = (float)GLOOM_PLAYER_RED_PAL_TIMER;
+    spawn_runtime_sparks(state, projectile->weapon_index, state->player2.camera_x, (float)GLOOM_PLAYER_FIRE_Y,
+                         state->player2.camera_z);
+    return true;
+  }
+
+  return false;
+}
+
+static bool damage_projectile_combat_player(AppState *state, RuntimeProjectile *projectile, float prev_x,
+                                            float prev_z) {
+  float hit_radius = 0.0f;
+
+  if (state == NULL || projectile == NULL || projectile->enemy || !state->combat_mode || !state->two_player_mode) {
     return false;
   }
 
-  state->player_hitpoints -= projectile->damage;
-  if (state->player_hitpoints < 0) {
-    state->player_hitpoints = 0;
+  hit_radius = (float)state->player_radius + (float)GLOOM_PROJECTILE_RADIUS;
+  if (projectile->player_owner_index == 0u && secondary_player_can_take_damage(&state->player2) &&
+      distance_sq_point_to_segment(state->player2.camera_x, state->player2.camera_z, prev_x, prev_z, projectile->x,
+                                   projectile->z) <= hit_radius * hit_radius) {
+    state->player2.player_hitpoints -= projectile->damage;
+    if (state->player2.player_hitpoints < 0) {
+      state->player2.player_hitpoints = 0;
+    }
+    state->player2.player_palette_timer = (float)GLOOM_PLAYER_RED_PAL_TIMER;
+    spawn_runtime_sparks(state, projectile->weapon_index, state->player2.camera_x, (float)GLOOM_PLAYER_FIRE_Y,
+                         state->player2.camera_z);
+    return true;
   }
-  player_redpal(state);
-  if (state->player_hitpoints == 0) {
-    start_player_death(state);
+
+  if (projectile->player_owner_index == 1u && player_can_take_damage(state) &&
+      distance_sq_point_to_segment(state->camera_x, state->camera_z, prev_x, prev_z, projectile->x, projectile->z) <=
+          hit_radius * hit_radius) {
+    state->player_hitpoints -= projectile->damage;
+    if (state->player_hitpoints < 0) {
+      state->player_hitpoints = 0;
+    }
+    player_redpal(state);
+    spawn_runtime_sparks(state, projectile->weapon_index, state->camera_x, (float)GLOOM_PLAYER_FIRE_Y,
+                         state->camera_z);
+    return true;
   }
-  spawn_runtime_sparks(state, projectile->weapon_index, state->camera_x, (float)GLOOM_PLAYER_FIRE_Y, state->camera_z);
-  return true;
+
+  return false;
 }
 
 static void update_homing_projectile_velocity(AppState *state, RuntimeProjectile *projectile, float step_scale) {
   float dx = 0.0f;
   float dz = 0.0f;
   float len = 0.0f;
+  float target_x = 0.0f;
+  float target_z = 0.0f;
 
   if (state == NULL || projectile == NULL || !projectile->homing) {
     return;
   }
 
-  dx = state->camera_x - projectile->x;
-  dz = state->camera_z - projectile->z;
+  target_x = state->camera_x;
+  target_z = state->camera_z;
+  if (state->two_player_mode && secondary_player_can_take_damage(&state->player2)) {
+    bool use_player2 = !player_can_take_damage(state);
+
+    if (!use_player2) {
+      float p1_dx = state->camera_x - projectile->x;
+      float p1_dz = state->camera_z - projectile->z;
+      float p2_dx = state->player2.camera_x - projectile->x;
+      float p2_dz = state->player2.camera_z - projectile->z;
+      use_player2 = (p2_dx * p2_dx + p2_dz * p2_dz) < (p1_dx * p1_dx + p1_dz * p1_dz);
+    }
+    if (use_player2) {
+      target_x = state->player2.camera_x;
+      target_z = state->player2.camera_z;
+    }
+  }
+
+  dx = target_x - projectile->x;
+  dz = target_z - projectile->z;
   len = SDL_sqrtf(dx * dx + dz * dz);
   if (len <= 0.0001f) {
     return;
@@ -5397,6 +6349,7 @@ static bool spawn_player_projectile_at_angle(AppState *state, uint8_t weapon_ind
     projectile->active = true;
     projectile->weapon_index = weapon_index;
     projectile->barrel_origin = state->barrel_projectile_origin;
+    projectile->player_owner_index = state->active_player_index;
     projectile->x = start_x;
     projectile->y = (float)GLOOM_PLAYER_FIRE_Y;
     projectile->z = start_z;
@@ -5454,7 +6407,13 @@ static void update_projectiles(AppState *state, const ObjectVisualSet *object_vi
       continue;
     }
 
-    if (!projectile->enemy && damage_projectile_enemy(state, object_visuals, projectile, prev_x, prev_z)) {
+    if (!projectile->enemy && damage_projectile_combat_player(state, projectile, prev_x, prev_z)) {
+      projectile->active = false;
+      continue;
+    }
+
+    if (!projectile->enemy && !state->combat_mode &&
+        damage_projectile_enemy(state, object_visuals, projectile, prev_x, prev_z)) {
       projectile->active = false;
       continue;
     }
@@ -5878,7 +6837,48 @@ static bool apply_player_pickup(AppState *state, RuntimeObjectState *object, int
   return consumed;
 }
 
-static void update_pickups(AppState *state) {
+static void update_pickup_animations(AppState *state) {
+  size_t i = 0u;
+  size_t count = 0u;
+
+  if (state == NULL ||
+      ((player_death_blocks_controls(state) || state->player_hitpoints <= 0) &&
+       (!state->two_player_mode || !secondary_player_can_take_damage(&state->player2)))) {
+    return;
+  }
+
+  count = state->map.object_spawn_count;
+  if (count > (size_t)GLOOM_MAX_RUNTIME_OBJECTS) {
+    count = (size_t)GLOOM_MAX_RUNTIME_OBJECTS;
+  }
+
+  for (i = 0u; i < count; ++i) {
+    const GloomObjectSpawn *spawn = &state->map.object_spawns[i];
+    RuntimeObjectState *object = &state->objects[i];
+
+    if (!object->active || !object_type_is_pickup(spawn->object_type)) {
+      continue;
+    }
+
+    if (object_type_pickup_weapon(spawn->object_type) >= 0) {
+      object->bounce_phase += 8.0f * fixed_step_amiga_scale();
+      while (object->bounce_phase >= 128.0f) {
+        object->bounce_phase -= 128.0f;
+      }
+      object->render_y_offset =
+          -SDL_sinf(amiga_rotation_to_radians((int16_t)round_float_to_int32(object->bounce_phase))) * 128.0f;
+      runtime_advance_monster_frame(object, 0x8000, fixed_step_amiga_scale());
+    } else if (spawn->object_type == GLOOM_OBJECT_TYPE_BOUNCY) {
+      static const uint32_t frames[4] = {3u << 16, 4u << 16, 3u << 16, 5u << 16};
+      int frame_index = ((int)object->delay >> 1) & 3;
+
+      object->delay += fixed_step_amiga_scale();
+      object->frame_fixed = frames[frame_index];
+    }
+  }
+}
+
+static void update_pickup_collisions(AppState *state) {
   size_t i = 0u;
   size_t count = 0u;
 
@@ -5902,22 +6902,6 @@ static void update_pickups(AppState *state) {
       continue;
     }
 
-    if (object_type_pickup_weapon(spawn->object_type) >= 0) {
-      object->bounce_phase += 8.0f * fixed_step_amiga_scale();
-      while (object->bounce_phase >= 128.0f) {
-        object->bounce_phase -= 128.0f;
-      }
-      object->render_y_offset =
-          -SDL_sinf(amiga_rotation_to_radians((int16_t)round_float_to_int32(object->bounce_phase))) * 128.0f;
-      runtime_advance_monster_frame(object, 0x8000, fixed_step_amiga_scale());
-    } else if (spawn->object_type == GLOOM_OBJECT_TYPE_BOUNCY) {
-      static const uint32_t frames[4] = {3u << 16, 4u << 16, 3u << 16, 5u << 16};
-      int frame_index = ((int)object->delay >> 1) & 3;
-
-      object->delay += fixed_step_amiga_scale();
-      object->frame_fixed = frames[frame_index];
-    }
-
     dx = object->x - state->camera_x;
     dz = object->z - state->camera_z;
     radius = (float)state->player_radius + (float)object->radius;
@@ -5925,6 +6909,11 @@ static void update_pickups(AppState *state) {
       (void)apply_player_pickup(state, object, spawn->object_type);
     }
   }
+}
+
+static void update_pickups(AppState *state) {
+  update_pickup_animations(state);
+  update_pickup_collisions(state);
 }
 
 static void mirror_two_player_lives_after_active_update(AppState *state, int16_t previous_lives,
@@ -5979,7 +6968,7 @@ static void update_active_player_logic(AppState *state, const PlayerControls *co
 
   update_player_keyboard_rotation(state, controls);
   update_player_movement(state, controls);
-  update_pickups(state);
+  update_pickup_collisions(state);
   update_player_weapon(state, controls);
 }
 
@@ -5993,6 +6982,7 @@ static void update_with_controls(AppState *state, const PlayerControls *controls
   update_rotpolys(state);
   update_doors(state);
   update_runtime_objects(state);
+  update_pickup_animations(state);
   update_projectiles(state, object_visuals);
   update_sparks(state);
   update_blood(state);
@@ -6028,9 +7018,39 @@ static void update_with_controls(AppState *state, const PlayerControls *controls
 }
 
 static void update(AppState *state, const uint8_t *keyboard, bool mouse_fire, const ObjectVisualSet *object_visuals) {
-  PlayerControls controls = read_modern_player_controls(keyboard, mouse_fire);
-  PlayerControls controls2 = read_second_player_controls(keyboard);
+  PlayerControls controls;
+  PlayerControls controls2;
+  int gamepad_index = -1;
 
+  memset(&controls, 0, sizeof(controls));
+  memset(&controls2, 0, sizeof(controls2));
+  normalize_control_config(&g_control_config);
+
+  if (player1_receives_keyboard_input()) {
+    controls = read_modern_player_controls(keyboard, mouse_fire);
+  }
+  if (g_control_config.player2 == GLOOM_CONTROL_KEYBOARD) {
+    controls2 = read_second_player_controls(keyboard);
+  }
+
+  gamepad_index = control_source_gamepad_index(g_control_config.player1);
+  if (gamepad_index >= 0) {
+    PlayerControls gamepad_controls = read_gamepad_player_controls((size_t)gamepad_index, 0u);
+
+    merge_player_controls(&controls, &gamepad_controls);
+  }
+  gamepad_index = control_source_gamepad_index(g_control_config.player2);
+  if (gamepad_index >= 0) {
+    PlayerControls gamepad_controls = read_gamepad_player_controls((size_t)gamepad_index, 1u);
+
+    merge_player_controls(&controls2, &gamepad_controls);
+  }
+  if (g_webrtc_guest_connected) {
+    PlayerControls webrtc_controls = read_webrtc_player2_controls();
+
+    /* WebRTC guest devices are remote player-two input, independent of local control assignment. */
+    merge_player_controls(&controls2, &webrtc_controls);
+  }
   update_with_controls(state, &controls, &controls2, object_visuals);
 }
 
@@ -6150,6 +7170,10 @@ static int32_t amiga_rotation_to_fixed(int16_t rotation) {
 
 static float player_rotation_fixed_to_radians(int32_t rotation_fixed) {
   return ((float)rotation_fixed * 6.28318530718f) / (float)(256 << 16);
+}
+
+static int16_t player_rotation_fixed_to_amiga(int32_t rotation_fixed) {
+  return (int16_t)(((rotation_fixed + 0x8000) >> 16) & 255);
 }
 
 static float amiga_rotation_to_radians(int16_t rotation) {
@@ -7149,6 +8173,7 @@ static void free_render_framebuffer(RenderFramebuffer *framebuffer) {
   if (framebuffer->texture != NULL) {
     SDL_DestroyTexture(framebuffer->texture);
   }
+  free(framebuffer->last_frame_pixels);
   free(framebuffer->depth_buffer);
   free(framebuffer->sprite_depth_buffer);
   free(framebuffer->filled_stamps);
@@ -7159,6 +8184,7 @@ static bool ensure_render_framebuffer(SDL_Renderer *renderer, RenderFramebuffer 
   float *depth_buffer = NULL;
   float *sprite_depth_buffer = NULL;
   uint32_t *filled_stamps = NULL;
+  uint32_t *last_frame_pixels = NULL;
   SDL_Texture *texture = NULL;
 
   if (renderer == NULL || framebuffer == NULL || width <= 0 || height <= 0) {
@@ -7172,11 +8198,13 @@ static bool ensure_render_framebuffer(SDL_Renderer *renderer, RenderFramebuffer 
   depth_buffer = (float *)malloc((size_t)width * sizeof(*depth_buffer));
   sprite_depth_buffer = (float *)malloc((size_t)width * sizeof(*sprite_depth_buffer));
   filled_stamps = (uint32_t *)calloc((size_t)height, sizeof(*filled_stamps));
-  if (depth_buffer == NULL || sprite_depth_buffer == NULL || filled_stamps == NULL) {
+  last_frame_pixels = (uint32_t *)malloc((size_t)width * (size_t)height * sizeof(*last_frame_pixels));
+  if (depth_buffer == NULL || sprite_depth_buffer == NULL || filled_stamps == NULL || last_frame_pixels == NULL) {
     fprintf(stderr, "Cannot allocate PC renderer scratch buffers %dx%d\n", width, height);
     free(depth_buffer);
     free(sprite_depth_buffer);
     free(filled_stamps);
+    free(last_frame_pixels);
     return false;
   }
 
@@ -7186,6 +8214,7 @@ static bool ensure_render_framebuffer(SDL_Renderer *renderer, RenderFramebuffer 
     free(depth_buffer);
     free(sprite_depth_buffer);
     free(filled_stamps);
+    free(last_frame_pixels);
     return false;
   }
   (void)SDL_SetTextureScaleMode(texture, SDL_ScaleModeNearest);
@@ -7193,6 +8222,7 @@ static bool ensure_render_framebuffer(SDL_Renderer *renderer, RenderFramebuffer 
 
   free_render_framebuffer(framebuffer);
   framebuffer->texture = texture;
+  framebuffer->last_frame_pixels = last_frame_pixels;
   framebuffer->depth_buffer = depth_buffer;
   framebuffer->sprite_depth_buffer = sprite_depth_buffer;
   framebuffer->filled_stamps = filled_stamps;
@@ -7255,6 +8285,21 @@ static void framebuffer_clear(RenderFramebuffer *framebuffer, uint32_t argb) {
     for (x = 0u; x < count; ++x) {
       row[x] = argb;
     }
+  }
+}
+
+static void snapshot_render_framebuffer(RenderFramebuffer *framebuffer) {
+  int y = 0;
+
+  if (framebuffer == NULL || framebuffer->pixels == NULL || framebuffer->last_frame_pixels == NULL ||
+      framebuffer->width <= 0 || framebuffer->height <= 0 || framebuffer->pitch_pixels < framebuffer->width) {
+    return;
+  }
+
+  for (y = 0; y < framebuffer->height; ++y) {
+    memcpy(framebuffer->last_frame_pixels + ((size_t)y * (size_t)framebuffer->width),
+           framebuffer->pixels + ((size_t)y * (size_t)framebuffer->pitch_pixels),
+           (size_t)framebuffer->width * sizeof(*framebuffer->last_frame_pixels));
   }
 }
 
@@ -7400,19 +8445,79 @@ static void render_flat_textures(RenderFramebuffer *framebuffer, const AppState 
   }
 }
 
+static void append_player_debug_sprite(const AppState *state, const ObjectVisualSet *object_visuals,
+                                       const RuntimePlayerState *player, int16_t object_type, DebugSprite *sprites,
+                                       size_t *sprite_write, size_t sprite_capacity, int x, int w, int horizon_y,
+                                       float cam_x, float cam_z, float view_cos, float view_sin, float focal,
+                                       float near_plane, float far_depth, float frustum_ratio) {
+  GloomObjectSpawn render_spawn;
+  const ObjectVisual *visual = NULL;
+  const ObjectFrame *frame = NULL;
+  float dx = 0.0f;
+  float dz = 0.0f;
+  float svx = 0.0f;
+  float svz = 0.0f;
+  float object_y = 0.0f;
+  float scale = 1.0f;
+  float top_view_y = 0.0f;
+  float left_view_x = 0.0f;
+  DebugSprite *sp = NULL;
+
+  if (state == NULL || object_visuals == NULL || player == NULL || sprites == NULL || sprite_write == NULL ||
+      *sprite_write >= sprite_capacity || object_type < 0 || object_type >= (int16_t)GLOOM_OBJECT_TYPE_COUNT) {
+    return;
+  }
+  if (player->player_lives <= 0 || player->player_hitpoints <= 0 || player->player_dead ||
+      player->player_death_phase != GLOOM_PLAYER_DEATH_NONE) {
+    return;
+  }
+
+  visual = &object_visuals->visuals[object_type];
+  if (!visual->loaded) {
+    return;
+  }
+
+  memset(&render_spawn, 0, sizeof(render_spawn));
+  render_spawn.object_type = object_type;
+  render_spawn.x = clamp_int16(round_float_to_int32(player->camera_x));
+  render_spawn.y = 0;
+  render_spawn.z = clamp_int16(round_float_to_int32(player->camera_z));
+  render_spawn.rotation = player_rotation_fixed_to_amiga(player->player_rot_fixed);
+  frame = select_object_visual_frame_number(visual, &render_spawn, state, (size_t)(player->player_frame_fixed >> 16u));
+  if (frame == NULL || frame->width <= 0 || frame->height <= 0) {
+    return;
+  }
+
+  dx = player->camera_x - cam_x;
+  dz = player->camera_z - cam_z;
+  svx = dx * view_cos - dz * view_sin;
+  svz = dx * view_sin + dz * view_cos;
+  if (svz < near_plane || svz >= far_depth || SDL_fabsf(svx) > svz * frustum_ratio * 1.1f) {
+    return;
+  }
+
+  object_y = (float)render_spawn.y - state->camera_y;
+  scale = (float)visual->scale / 256.0f;
+  top_view_y = object_y - ((float)frame->handle_y * scale);
+  left_view_x = svx - ((float)frame->handle_x * scale);
+
+  sp = &sprites[*sprite_write];
+  sp->screen_x = (float)x + (float)w * 0.5f + (left_view_x / svz) * focal;
+  sp->screen_y = (float)horizon_y + (top_view_y / svz) * focal;
+  sp->screen_w = ((float)frame->width * scale * focal) / svz;
+  sp->screen_h = ((float)frame->height * scale * focal) / svz;
+  sp->depth = svz;
+  sp->frame = frame;
+
+  if (sp->screen_w >= 1.0f && sp->screen_h >= 1.0f) {
+    *sprite_write += 1u;
+  }
+}
+
 static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *state, const GridOffsetSet *grid_offsets,
                               const WallTextureSet *wall_textures, const FlatTextureSet *flats,
                               const ObjectVisualSet *object_visuals, const WeaponVisualSet *weapon_visuals, int x,
                               int y, int w, int h) {
-  typedef struct {
-    float screen_x;
-    float screen_y;
-    float screen_w;
-    float screen_h;
-    float depth;
-    const ObjectFrame *frame;
-  } DebugSprite;
-
   float near_plane = 1.0f;
   float view_angle = state->camera_angle;
   float cam_x = state->camera_x;
@@ -7800,6 +8905,14 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
         }
       }
     }
+  }
+
+  if (state->two_player_mode && object_visuals != NULL) {
+    int16_t other_player_object_type = state->active_player_index == 0u ? 1 : 0;
+
+    append_player_debug_sprite(state, object_visuals, &state->player2, other_player_object_type, debug_sprites,
+                               &sprite_write, GLOOM_MAX_DEBUG_SPRITES, x, w, horizon_y, cam_x, cam_z, view_cos,
+                               view_sin, focal, near_plane, far_depth, frustum_ratio);
   }
 
   if (weapon_visuals != NULL) {
@@ -8317,6 +9430,112 @@ static void render_hud_glyph_scaled(RenderFramebuffer *framebuffer, const HudGly
   render_argb_pixels_scaled(framebuffer, glyph->argb_pixels, glyph->width, glyph->height, x, y, scale);
 }
 
+static void render_hud_glyph_scaled_brightness(RenderFramebuffer *framebuffer, const HudGlyph *glyph, int x, int y,
+                                               int scale, uint8_t brightness) {
+  int sy = 0;
+
+  if (framebuffer == NULL || framebuffer->pixels == NULL || glyph == NULL || glyph->argb_pixels == NULL ||
+      scale <= 0) {
+    return;
+  }
+
+  if (brightness >= 255u) {
+    render_hud_glyph_scaled(framebuffer, glyph, x, y, scale);
+    return;
+  }
+
+  for (sy = 0; sy < glyph->height; ++sy) {
+    int sx = 0;
+
+    for (sx = 0; sx < glyph->width; ++sx) {
+      uint32_t src = glyph->argb_pixels[(size_t)sy * (size_t)glyph->width + (size_t)sx];
+      uint32_t alpha = src >> 24;
+      uint32_t r = ((src >> 16) & 0xffu) * (uint32_t)brightness / 255u;
+      uint32_t g = ((src >> 8) & 0xffu) * (uint32_t)brightness / 255u;
+      uint32_t b = (src & 0xffu) * (uint32_t)brightness / 255u;
+      int dy = 0;
+
+      if (alpha == 0u) {
+        continue;
+      }
+      for (dy = 0; dy < scale; ++dy) {
+        int py = y + (sy * scale) + dy;
+        int dx = 0;
+
+        if (py < 0 || py >= framebuffer->height) {
+          continue;
+        }
+        for (dx = 0; dx < scale; ++dx) {
+          int px = x + (sx * scale) + dx;
+
+          if (px < 0 || px >= framebuffer->width) {
+            continue;
+          }
+          framebuffer->pixels[(size_t)py * (size_t)framebuffer->pitch_pixels + (size_t)px] =
+              0xff000000u | (r << 16) | (g << 8) | b;
+        }
+      }
+    }
+  }
+}
+
+static int menu_glyph_index_for_char(unsigned char ch) {
+  if (ch >= (unsigned char)'0' && ch <= (unsigned char)'9') {
+    return (int)(ch - (unsigned char)'0');
+  }
+  if (ch == (unsigned char)'\'') {
+    return 57;
+  }
+  if (ch == (unsigned char)'!') {
+    return 36;
+  }
+  if (ch == (unsigned char)'.') {
+    return 37;
+  }
+  if (ch == (unsigned char)':') {
+    return 38;
+  }
+  if (ch == 127u) {
+    return 39;
+  }
+  return (int)(ch & 31u) + 9;
+}
+
+static void render_menu_text_brightness(RenderFramebuffer *framebuffer, const HudFont *font, const char *text,
+                                        int center_x, int y, int scale, uint8_t brightness);
+
+static void render_menu_text(RenderFramebuffer *framebuffer, const HudFont *font, const char *text, int center_x,
+                             int y, int scale) {
+  const uint8_t full_brightness = 255u;
+
+  render_menu_text_brightness(framebuffer, font, text, center_x, y, scale, full_brightness);
+}
+
+static void render_menu_text_brightness(RenderFramebuffer *framebuffer, const HudFont *font, const char *text,
+                                        int center_x, int y, int scale, uint8_t brightness) {
+  size_t len = 0u;
+  int x = 0;
+
+  if (framebuffer == NULL || font == NULL || !font->loaded || font->glyphs == NULL || text == NULL || scale <= 0) {
+    return;
+  }
+
+  len = strlen(text);
+  x = center_x - (int)(((int)len * GLOOM_MENU_BIG_FONT_WIDTH * scale) / 2);
+  while (*text != '\0') {
+    unsigned char ch = (unsigned char)*text++;
+
+    if (ch != (unsigned char)' ') {
+      int glyph_index = menu_glyph_index_for_char(ch);
+
+      if (glyph_index >= 0 && (size_t)glyph_index < font->glyph_count) {
+        render_hud_glyph_scaled_brightness(framebuffer, &font->glyphs[glyph_index], x, y, scale, brightness);
+      }
+    }
+    x += GLOOM_MENU_BIG_FONT_WIDTH * scale;
+  }
+}
+
 static void render_player_weapon_status(RenderFramebuffer *framebuffer, const AppState *state, const HudFont *hud_font,
                                         int x, int y, int w, int h) {
   int slot = 0;
@@ -8446,6 +9665,1007 @@ static void render_scene_contents(RenderFramebuffer *framebuffer, const AppState
   render_player_weapon_status(framebuffer, state, hud_font, x, y, w, h);
 }
 
+static void free_menu_image(MenuImage *image) {
+  if (image == NULL) {
+    return;
+  }
+
+  free(image->pixels);
+  memset(image, 0, sizeof(*image));
+}
+
+static void free_menu_assets(MenuAssets *assets) {
+  if (assets == NULL) {
+    return;
+  }
+
+  free_menu_image(&assets->title);
+  free_hud_font(&assets->big_font);
+}
+
+static bool load_menu_title_image(MenuImage *out_image) {
+  const char *candidates[4] = {"amiga/title.iff", "amiga/pics2/title.iff", "amiga/pics/title.iff", "title.iff"};
+  size_t i = 0u;
+
+  if (out_image == NULL) {
+    return false;
+  }
+
+  free_menu_image(out_image);
+  for (i = 0u; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
+    char resolved_path[1024] = {0};
+    GloomIffImage image;
+    char error[256] = {0};
+    uint32_t *pixels = NULL;
+    size_t pixel_index = 0u;
+
+    memset(&image, 0, sizeof(image));
+    if (!resolve_runtime_file_path(candidates[i], resolved_path, sizeof(resolved_path))) {
+      continue;
+    }
+    if (!gloom_iff_load(resolved_path, &image, error, sizeof(error))) {
+      gloom_iff_free(&image);
+      continue;
+    }
+    if (!image.has_decoded_pixels || image.width <= 0u || image.height <= 0u) {
+      gloom_iff_free(&image);
+      continue;
+    }
+
+    pixels = (uint32_t *)malloc((size_t)image.width * (size_t)image.height * sizeof(*pixels));
+    if (pixels == NULL) {
+      gloom_iff_free(&image);
+      return false;
+    }
+
+    for (pixel_index = 0u; pixel_index < image.pixel_count; ++pixel_index) {
+      pixels[pixel_index] = palette_to_argb(&image, image.pixels[pixel_index]);
+    }
+
+    out_image->loaded = true;
+    out_image->pixels = pixels;
+    out_image->width = (int)image.width;
+    out_image->height = (int)image.height;
+    gloom_iff_free(&image);
+    printf("Loaded original title image %s for menu\n", resolved_path);
+    return true;
+  }
+
+  fprintf(stderr, "Missing original title image for menu\n");
+  return false;
+}
+
+static bool load_iff_menu_image_from_candidates(const char *const *candidates, size_t candidate_count,
+                                                MenuImage *out_image) {
+  size_t i = 0u;
+
+  if (candidates == NULL || out_image == NULL) {
+    return false;
+  }
+
+  free_menu_image(out_image);
+  for (i = 0u; i < candidate_count; ++i) {
+    char resolved_path[1024] = {0};
+    GloomIffImage image;
+    char error[256] = {0};
+    uint32_t *pixels = NULL;
+    size_t pixel_index = 0u;
+
+    memset(&image, 0, sizeof(image));
+    if (candidates[i] == NULL || !resolve_runtime_file_path(candidates[i], resolved_path, sizeof(resolved_path))) {
+      continue;
+    }
+    if (!gloom_iff_load(resolved_path, &image, error, sizeof(error))) {
+      gloom_iff_free(&image);
+      continue;
+    }
+    if (!image.has_decoded_pixels || image.width <= 0u || image.height <= 0u) {
+      gloom_iff_free(&image);
+      continue;
+    }
+
+    pixels = (uint32_t *)malloc((size_t)image.width * (size_t)image.height * sizeof(*pixels));
+    if (pixels == NULL) {
+      gloom_iff_free(&image);
+      return false;
+    }
+
+    for (pixel_index = 0u; pixel_index < image.pixel_count; ++pixel_index) {
+      pixels[pixel_index] = palette_to_argb(&image, image.pixels[pixel_index]);
+    }
+
+    out_image->loaded = true;
+    out_image->pixels = pixels;
+    out_image->width = (int)image.width;
+    out_image->height = (int)image.height;
+    gloom_iff_free(&image);
+    printf("Loaded original script picture %s\n", resolved_path);
+    return true;
+  }
+
+  return false;
+}
+
+static bool load_script_picture_image(const char *picture, MenuImage *out_image) {
+  char path0[256] = {0};
+  char path1[256] = {0};
+  char path2[256] = {0};
+  char path3[256] = {0};
+  const char *candidates[4] = {path0, path1, path2, path3};
+
+  if (picture == NULL || picture[0] == '\0' || out_image == NULL) {
+    return false;
+  }
+
+  (void)snprintf(path0, sizeof(path0), "amiga/%s.iff", picture);
+  (void)snprintf(path1, sizeof(path1), "amiga/pics/%s.iff", picture);
+  (void)snprintf(path2, sizeof(path2), "amiga/data/pics/%s.iff", picture);
+  (void)snprintf(path3, sizeof(path3), "%s.iff", picture);
+  return load_iff_menu_image_from_candidates(candidates, sizeof(candidates) / sizeof(candidates[0]), out_image);
+}
+
+static bool load_menu_assets(MenuAssets *assets) {
+  if (assets == NULL) {
+    return false;
+  }
+
+  memset(assets, 0, sizeof(*assets));
+  if (!load_menu_title_image(&assets->title)) {
+    return false;
+  }
+  if (!load_menu_big_font(&assets->big_font)) {
+    free_menu_image(&assets->title);
+    return false;
+  }
+  return true;
+}
+
+static int menu_pixel_scale_for_viewport(int render_width, int render_height) {
+  int scale_x = render_width / BASE_WIDTH;
+  int scale_y = render_height / BASE_HEIGHT;
+  int scale = scale_x < scale_y ? scale_x : scale_y;
+  int power = 1;
+
+  if (scale < 1) {
+    return 1;
+  }
+  while (power * 2 <= scale && power < 8) {
+    power *= 2;
+  }
+  return power;
+}
+
+static void render_menu_image(RenderFramebuffer *framebuffer, const MenuImage *image, int render_width,
+                              int render_height) {
+  int dst_y = 0;
+
+  if (framebuffer == NULL || image == NULL || !image->loaded || image->pixels == NULL) {
+    return;
+  }
+
+  if (render_width <= 0 || render_height <= 0 || framebuffer->pixels == NULL || image->width <= 0 ||
+      image->height <= 0) {
+    return;
+  }
+
+  for (dst_y = 0; dst_y < render_height; ++dst_y) {
+    uint32_t *dst_row = framebuffer->pixels + ((size_t)dst_y * (size_t)framebuffer->pitch_pixels);
+    int dst_x = 0;
+
+    for (dst_x = 0; dst_x < render_width; ++dst_x) {
+      int64_t src_x = 0;
+      int64_t src_y = 0;
+
+      if ((int64_t)render_width * (int64_t)image->height > (int64_t)render_height * (int64_t)image->width) {
+        int64_t scaled_height = ((int64_t)render_width * (int64_t)image->height + (int64_t)image->width - 1) /
+                                (int64_t)image->width;
+        int64_t crop_y = (scaled_height - (int64_t)render_height) / 2;
+
+        src_x = ((int64_t)dst_x * (int64_t)image->width) / (int64_t)render_width;
+        src_y = (((int64_t)dst_y + crop_y) * (int64_t)image->height) / scaled_height;
+      } else {
+        int64_t scaled_width = ((int64_t)render_height * (int64_t)image->width + (int64_t)image->height - 1) /
+                               (int64_t)image->height;
+        int64_t crop_x = (scaled_width - (int64_t)render_width) / 2;
+
+        src_x = (((int64_t)dst_x + crop_x) * (int64_t)image->width) / scaled_width;
+        src_y = ((int64_t)dst_y * (int64_t)image->height) / (int64_t)render_height;
+      }
+
+      if (src_x < 0) src_x = 0;
+      if (src_y < 0) src_y = 0;
+      if (src_x >= image->width) src_x = image->width - 1;
+      if (src_y >= image->height) src_y = image->height - 1;
+      dst_row[dst_x] = image->pixels[(size_t)src_y * (size_t)image->width + (size_t)src_x];
+    }
+  }
+}
+
+static int start_menu_item_count(void) {
+#ifdef __EMSCRIPTEN__
+  return 4;
+#else
+  return 5;
+#endif
+}
+
+static int menu_row_at_point(int render_width, int render_height, int item_count, int x, int y) {
+  int scale = menu_pixel_scale_for_viewport(render_width, render_height);
+  int row_height = GLOOM_MENU_BIG_FONT_HEIGHT * scale;
+  int menu_y = 0;
+  int index = 0;
+
+  if (render_width <= 0 || render_height <= 0 || item_count <= 0 || x < 0 || x >= render_width || y < 0 ||
+      y >= render_height) {
+    return -1;
+  }
+  menu_y = (render_height / 2) - ((item_count * row_height) / 2);
+  if (y < menu_y || y >= menu_y + (item_count * row_height)) {
+    return -1;
+  }
+  index = (y - menu_y) / row_height;
+  return index >= 0 && index < item_count ? index : -1;
+}
+
+static int activate_start_menu_selection(int selected_index, GloomGameMode *out_game_mode,
+                                         RuntimeControlConfig *io_control_config, bool *io_selected_visible,
+                                         int *io_flash_ticks) {
+  if (out_game_mode == NULL || io_control_config == NULL || io_selected_visible == NULL || io_flash_ticks == NULL) {
+    return -1;
+  }
+  if (selected_index == 0) {
+    *out_game_mode = GLOOM_GAME_MODE_ONE_PLAYER;
+    return 1;
+  }
+  if (selected_index == 1) {
+    *out_game_mode = GLOOM_GAME_MODE_TWO_PLAYER;
+    return 1;
+  }
+  if (selected_index == 2) {
+    cycle_control_config(io_control_config, 0u);
+    *io_selected_visible = false;
+    *io_flash_ticks = GLOOM_MENU_FLASH_TICKS;
+    return 0;
+  }
+  if (selected_index == 3) {
+    cycle_control_config(io_control_config, 1u);
+    *io_selected_visible = false;
+    *io_flash_ticks = GLOOM_MENU_FLASH_TICKS;
+    return 0;
+  }
+  if (selected_index == 4) {
+    return -1;
+  }
+  return 0;
+}
+
+static void render_start_menu_frame(RenderFramebuffer *framebuffer, const MenuAssets *assets, int render_width,
+                                    int render_height, int selected_index, bool selected_visible,
+                                    uint8_t violence_mode, const RuntimeControlConfig *control_config) {
+  const char *items[6];
+  int item_count = start_menu_item_count();
+  char player1_item[32];
+  char player2_item[32];
+  int scale = 1;
+  int title_scale = 4;
+  int y = 0;
+  int title_y = 0;
+  int title_width = 0;
+  int i = 0;
+
+  if (framebuffer == NULL || assets == NULL) {
+    return;
+  }
+  (void)violence_mode;
+
+  (void)snprintf(player1_item, sizeof(player1_item), "PLAYER 1 %s",
+                 control_source_menu_name(control_config != NULL ? control_config->player1 : GLOOM_CONTROL_KEYBOARD));
+  (void)snprintf(player2_item, sizeof(player2_item), "PLAYER 2 %s",
+                 control_source_menu_name(control_config != NULL ? control_config->player2 : GLOOM_CONTROL_GAMEPAD_1));
+  items[0] = "ONE PLAYER GAME";
+  items[1] = "TWO PLAYER GAME";
+  items[2] = player1_item;
+  items[3] = player2_item;
+  items[4] = "EXIT GLOOM";
+
+  framebuffer_clear(framebuffer, 0xFF000000u);
+  render_menu_image(framebuffer, &assets->title, render_width, render_height);
+
+  scale = menu_pixel_scale_for_viewport(render_width, render_height);
+  title_width = (int)(strlen("GLOOM WITH FRIENDS") * (size_t)GLOOM_MENU_BIG_FONT_WIDTH * (size_t)title_scale);
+  while (title_scale > 1 && title_width > render_width) {
+    title_scale /= 2;
+    title_width = (int)(strlen("GLOOM WITH FRIENDS") * (size_t)GLOOM_MENU_BIG_FONT_WIDTH * (size_t)title_scale);
+  }
+  y = (render_height / 2) - ((item_count * GLOOM_MENU_BIG_FONT_HEIGHT * scale) / 2);
+  title_y = y - (GLOOM_MENU_BIG_FONT_HEIGHT * title_scale) - ((GLOOM_MENU_BIG_FONT_HEIGHT * scale * 21) / 2);
+  if (title_y < GLOOM_MENU_BIG_FONT_HEIGHT) {
+    title_y = GLOOM_MENU_BIG_FONT_HEIGHT;
+  }
+  render_menu_text_brightness(framebuffer, &assets->big_font, "GLOOM WITH FRIENDS", render_width / 2, title_y,
+                              title_scale, 255u);
+  for (i = 0; i < item_count; ++i) {
+    uint8_t brightness = (i == selected_index && !selected_visible) ? 96u : 255u;
+
+    render_menu_text_brightness(framebuffer, &assets->big_font, items[i], render_width / 2,
+                                y + (i * GLOOM_MENU_BIG_FONT_HEIGHT * scale), scale, brightness);
+  }
+}
+
+static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const MenuAssets *assets,
+                          int render_width, int render_height, GloomGameMode *out_game_mode,
+                          uint8_t *io_violence_mode, RuntimeControlConfig *io_control_config) {
+  int selected_index = 0;
+  int flash_ticks = GLOOM_MENU_FLASH_TICKS;
+  bool selected_visible = false;
+  bool running = true;
+  uint32_t last_tick = SDL_GetTicks();
+
+  if (renderer == NULL || framebuffer == NULL || assets == NULL || out_game_mode == NULL ||
+      io_violence_mode == NULL || io_control_config == NULL) {
+    return -1;
+  }
+  normalize_control_config(io_control_config);
+  if (*out_game_mode == GLOOM_GAME_MODE_TWO_PLAYER) {
+    selected_index = 1;
+  } else if (*out_game_mode == GLOOM_GAME_MODE_COMBAT) {
+    selected_index = 1;
+  }
+
+  while (running) {
+    SDL_Event event;
+    uint32_t now = SDL_GetTicks();
+    const int item_count = start_menu_item_count();
+
+    while (SDL_PollEvent(&event) != 0) {
+      gamepad_handle_event(&event);
+      if (event.type == SDL_QUIT) {
+        return -1;
+      }
+      if (event.type == SDL_KEYDOWN && event.key.repeat == 0) {
+        SDL_Keycode sym = event.key.keysym.sym;
+
+        if (sym == SDLK_UP || sym == SDLK_w) {
+          selected_index -= 1;
+          if (selected_index < 0) selected_index = item_count - 1;
+          selected_visible = false;
+          flash_ticks = GLOOM_MENU_FLASH_TICKS;
+          audio_play_ui_move();
+        } else if (sym == SDLK_DOWN || sym == SDLK_s) {
+          selected_index += 1;
+          if (selected_index >= item_count) selected_index = 0;
+          selected_visible = false;
+          flash_ticks = GLOOM_MENU_FLASH_TICKS;
+          audio_play_ui_move();
+        } else if (sym == SDLK_RETURN || sym == SDLK_SPACE || sym == SDLK_LCTRL || sym == SDLK_RCTRL) {
+          int result =
+              activate_start_menu_selection(selected_index, out_game_mode, io_control_config, &selected_visible,
+                                            &flash_ticks);
+          audio_play_ui_activate();
+          if (result > 0) {
+            return 0;
+          }
+          if (result < 0) {
+            return -1;
+          }
+        } else if (sym == SDLK_ESCAPE) {
+#ifndef __EMSCRIPTEN__
+          audio_play_ui_back();
+          return -1;
+#endif
+        }
+      }
+      if (event.type == SDL_MOUSEMOTION) {
+        int hover_index = menu_row_at_point(render_width, render_height, item_count, event.motion.x, event.motion.y);
+
+        if (hover_index >= 0 && hover_index != selected_index) {
+          selected_index = hover_index;
+          selected_visible = false;
+          flash_ticks = GLOOM_MENU_FLASH_TICKS;
+          audio_play_ui_move();
+        }
+      }
+      if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT) {
+        int click_index = menu_row_at_point(render_width, render_height, item_count, event.button.x, event.button.y);
+
+        if (click_index >= 0) {
+          int result = 0;
+
+          selected_index = click_index;
+          selected_visible = true;
+          result = activate_start_menu_selection(selected_index, out_game_mode, io_control_config, &selected_visible,
+                                                 &flash_ticks);
+          audio_play_ui_activate();
+          if (result > 0) {
+            return 0;
+          }
+          if (result < 0) {
+            return -1;
+          }
+        }
+      }
+      if (event.type == SDL_CONTROLLERBUTTONDOWN) {
+        if (event.cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_UP) {
+          selected_index -= 1;
+          if (selected_index < 0) selected_index = item_count - 1;
+          selected_visible = false;
+          flash_ticks = GLOOM_MENU_FLASH_TICKS;
+          audio_play_ui_move();
+        } else if (event.cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_DOWN) {
+          selected_index += 1;
+          if (selected_index >= item_count) selected_index = 0;
+          selected_visible = false;
+          flash_ticks = GLOOM_MENU_FLASH_TICKS;
+          audio_play_ui_move();
+        } else if (gamepad_menu_activate_event(&event)) {
+          int result =
+              activate_start_menu_selection(selected_index, out_game_mode, io_control_config, &selected_visible,
+                                            &flash_ticks);
+          audio_play_ui_activate();
+          if (result > 0) {
+            return 0;
+          }
+          if (result < 0) {
+            return -1;
+          }
+        } else if (gamepad_menu_back_event(&event)) {
+#ifndef __EMSCRIPTEN__
+          audio_play_ui_back();
+          return -1;
+#endif
+        }
+      }
+    }
+
+    if (now - last_tick >= (uint32_t)(1000 / GLOOM_AMIGA_GAME_TICK_HZ)) {
+      last_tick = now;
+      flash_ticks -= 1;
+      if (flash_ticks <= 0) {
+        selected_visible = !selected_visible;
+        flash_ticks = GLOOM_MENU_FLASH_TICKS;
+      }
+    }
+
+    if (begin_render_framebuffer(framebuffer)) {
+      render_start_menu_frame(framebuffer, assets, render_width, render_height, selected_index, selected_visible,
+                              *io_violence_mode, io_control_config);
+      end_render_framebuffer(framebuffer);
+      SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+      SDL_RenderClear(renderer);
+      {
+        SDL_Rect dst = {0, 0, render_width, render_height};
+        (void)SDL_RenderCopy(renderer, framebuffer->texture, NULL, &dst);
+      }
+      SDL_RenderPresent(renderer);
+    }
+    SDL_Delay(1);
+  }
+
+  return -1;
+}
+
+static bool load_combat_menu_image(MenuImage *out_image) {
+  const char *candidates[5] = {"amiga/combat.iff", "amiga/combat", "amiga/pics/combat", "amiga/data/pics/combat",
+                               "combat.iff"};
+
+  return load_iff_menu_image_from_candidates(candidates, sizeof(candidates) / sizeof(candidates[0]), out_image);
+}
+
+static void render_combat_menu_frame(RenderFramebuffer *framebuffer, const MenuImage *image, const HudFont *font,
+                                     int render_width, int render_height, int selected_index, bool selected_visible,
+                                     int16_t lives) {
+  const char *items[4];
+  char lives_item[32];
+  int scale = 1;
+  int y = 0;
+  int i = 0;
+
+  if (framebuffer == NULL || font == NULL) {
+    return;
+  }
+
+  items[0] = "PLAY SPACEHULK SERIES";
+  items[1] = "PLAY GOTHIC TOMB SERIES";
+  items[2] = "PLAY HELL SERIES";
+  (void)snprintf(lives_item, sizeof(lives_item), "START WITH %d LIVES", (int)lives);
+  items[3] = lives_item;
+
+  framebuffer_clear(framebuffer, 0xFF000000u);
+  render_menu_image(framebuffer, image, render_width, render_height);
+  scale = menu_pixel_scale_for_viewport(render_width, render_height);
+  y = (render_height / 2) - (((int)(sizeof(items) / sizeof(items[0])) * GLOOM_MENU_BIG_FONT_HEIGHT * scale) / 2);
+  for (i = 0; i < (int)(sizeof(items) / sizeof(items[0])); ++i) {
+    uint8_t brightness = (i == selected_index && !selected_visible) ? 96u : 255u;
+
+    render_menu_text_brightness(framebuffer, font, items[i], render_width / 2,
+                                y + (i * GLOOM_MENU_BIG_FONT_HEIGHT * scale), scale, brightness);
+  }
+}
+
+static int run_combat_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, int render_width, int render_height,
+                           uint8_t *out_series, int16_t *out_lives) {
+  MenuImage image;
+  HudFont font;
+  int selected_index = 0;
+  int flash_ticks = GLOOM_MENU_FLASH_TICKS;
+  bool selected_visible = false;
+  uint32_t last_tick = SDL_GetTicks();
+  int16_t lives = 3;
+
+  memset(&image, 0, sizeof(image));
+  memset(&font, 0, sizeof(font));
+  if (renderer == NULL || framebuffer == NULL || out_series == NULL || out_lives == NULL) {
+    return -1;
+  }
+  if (!load_combat_menu_image(&image) || !load_menu_big_font(&font)) {
+    free_menu_image(&image);
+    free_hud_font(&font);
+    return -1;
+  }
+
+  while (true) {
+    SDL_Event event;
+    uint32_t now = SDL_GetTicks();
+
+    while (SDL_PollEvent(&event) != 0) {
+      gamepad_handle_event(&event);
+      if (event.type == SDL_QUIT) {
+        free_menu_image(&image);
+        free_hud_font(&font);
+        return -1;
+      }
+      if (event.type == SDL_KEYDOWN && event.key.repeat == 0) {
+        SDL_Keycode sym = event.key.keysym.sym;
+
+        if (sym == SDLK_UP || sym == SDLK_w) {
+          selected_index -= 1;
+          if (selected_index < 0) selected_index = 3;
+          selected_visible = false;
+          flash_ticks = GLOOM_MENU_FLASH_TICKS;
+          audio_play_ui_move();
+        } else if (sym == SDLK_DOWN || sym == SDLK_s) {
+          selected_index += 1;
+          if (selected_index > 3) selected_index = 0;
+          selected_visible = false;
+          flash_ticks = GLOOM_MENU_FLASH_TICKS;
+          audio_play_ui_move();
+        } else if (sym == SDLK_RETURN || sym == SDLK_SPACE || sym == SDLK_LCTRL || sym == SDLK_RCTRL) {
+          audio_play_ui_activate();
+          if (selected_index < 3) {
+            *out_series = (uint8_t)(selected_index + 1);
+            *out_lives = lives;
+            free_menu_image(&image);
+            free_hud_font(&font);
+            return 0;
+          }
+          lives += 1;
+          if (lives > 9) {
+            lives = 2;
+          }
+        } else if (sym == SDLK_ESCAPE) {
+          audio_play_ui_back();
+          free_menu_image(&image);
+          free_hud_font(&font);
+          return -1;
+        }
+      }
+      if (event.type == SDL_CONTROLLERBUTTONDOWN) {
+        if (event.cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_UP) {
+          selected_index -= 1;
+          if (selected_index < 0) selected_index = 3;
+          selected_visible = false;
+          flash_ticks = GLOOM_MENU_FLASH_TICKS;
+          audio_play_ui_move();
+        } else if (event.cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_DOWN) {
+          selected_index += 1;
+          if (selected_index > 3) selected_index = 0;
+          selected_visible = false;
+          flash_ticks = GLOOM_MENU_FLASH_TICKS;
+          audio_play_ui_move();
+        } else if (gamepad_menu_activate_event(&event)) {
+          audio_play_ui_activate();
+          if (selected_index < 3) {
+            *out_series = (uint8_t)(selected_index + 1);
+            *out_lives = lives;
+            free_menu_image(&image);
+            free_hud_font(&font);
+            return 0;
+          }
+          lives += 1;
+          if (lives > 9) {
+            lives = 2;
+          }
+        } else if (gamepad_menu_back_event(&event)) {
+          audio_play_ui_back();
+          free_menu_image(&image);
+          free_hud_font(&font);
+          return -1;
+        }
+      }
+    }
+
+    if (now - last_tick >= (uint32_t)(1000 / GLOOM_AMIGA_GAME_TICK_HZ)) {
+      last_tick = now;
+      flash_ticks -= 1;
+      if (flash_ticks <= 0) {
+        selected_visible = !selected_visible;
+        flash_ticks = GLOOM_MENU_FLASH_TICKS;
+      }
+    }
+
+    if (begin_render_framebuffer(framebuffer)) {
+      render_combat_menu_frame(framebuffer, &image, &font, render_width, render_height, selected_index,
+                               selected_visible, lives);
+      end_render_framebuffer(framebuffer);
+      SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+      SDL_RenderClear(renderer);
+      {
+        SDL_Rect dst = {0, 0, render_width, render_height};
+        (void)SDL_RenderCopy(renderer, framebuffer->texture, NULL, &dst);
+      }
+      SDL_RenderPresent(renderer);
+    }
+    SDL_Delay(1);
+  }
+}
+
+static bool run_combat_result_screen(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, int render_width,
+                                     int render_height, const char *message) {
+  MenuImage image;
+  HudFont font;
+  bool running = true;
+
+  memset(&image, 0, sizeof(image));
+  memset(&font, 0, sizeof(font));
+  if (renderer == NULL || framebuffer == NULL || message == NULL) {
+    return false;
+  }
+  if (!load_combat_menu_image(&image) || !load_menu_big_font(&font)) {
+    free_menu_image(&image);
+    free_hud_font(&font);
+    return false;
+  }
+
+  while (running) {
+    SDL_Event event;
+
+    while (SDL_PollEvent(&event) != 0) {
+      gamepad_handle_event(&event);
+      if (event.type == SDL_QUIT) {
+        free_menu_image(&image);
+        free_hud_font(&font);
+        return false;
+      }
+      if (event.type == SDL_KEYDOWN || event.type == SDL_MOUSEBUTTONDOWN || event.type == SDL_CONTROLLERBUTTONDOWN) {
+        running = false;
+      }
+    }
+
+    if (begin_render_framebuffer(framebuffer)) {
+      framebuffer_clear(framebuffer, 0xFF000000u);
+      render_menu_image(framebuffer, &image, render_width, render_height);
+      render_menu_text(framebuffer, &font, message, render_width / 2, render_height / 2,
+                       menu_pixel_scale_for_viewport(render_width, render_height));
+      end_render_framebuffer(framebuffer);
+      SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+      SDL_RenderClear(renderer);
+      {
+        SDL_Rect dst = {0, 0, render_width, render_height};
+        (void)SDL_RenderCopy(renderer, framebuffer->texture, NULL, &dst);
+      }
+      SDL_RenderPresent(renderer);
+    }
+    SDL_Delay(1);
+  }
+
+  free_menu_image(&image);
+  free_hud_font(&font);
+  return true;
+}
+
+static void render_pause_menu_frame(RenderFramebuffer *framebuffer, const HudFont *font, const uint32_t *background,
+                                    int background_pitch_pixels, int render_width, int render_height,
+                                    int selected_index, bool selected_visible) {
+  const char *items[2] = {"CONTINUE", "RETURN TO MAIN MENU"};
+  int scale = 1;
+  int y = 0;
+  int i = 0;
+
+  if (framebuffer == NULL || font == NULL) {
+    return;
+  }
+
+  if (background != NULL && background_pitch_pixels > 0 && framebuffer->pixels != NULL) {
+    int py = 0;
+
+    for (py = 0; py < render_height; ++py) {
+      uint32_t *dst_row = framebuffer->pixels + ((size_t)py * (size_t)framebuffer->pitch_pixels);
+      const uint32_t *src_row = background + ((size_t)py * (size_t)background_pitch_pixels);
+
+      memcpy(dst_row, src_row, (size_t)render_width * sizeof(*dst_row));
+    }
+  } else {
+    framebuffer_clear(framebuffer, 0xFF000000u);
+  }
+  scale = menu_pixel_scale_for_viewport(render_width, render_height);
+  y = (render_height / 2) - (((int)(sizeof(items) / sizeof(items[0])) * GLOOM_MENU_BIG_FONT_HEIGHT * scale) / 2);
+  for (i = 0; i < (int)(sizeof(items) / sizeof(items[0])); ++i) {
+    uint8_t brightness = (i == selected_index && !selected_visible) ? 96u : 255u;
+
+    render_menu_text_brightness(framebuffer, font, items[i], render_width / 2,
+                                y + (i * GLOOM_MENU_BIG_FONT_HEIGHT * scale), scale, brightness);
+  }
+}
+
+static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer, RenderFramebuffer *framebuffer,
+                                      int render_width, int render_height, bool *io_mouse_captured,
+                                      int *io_mouse_dx_accum, bool *io_suppress_mouse_fire_until_button_up) {
+  static uint32_t *pause_background = NULL;
+  static size_t pause_background_capacity = 0u;
+  HudFont font;
+  int selected_index = 0;
+  int flash_ticks = GLOOM_MENU_FLASH_TICKS;
+  bool selected_visible = true;
+  uint32_t last_tick = SDL_GetTicks();
+  size_t required_pixels = 0u;
+  bool pause_background_valid = false;
+
+  memset(&font, 0, sizeof(font));
+  if (window == NULL || renderer == NULL || framebuffer == NULL || io_mouse_captured == NULL ||
+      io_mouse_dx_accum == NULL || io_suppress_mouse_fire_until_button_up == NULL) {
+    return PAUSE_MENU_QUIT;
+  }
+  if (!load_menu_big_font(&font)) {
+    return PAUSE_MENU_QUIT;
+  }
+  required_pixels = (size_t)render_width * (size_t)render_height;
+  if (required_pixels > 0u && pause_background_capacity < required_pixels) {
+    uint32_t *new_background = (uint32_t *)realloc(pause_background, required_pixels * sizeof(*pause_background));
+
+    if (new_background == NULL) {
+      free_hud_font(&font);
+      return PAUSE_MENU_QUIT;
+    }
+    pause_background = new_background;
+    pause_background_capacity = required_pixels;
+  }
+  if (pause_background != NULL && framebuffer->last_frame_pixels != NULL && framebuffer->width == render_width &&
+      framebuffer->height == render_height) {
+    int py = 0;
+
+    for (py = 0; py < render_height; ++py) {
+      memcpy(pause_background + ((size_t)py * (size_t)render_width),
+             framebuffer->last_frame_pixels + ((size_t)py * (size_t)render_width),
+             (size_t)render_width * sizeof(*pause_background));
+    }
+    pause_background_valid = true;
+  }
+  audio_pause_output(&g_audio, true, true);
+  audio_pause_output(&g_audio, false, false);
+  audio_play_ui_activate();
+
+  while (true) {
+    SDL_Event event;
+    uint32_t now = SDL_GetTicks();
+
+#ifdef __EMSCRIPTEN__
+    if (runtime_emscripten_consume_pointer_lock_lost()) {
+      (void)set_runtime_mouse_capture(window, false);
+      *io_mouse_captured = false;
+      *io_mouse_dx_accum = 0;
+      *io_suppress_mouse_fire_until_button_up = false;
+      SDL_FlushEvent(SDL_MOUSEMOTION);
+    }
+#endif
+
+    while (SDL_PollEvent(&event) != 0) {
+      gamepad_handle_event(&event);
+      if (event.type == SDL_QUIT) {
+        audio_pause_output(&g_audio, false, false);
+        free_hud_font(&font);
+        return PAUSE_MENU_QUIT;
+      }
+      if (event.type == SDL_KEYDOWN && event.key.repeat == 0) {
+        SDL_Keycode sym = event.key.keysym.sym;
+
+        if (sym == SDLK_UP || sym == SDLK_w || sym == SDLK_DOWN || sym == SDLK_s) {
+          selected_index = selected_index == 0 ? 1 : 0;
+          selected_visible = false;
+          flash_ticks = GLOOM_MENU_FLASH_TICKS;
+          audio_play_ui_move();
+        } else if (sym == SDLK_RETURN || sym == SDLK_SPACE || sym == SDLK_LCTRL || sym == SDLK_RCTRL) {
+          PauseMenuResult result = selected_index == 0 ? PAUSE_MENU_CONTINUE : PAUSE_MENU_MAIN_MENU;
+          audio_play_ui_activate();
+          audio_pause_output(&g_audio, false, false);
+          free_hud_font(&font);
+          return result;
+        } else if (sym == SDLK_p) {
+          audio_play_ui_activate();
+          audio_pause_output(&g_audio, false, false);
+          free_hud_font(&font);
+          return PAUSE_MENU_CONTINUE;
+        } else if (sym == SDLK_ESCAPE) {
+          if (*io_mouse_captured || g_runtime_mouse_capture_active || SDL_GetRelativeMouseMode()) {
+            audio_play_ui_back();
+            (void)set_runtime_mouse_capture(window, false);
+            *io_mouse_captured = false;
+            *io_mouse_dx_accum = 0;
+            *io_suppress_mouse_fire_until_button_up = false;
+            SDL_FlushEvent(SDL_MOUSEMOTION);
+          }
+        }
+      }
+      if (event.type == SDL_MOUSEBUTTONDOWN && event.button.clicks >= 2) {
+        if (event.button.button == SDL_BUTTON_LEFT) {
+          int click_index = menu_row_at_point(render_width, render_height, 2, event.button.x, event.button.y);
+
+          if (click_index >= 0) {
+            PauseMenuResult result = click_index == 0 ? PAUSE_MENU_CONTINUE : PAUSE_MENU_MAIN_MENU;
+
+            selected_index = click_index;
+            audio_play_ui_activate();
+            audio_pause_output(&g_audio, false, false);
+            free_hud_font(&font);
+            return result;
+          }
+        }
+        if (!*io_mouse_captured && set_runtime_mouse_capture(window, true)) {
+          *io_mouse_captured = true;
+          *io_mouse_dx_accum = 0;
+          *io_suppress_mouse_fire_until_button_up = event.button.button == SDL_BUTTON_LEFT;
+          SDL_FlushEvent(SDL_MOUSEMOTION);
+        }
+      } else if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT) {
+        int click_index = menu_row_at_point(render_width, render_height, 2, event.button.x, event.button.y);
+
+        if (click_index >= 0) {
+          PauseMenuResult result = click_index == 0 ? PAUSE_MENU_CONTINUE : PAUSE_MENU_MAIN_MENU;
+
+          selected_index = click_index;
+          audio_play_ui_activate();
+          audio_pause_output(&g_audio, false, false);
+          free_hud_font(&font);
+          return result;
+        }
+      }
+      if (event.type == SDL_MOUSEMOTION) {
+        int hover_index = menu_row_at_point(render_width, render_height, 2, event.motion.x, event.motion.y);
+
+        if (hover_index >= 0 && hover_index != selected_index) {
+          selected_index = hover_index;
+          selected_visible = false;
+          flash_ticks = GLOOM_MENU_FLASH_TICKS;
+          audio_play_ui_move();
+        }
+      }
+      if (event.type == SDL_MOUSEBUTTONUP && event.button.button == SDL_BUTTON_LEFT) {
+        *io_suppress_mouse_fire_until_button_up = false;
+      }
+      if (event.type == SDL_CONTROLLERBUTTONDOWN) {
+        if (event.cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_UP ||
+            event.cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_DOWN) {
+          selected_index = selected_index == 0 ? 1 : 0;
+          selected_visible = false;
+          flash_ticks = GLOOM_MENU_FLASH_TICKS;
+          audio_play_ui_move();
+        } else if (gamepad_menu_activate_event(&event)) {
+          PauseMenuResult result = selected_index == 0 ? PAUSE_MENU_CONTINUE : PAUSE_MENU_MAIN_MENU;
+          audio_play_ui_activate();
+          audio_pause_output(&g_audio, false, false);
+          free_hud_font(&font);
+          return result;
+        } else if (gamepad_menu_back_event(&event)) {
+          audio_play_ui_back();
+          audio_pause_output(&g_audio, false, false);
+          free_hud_font(&font);
+          return PAUSE_MENU_CONTINUE;
+        }
+      }
+    }
+
+    if (now - last_tick >= (uint32_t)(1000 / GLOOM_AMIGA_GAME_TICK_HZ)) {
+      last_tick = now;
+      flash_ticks -= 1;
+      if (flash_ticks <= 0) {
+        selected_visible = !selected_visible;
+        flash_ticks = GLOOM_MENU_FLASH_TICKS;
+      }
+    }
+
+    if (begin_render_framebuffer(framebuffer)) {
+      render_pause_menu_frame(framebuffer, &font, pause_background_valid ? pause_background : NULL, render_width,
+                              render_width, render_height, selected_index, selected_visible);
+      end_render_framebuffer(framebuffer);
+      SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+      SDL_RenderClear(renderer);
+      {
+        SDL_Rect dst = {0, 0, render_width, render_height};
+        (void)SDL_RenderCopy(renderer, framebuffer->texture, NULL, &dst);
+      }
+      SDL_RenderPresent(renderer);
+    }
+    SDL_Delay(1);
+  }
+}
+
+static void render_completion_frame(RenderFramebuffer *framebuffer, const MenuImage *image, const HudFont *font,
+                                    const char *text, int render_width, int render_height) {
+  int scale = 1;
+  int y = 0;
+
+  if (framebuffer == NULL) {
+    return;
+  }
+
+  framebuffer_clear(framebuffer, 0xFF000000u);
+  render_menu_image(framebuffer, image, render_width, render_height);
+  if (font == NULL || text == NULL || text[0] == '\0') {
+    return;
+  }
+
+  scale = menu_pixel_scale_for_viewport(render_width, render_height);
+  y = render_height - (GLOOM_MENU_BIG_FONT_HEIGHT * scale * 3);
+  if (y < GLOOM_MENU_BIG_FONT_HEIGHT * scale) {
+    y = GLOOM_MENU_BIG_FONT_HEIGHT * scale;
+  }
+  render_menu_text(framebuffer, font, text, render_width / 2, y, scale);
+}
+
+static bool run_completion_screen(SDL_Renderer *renderer, RenderFramebuffer *framebuffer,
+                                  const ScriptCompletion *completion, int render_width, int render_height) {
+  MenuImage image;
+  HudFont font;
+  bool running = true;
+
+  memset(&image, 0, sizeof(image));
+  memset(&font, 0, sizeof(font));
+  if (renderer == NULL || framebuffer == NULL || completion == NULL) {
+    return false;
+  }
+  if (!load_script_picture_image(completion->picture, &image)) {
+    fprintf(stderr, "Cannot execute scriptdone completion screen: missing original pict_%s image\n",
+            completion->picture);
+    return false;
+  }
+  if (!load_menu_big_font(&font)) {
+    free_menu_image(&image);
+    return false;
+  }
+
+  while (running) {
+    SDL_Event event;
+
+    while (SDL_PollEvent(&event) != 0) {
+      gamepad_handle_event(&event);
+      if (event.type == SDL_QUIT) {
+        free_hud_font(&font);
+        free_menu_image(&image);
+        return false;
+      }
+      if (event.type == SDL_KEYDOWN || event.type == SDL_MOUSEBUTTONDOWN || event.type == SDL_CONTROLLERBUTTONDOWN) {
+        running = false;
+      }
+    }
+
+    if (begin_render_framebuffer(framebuffer)) {
+      render_completion_frame(framebuffer, &image, &font, completion->text, render_width, render_height);
+      end_render_framebuffer(framebuffer);
+      SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+      SDL_RenderClear(renderer);
+      {
+        SDL_Rect dst = {0, 0, render_width, render_height};
+        (void)SDL_RenderCopy(renderer, framebuffer->texture, NULL, &dst);
+      }
+      SDL_RenderPresent(renderer);
+    }
+    SDL_Delay(1);
+  }
+
+  free_hud_font(&font);
+  free_menu_image(&image);
+  return true;
+}
+
 static bool render_pixelate_texture(SDL_Renderer *renderer, SDL_Texture *texture, int render_width, int render_height,
                                     int pixsize) {
   int block = pixsize;
@@ -8518,21 +10738,26 @@ static void render(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const
   framebuffer_clear(framebuffer, 0xFF000000u);
   if (state != NULL && state->two_player_mode) {
     AppState player2_state = *state;
-    int top_h = render_height / 2;
-    int bottom_h = render_height - top_h;
+    RuntimePlayerState player1_state;
+    int left_w = render_width / 2;
+    int right_w = render_width - left_w;
 
+    capture_primary_player_state(state, &player1_state);
     render_scene_contents(framebuffer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals,
-                          hud_font, 0, 0, render_width, top_h);
-    apply_player_red_palette_rect(framebuffer, state, 0, 0, render_width, top_h);
+                          hud_font, 0, 0, left_w, render_height);
+    apply_player_red_palette_rect(framebuffer, state, 0, 0, left_w, render_height);
     apply_primary_player_state(&player2_state, &state->player2);
+    player2_state.player2 = player1_state;
+    player2_state.active_player_index = 1u;
     render_scene_contents(framebuffer, &player2_state, grid_offsets, wall_textures, flat_textures, object_visuals,
-                          weapon_visuals, hud_font, 0, top_h, render_width, bottom_h);
-    apply_player_red_palette_rect(framebuffer, &player2_state, 0, top_h, render_width, bottom_h);
+                          weapon_visuals, hud_font, left_w, 0, right_w, render_height);
+    apply_player_red_palette_rect(framebuffer, &player2_state, left_w, 0, right_w, render_height);
   } else {
     render_scene_contents(framebuffer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals,
                           hud_font, 0, 0, render_width, render_height);
     apply_player_red_palette(framebuffer, state);
   }
+  snapshot_render_framebuffer(framebuffer);
   end_render_framebuffer(framebuffer);
 
   SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
@@ -8695,6 +10920,7 @@ static AppState interpolate_render_state(const AppState *previous, const AppStat
   }
 
   render_state.player_rot_fixed = current->player_rot_fixed;
+  render_state.player_frame_fixed = current->player_frame_fixed;
   render_state.camera_angle = current->camera_angle;
   if (previous->two_player_mode && current->two_player_mode) {
     render_state.player2.camera_x =
@@ -8706,6 +10932,7 @@ static AppState interpolate_render_state(const AppState *previous, const AppStat
     render_state.player2.player_bounce =
         previous->player2.player_bounce + ((current->player2.player_bounce - previous->player2.player_bounce) * alpha);
     render_state.player2.player_rot_fixed = current->player2.player_rot_fixed;
+    render_state.player2.player_frame_fixed = current->player2.player_frame_fixed;
     render_state.player2.camera_angle = current->player2.camera_angle;
   }
   return render_state;
@@ -8717,6 +10944,112 @@ static bool combat_selftest_expect(bool condition, const char *message) {
     return false;
   }
   return true;
+}
+
+static bool input_selftest_expect(bool condition, const char *message) {
+  if (!condition) {
+    fprintf(stderr, "Input selftest failed: %s\n", message);
+    return false;
+  }
+  return true;
+}
+
+static int run_input_selftest(void) {
+  AppState state;
+  PlayerControls keyboard_controls;
+  PlayerControls gamepad_controls;
+  RuntimeControlConfig config;
+
+  if (!input_selftest_expect(gamepad_axis_with_deadzone(0, GLOOM_GAMEPAD_MOVE_DEADZONE) == 0,
+                             "zero axis stays neutral")) {
+    return 1;
+  }
+  if (!input_selftest_expect(gamepad_axis_with_deadzone((Sint16)GLOOM_GAMEPAD_MOVE_DEADZONE,
+                                                       GLOOM_GAMEPAD_MOVE_DEADZONE) == 0,
+                             "deadzone edge stays neutral")) {
+    return 1;
+  }
+  if (!input_selftest_expect(gamepad_axis_with_deadzone(32767, GLOOM_GAMEPAD_MOVE_DEADZONE) == 32767,
+                             "positive axis scales to full range")) {
+    return 1;
+  }
+  if (!input_selftest_expect(gamepad_axis_with_deadzone(-32768, GLOOM_GAMEPAD_MOVE_DEADZONE) == -32767,
+                             "negative axis clamps to full range")) {
+    return 1;
+  }
+  if (!input_selftest_expect(gamepad_axis_to_mouse_delta(0) == 0 &&
+                                 gamepad_axis_to_mouse_delta(GLOOM_GAMEPAD_LOOK_MIN_DELTA_AXIS - 1) == 0,
+                             "look minimum suppresses small axis motion")) {
+    return 1;
+  }
+  if (!input_selftest_expect(gamepad_axis_to_mouse_delta(32767) > 0 &&
+                                 gamepad_axis_to_mouse_delta(-32767) < 0,
+                             "look axis produces signed mouse deltas")) {
+    return 1;
+  }
+
+  memset(&keyboard_controls, 0, sizeof(keyboard_controls));
+  memset(&gamepad_controls, 0, sizeof(gamepad_controls));
+  keyboard_controls.joyy = -1;
+  gamepad_controls.joyx = 1;
+  gamepad_controls.joys = -1;
+  gamepad_controls.fire = true;
+  merge_player_controls(&keyboard_controls, &gamepad_controls);
+  if (!input_selftest_expect(keyboard_controls.joyy == -1 && keyboard_controls.joyx == 1 &&
+                                 keyboard_controls.joys == -1 && keyboard_controls.fire,
+                             "gamepad controls merge with keyboard controls")) {
+    return 1;
+  }
+
+  config.player1 = GLOOM_CONTROL_KEYBOARD;
+  config.player2 = GLOOM_CONTROL_GAMEPAD_1;
+  cycle_control_config(&config, 0u);
+  if (!input_selftest_expect(config.player1 == GLOOM_CONTROL_GAMEPAD_1 &&
+                                 config.player2 == GLOOM_CONTROL_GAMEPAD_2,
+                             "selecting two joysticks assigns player one joystick 1 and player two joystick 2")) {
+    return 1;
+  }
+  cycle_control_config(&config, 1u);
+  if (!input_selftest_expect(config.player1 != config.player2, "players cannot select the same controls")) {
+    return 1;
+  }
+  config.player1 = GLOOM_CONTROL_KEYBOARD;
+  config.player2 = GLOOM_CONTROL_KEYBOARD;
+  normalize_control_config(&config);
+  if (!input_selftest_expect(config.player1 != config.player2, "duplicate keyboard selection is normalized")) {
+    return 1;
+  }
+
+  g_webrtc_guest_connected = true;
+  g_webrtc_guest_player2_input = GLOOM_WEBRTC_INPUT_FORWARD | GLOOM_WEBRTC_INPUT_STRAFE_RIGHT | GLOOM_WEBRTC_INPUT_FIRE;
+  gamepad_controls = read_webrtc_player2_controls();
+  if (!input_selftest_expect(gamepad_controls.joyy == -1 && gamepad_controls.joyx == 1 &&
+                                 gamepad_controls.joys == -1 && gamepad_controls.fire,
+                             "WebRTC guest input maps to player two controls")) {
+    return 1;
+  }
+  g_webrtc_guest_connected = false;
+  g_webrtc_guest_player2_input = 0u;
+
+  memset(&state, 0, sizeof(state));
+  memset(&keyboard_controls, 0, sizeof(keyboard_controls));
+  keyboard_controls.joyy = -1;
+  state.player_hitpoints = GLOOM_PLAYER_INITIAL_HEALTH;
+  state.player_lives = GLOOM_PLAYER_INITIAL_LIVES;
+  state.player_eye_y = (float)GLOOM_PLAYER_EYE_Y;
+  update_player_movement(&state, &keyboard_controls);
+  if (!input_selftest_expect(state.player_frame_fixed > 0u,
+                             "moving player advances drawshape_8 player frame from moveplayer")) {
+    return 1;
+  }
+  state.player_bounce = 126.0f;
+  settle_player_bounce(&state, false);
+  if (!input_selftest_expect(state.player_bounce == 0.0f && state.player_frame_fixed == 0u,
+                             "unbounce clears player frame when movement settles")) {
+    return 1;
+  }
+
+  return 0;
 }
 
 static size_t combat_selftest_active_projectile_count(const AppState *state) {
@@ -8764,6 +11097,7 @@ static int run_combat_selftest(void) {
   size_t i = 0u;
   size_t soul_count = 0u;
   RuntimeObjectState test_object;
+  RuntimeProjectile test_projectile;
   const RuntimeProjectile *projectile = NULL;
 
   memset(&state, 0, sizeof(state));
@@ -8803,6 +11137,8 @@ static int run_combat_selftest(void) {
     return 1;
   }
 
+  memset(&state, 0, sizeof(state));
+  memset(&state, 0, sizeof(state));
   state.player_hitpoints = GLOOM_PLAYER_INITIAL_HEALTH;
   memset(&test_object, 0, sizeof(test_object));
   test_object.damage = 3;
@@ -8827,6 +11163,86 @@ static int run_combat_selftest(void) {
     }
   }
 
+  memset(&state, 0, sizeof(state));
+  memset(&test_object, 0, sizeof(test_object));
+  state.two_player_mode = true;
+  state.player_hitpoints = GLOOM_PLAYER_INITIAL_HEALTH;
+  state.camera_x = 512.0f;
+  state.camera_z = 512.0f;
+  state.player_radius = 33;
+  state.player2.player_hitpoints = GLOOM_PLAYER_INITIAL_HEALTH;
+  state.player2.camera_x = 32.0f;
+  state.player2.camera_z = 0.0f;
+  test_object.radius = 33;
+  test_object.damage = 3;
+  if (!combat_selftest_expect(runtime_angle_to_player(&state, &test_object) ==
+                                  radians_to_amiga_rotation(
+                                      SDL_atan2f(state.player2.camera_x - test_object.x,
+                                                 state.player2.camera_z - test_object.z)),
+                              "pickplayer two-player targets nearest live player")) {
+    return 1;
+  }
+  damage_player_from_object(&state, &test_object);
+  if (!combat_selftest_expect(state.player_hitpoints == GLOOM_PLAYER_INITIAL_HEALTH &&
+                                  state.player2.player_hitpoints == GLOOM_PLAYER_INITIAL_HEALTH - 3 &&
+                                  (int)state.player2.player_palette_timer == GLOOM_PLAYER_RED_PAL_TIMER,
+                              "two-player enemy contact damages player two")) {
+    return 1;
+  }
+  memset(&test_projectile, 0, sizeof(test_projectile));
+  test_projectile.weapon_index = 0;
+  test_projectile.enemy = true;
+  test_projectile.x = state.player2.camera_x;
+  test_projectile.z = state.player2.camera_z;
+  test_projectile.damage = 3;
+  state.player2.player_hitpoints = GLOOM_PLAYER_INITIAL_HEALTH;
+  state.player2.player_palette_timer = 0.0f;
+  if (!combat_selftest_expect(damage_projectile_player(&state, &test_projectile, 16.0f, 0.0f) &&
+                                  state.player_hitpoints == GLOOM_PLAYER_INITIAL_HEALTH &&
+                                  state.player2.player_hitpoints == GLOOM_PLAYER_INITIAL_HEALTH - 3 &&
+                                  (int)state.player2.player_palette_timer == GLOOM_PLAYER_RED_PAL_TIMER,
+                              "two-player enemy projectile damages player two")) {
+    return 1;
+  }
+  memset(&state, 0, sizeof(state));
+  memset(&test_projectile, 0, sizeof(test_projectile));
+  state.two_player_mode = true;
+  state.combat_mode = true;
+  state.player_radius = 33;
+  state.player_hitpoints = GLOOM_PLAYER_INITIAL_HEALTH;
+  state.player2.player_hitpoints = GLOOM_PLAYER_INITIAL_HEALTH;
+  state.player2.camera_x = 32.0f;
+  test_projectile.weapon_index = 0;
+  test_projectile.player_owner_index = 0u;
+  test_projectile.x = state.player2.camera_x;
+  test_projectile.z = state.player2.camera_z;
+  test_projectile.damage = 5;
+  if (!combat_selftest_expect(damage_projectile_combat_player(&state, &test_projectile, 16.0f, 0.0f) &&
+                                  state.player_hitpoints == GLOOM_PLAYER_INITIAL_HEALTH &&
+                                  state.player2.player_hitpoints == GLOOM_PLAYER_INITIAL_HEALTH - 5,
+                              "combat player projectile damages opposing player")) {
+    return 1;
+  }
+  memset(&state, 0, sizeof(state));
+  state.two_player_mode = true;
+  state.combat_mode = true;
+  state.active_player_index = 0u;
+  state.player_hitpoints = 0;
+  state.player_lives = 1;
+  state.player_dead = true;
+  state.player_death_phase = GLOOM_PLAYER_DEATH_FALLING;
+  state.player_eye_y = (float)GLOOM_PLAYER_DEATH_EYE_CLAMP;
+  advance_player_death_amiga_tick(&state);
+  for (i = 0; i < GLOOM_PLAYER_DEAD_DELAY + 1; ++i) {
+    advance_player_death_amiga_tick(&state);
+  }
+  if (!combat_selftest_expect(state.player_lives == 0 && state.finished == GLOOM_COMBAT_ROUND_FINISHED &&
+                                  state.finished2 == GLOOM_COMBAT_ROUND_FINISHED,
+                              "combat playerdead sets finished=4 after loser life reaches zero")) {
+    return 1;
+  }
+
+  memset(&state, 0, sizeof(state));
   state.player_hitpoints = GLOOM_PLAYER_INITIAL_HEALTH;
   state.camera_x = 1024.0f;
   state.camera_z = 1024.0f;
@@ -9156,8 +11572,8 @@ static int run_sfx_selftest(void) {
 
   audio.obtained.freq = 48000;
   audio_start_channel_locked(&audio, &audio.channels[0], GLOOM_SFX_SHOOT, 32, 0);
-  if (!audio.channels[0].active || audio.channels[0].busy_passes != 2u) {
-    fprintf(stderr, "SFX selftest failed: playsfxnow channel lifetime does not match fx_status=-2\n");
+  if (!audio.channels[0].active || audio.channels[0].busy_passes != 1u) {
+    fprintf(stderr, "SFX selftest failed: playsfxnow channel did not start a non-looping one-shot\n");
     audio_free_sfx_bank(&audio);
     return 1;
   }
@@ -9178,7 +11594,52 @@ static int run_sfx_selftest(void) {
     audio_callback(&repeat_audio, (Uint8 *)stream, (int)sizeof(stream));
     if (stream[0] <= 0.0f || stream[2] <= 0.0f || stream[4] != 0.0f || stream[6] != 0.0f ||
         repeat_audio.channels[0].active) {
-      fprintf(stderr, "SFX selftest failed: fx_status=-2 busy tail audibly repeated the sample\n");
+      fprintf(stderr, "SFX selftest failed: one-shot SFX looped or held the channel after completion\n");
+      audio_free_sfx_bank(&audio);
+      return 1;
+    }
+  }
+
+  {
+    AudioSystem busy_audio;
+    int8_t fake_samples[2] = {64, 64};
+    float stream[8];
+    int c = 0;
+
+    memset(&busy_audio, 0, sizeof(busy_audio));
+    memset(stream, 0, sizeof(stream));
+    busy_audio.obtained.freq = 1;
+    busy_audio.samples[GLOOM_SFX_SHOOT].loaded = true;
+    busy_audio.samples[GLOOM_SFX_SHOOT].sample_count = 2u;
+    busy_audio.samples[GLOOM_SFX_SHOOT].sample_rate = 1.0;
+    busy_audio.samples[GLOOM_SFX_SHOOT].samples = fake_samples;
+    for (c = 0; c < GLOOM_AUDIO_CHANNEL_COUNT; ++c) {
+      audio_start_channel_locked(&busy_audio, &busy_audio.channels[c], GLOOM_SFX_SHOOT, 64, 0);
+    }
+    audio_callback(&busy_audio, (Uint8 *)stream, (int)sizeof(stream));
+    for (c = 0; c < GLOOM_AUDIO_CHANNEL_COUNT; ++c) {
+      if (busy_audio.channels[c].active) {
+        fprintf(stderr, "SFX selftest failed: completed one-shot channel %d stayed busy\n", c);
+        audio_free_sfx_bank(&audio);
+        return 1;
+      }
+    }
+  }
+
+  {
+    AudioSystem ui_audio;
+    float stream[8];
+
+    memset(&ui_audio, 0, sizeof(ui_audio));
+    memset(stream, 0, sizeof(stream));
+    ui_audio.ui_beep_total = 4u;
+    ui_audio.ui_beep_remaining = 4u;
+    ui_audio.ui_beep_phase = 1.57079632679489661923;
+    ui_audio.ui_beep_phase_step = 0.0;
+    ui_audio.ui_beep_volume = 0.12f;
+    audio_callback(&ui_audio, (Uint8 *)stream, (int)sizeof(stream));
+    if (stream[0] <= 0.0f || stream[1] <= 0.0f || ui_audio.ui_beep_remaining != 0u) {
+      fprintf(stderr, "SFX selftest failed: UI beep did not mix as a short stereo tone\n");
       audio_free_sfx_bank(&audio);
       return 1;
     }
@@ -9295,6 +11756,41 @@ static int run_pickup_selftest(void) {
   if ((int)state.objects[0].y != -32 || state.objects[0].render_y_offset < -128.0f ||
       state.objects[0].render_y_offset > 0.0f) {
     fprintf(stderr, "Pickup selftest failed: weaponlogic bob changed map-authored pickup y or moved below floor\n");
+    free(state.map.object_spawns);
+    state.map.object_spawns = NULL;
+    state.map.object_spawn_count = 0u;
+    return 1;
+  }
+  free(state.map.object_spawns);
+  state.map.object_spawns = NULL;
+  state.map.object_spawn_count = 0u;
+
+  memset(&state, 0, sizeof(state));
+  memset(&pickup, 0, sizeof(pickup));
+  state.map.object_spawn_count = 1u;
+  state.map.object_spawns = (GloomObjectSpawn *)calloc(1u, sizeof(*state.map.object_spawns));
+  if (state.map.object_spawns == NULL) {
+    fprintf(stderr, "Pickup selftest failed: out of memory preparing two-player weaponlogic fixture\n");
+    return 1;
+  }
+  state.map.object_spawns[0].object_type = GLOOM_OBJECT_TYPE_WEAPON3;
+  state.objects[0].active = true;
+  state.objects[0].radius = 24;
+  state.objects[0].x = 0.0f;
+  state.objects[0].z = 0.0f;
+  state.player_hitpoints = GLOOM_PLAYER_INITIAL_HEALTH;
+  state.player_lives = GLOOM_PLAYER_INITIAL_LIVES;
+  state.player_radius = 16;
+  state.camera_x = 4096.0f;
+  state.camera_z = 4096.0f;
+  state.two_player_mode = true;
+  state.player2.player_hitpoints = GLOOM_PLAYER_INITIAL_HEALTH;
+  state.player2.player_lives = GLOOM_PLAYER_INITIAL_LIVES;
+  state.player2.camera_x = 8192.0f;
+  state.player2.camera_z = 8192.0f;
+  update_with_controls(&state, &controls, &controls, NULL);
+  if (SDL_fabsf(state.objects[0].bounce_phase - (8.0f * fixed_step_amiga_scale())) > 0.001f) {
+    fprintf(stderr, "Pickup selftest failed: weaponlogic bob advanced more than once in two-player mode\n");
     free(state.map.object_spawns);
     state.map.object_spawns = NULL;
     state.map.object_spawn_count = 0u;
@@ -9451,6 +11947,30 @@ static int run_hud_selftest(void) {
   }
 
   printf("HUD selftest passed\n");
+  return 0;
+}
+
+static int run_menu_selftest(void) {
+  MenuAssets assets;
+
+  memset(&assets, 0, sizeof(assets));
+  if (!load_menu_assets(&assets)) {
+    fprintf(stderr, "Menu selftest failed: could not load original title/bigfont assets\n");
+    return 1;
+  }
+  if (!assets.title.loaded || assets.title.width <= 0 || assets.title.height <= 0) {
+    fprintf(stderr, "Menu selftest failed: title image did not decode\n");
+    free_menu_assets(&assets);
+    return 1;
+  }
+  if (!assets.big_font.loaded || assets.big_font.glyph_count <= 39u) {
+    fprintf(stderr, "Menu selftest failed: bigfont lacks printmess2 glyph mappings\n");
+    free_menu_assets(&assets);
+    return 1;
+  }
+
+  free_menu_assets(&assets);
+  printf("Menu selftest passed\n");
   return 0;
 }
 
@@ -9871,6 +12391,7 @@ static uint64_t replay_fingerprint_state(const AppState *state, ReplayResult *ou
   replay_hash_i32(&hash, state->player_rot_fixed);
   replay_hash_i32(&hash, state->player_rotspeed);
   replay_hash_i32(&hash, replay_quantize_float(state->player_bounce));
+  replay_hash_i32(&hash, (int32_t)state->player_frame_fixed);
   replay_hash_i32(&hash, state->player_hitpoints);
   replay_hash_i32(&hash, state->player_lives);
   replay_hash_i32(&hash, state->player_dead ? 1 : 0);
@@ -9891,6 +12412,7 @@ static uint64_t replay_fingerprint_state(const AppState *state, ReplayResult *ou
     replay_hash_i32(&hash, replay_quantize_float(state->player2.camera_z));
     replay_hash_i32(&hash, replay_quantize_float(state->player2.camera_y));
     replay_hash_i32(&hash, state->player2.player_rot_fixed);
+    replay_hash_i32(&hash, (int32_t)state->player2.player_frame_fixed);
     replay_hash_i32(&hash, state->player2.player_hitpoints);
     replay_hash_i32(&hash, state->player2.player_lives);
     replay_hash_i32(&hash, state->player2.player_dead ? 1 : 0);
@@ -10131,16 +12653,122 @@ static int run_replay_selftest(int argc, char **argv) {
   return 0;
 }
 
+static void share_levelover_two_player_lives(int16_t *p1_lives, int16_t *p2_lives) {
+  int16_t shared_lives = 0;
+
+  if (p1_lives == NULL || p2_lives == NULL) {
+    return;
+  }
+
+  /* amiga/gloom2.s: levelover stores the max of p1lives/p2lives back to both players. */
+  shared_lives = *p1_lives >= *p2_lives ? *p1_lives : *p2_lives;
+  *p1_lives = shared_lives;
+  *p2_lives = shared_lives;
+}
+
+static void initialize_combat_rotation_state(AppState *state, uint8_t series, int16_t start_lives) {
+  static const uint8_t initial_maps[8] = {1, 2, 3, 4, 5, 6, 7, 8};
+
+  if (state == NULL) {
+    return;
+  }
+
+  memcpy(state->combat_maps, initial_maps, sizeof(state->combat_maps));
+  state->combat_maps_left = 7;
+  state->combat_series = series;
+  if (state->combat_series < 1u || state->combat_series > 3u) {
+    state->combat_series = 1u;
+  }
+  state->combat_start_lives = start_lives > 0 ? start_lives : 3;
+}
+
+static bool resolve_next_combat_map(AppState *state, char *out_map_path, size_t out_map_path_size) {
+  uint16_t random_word = 0u;
+  int16_t index = 0;
+  uint8_t map_number = 0u;
+
+  if (state == NULL || out_map_path == NULL || out_map_path_size == 0u || !state->combat_mode) {
+    return false;
+  }
+
+  if (state->combat_maps_left <= 0) {
+    state->combat_maps_left = 7;
+  }
+
+  random_word = runtime_random_word(state);
+  index = (int16_t)(((uint32_t)random_word * (uint32_t)state->combat_maps_left) >> 16);
+  if (index < 0) {
+    index = 0;
+  }
+  if (index >= state->combat_maps_left) {
+    index = state->combat_maps_left - 1;
+  }
+
+  state->combat_maps_left -= 1;
+  map_number = state->combat_maps[index];
+  state->combat_maps[index] = state->combat_maps[state->combat_maps_left];
+  state->combat_maps[state->combat_maps_left] = map_number;
+  if (map_number == 0u) {
+    map_number = 1u;
+  }
+
+  /* amiga/gloom2.s: pickcombat builds "com<series>_<map>" from commaps/comseriesnum/comseriesmap. */
+  (void)snprintf(out_map_path, out_map_path_size, "amiga/maps/com%u_%u", (unsigned)state->combat_series,
+                 (unsigned)map_number);
+  return true;
+}
+
+static void restore_scriptplay_primary_player(AppState *state, int16_t hitpoints, int16_t lives, uint8_t weapon,
+                                              uint8_t reload) {
+  if (state == NULL) {
+    return;
+  }
+
+  /* amiga/gloom2.s: scriptplay copies lives exactly; zero health resets health and reload only. */
+  state->player_lives = lives;
+  if (hitpoints == 0) {
+    hitpoints = GLOOM_PLAYER_INITIAL_HEALTH;
+    reload = (uint8_t)GLOOM_PLAYER_INITIAL_RELOAD;
+  }
+  state->player_hitpoints = hitpoints;
+  state->player_weapon = weapon;
+  state->player_reload = reload;
+}
+
+static void restore_scriptplay_secondary_player(RuntimePlayerState *player, int16_t hitpoints, int16_t lives,
+                                                uint8_t weapon, uint8_t reload) {
+  if (player == NULL) {
+    return;
+  }
+
+  player->player_lives = lives;
+  if (hitpoints == 0) {
+    hitpoints = GLOOM_PLAYER_INITIAL_HEALTH;
+    reload = (uint8_t)GLOOM_PLAYER_INITIAL_RELOAD;
+  }
+  player->player_hitpoints = hitpoints;
+  player->player_weapon = weapon;
+  player->player_reload = reload;
+}
+
 static bool load_runtime_level(const char *map_path, AppState *state, WallTextureSet *wall_textures,
                                FlatTextureSet *flat_textures, ObjectVisualSet *object_visuals,
                                GloomZone *previous_zones, GloomZone *render_zones, bool preserve_player,
                                int16_t preserved_hitpoints, int16_t preserved_lives, uint8_t preserved_weapon,
-                               uint8_t preserved_reload, bool barrel_projectile_origin, bool two_player_mode,
-                               uint8_t violence_mode, char *resolved_map_path, size_t resolved_map_path_size) {
-  AppState next_state;
-  WallTextureSet next_wall_textures;
-  FlatTextureSet next_flat_textures;
-  ObjectVisualSet next_object_visuals;
+                               uint8_t preserved_reload, int16_t preserved_p2_hitpoints, int16_t preserved_p2_lives,
+                               uint8_t preserved_p2_weapon, uint8_t preserved_p2_reload, bool barrel_projectile_origin,
+                               bool two_player_mode, uint8_t violence_mode, char *resolved_map_path,
+                               size_t resolved_map_path_size) {
+  static AppState next_state_storage;
+  static WallTextureSet next_wall_textures;
+  static FlatTextureSet next_flat_textures;
+  static ObjectVisualSet next_object_visuals;
+  AppState *next_state = &next_state_storage;
+  bool next_combat_mode = state != NULL && state->combat_mode;
+  uint8_t next_combat_series = state != NULL ? state->combat_series : 1u;
+  int16_t next_combat_start_lives = state != NULL ? state->combat_start_lives : 3;
+  uint8_t next_combat_maps[8] = {0};
+  int16_t next_combat_maps_left = state != NULL ? state->combat_maps_left : 7;
   char map_path_buffer[1024] = {0};
   const char *resolved = map_path;
   char error[256] = {0};
@@ -10150,7 +12778,10 @@ static bool load_runtime_level(const char *map_path, AppState *state, WallTextur
     return false;
   }
 
-  memset(&next_state, 0, sizeof(next_state));
+  memset(next_state, 0, sizeof(*next_state));
+  if (state != NULL) {
+    memcpy(next_combat_maps, state->combat_maps, sizeof(next_combat_maps));
+  }
   memset(&next_wall_textures, 0, sizeof(next_wall_textures));
   memset(&next_flat_textures, 0, sizeof(next_flat_textures));
   memset(&next_object_visuals, 0, sizeof(next_object_visuals));
@@ -10159,77 +12790,84 @@ static bool load_runtime_level(const char *map_path, AppState *state, WallTextur
     resolved = map_path_buffer;
   }
 
-  next_state.barrel_projectile_origin = barrel_projectile_origin;
-  next_state.two_player_mode = two_player_mode;
-  if (!gloom_map_load(resolved, &next_state.map, error, sizeof(error))) {
+  next_state->barrel_projectile_origin = barrel_projectile_origin;
+  next_state->two_player_mode = two_player_mode;
+  next_state->combat_mode = next_combat_mode;
+  next_state->combat_series = next_combat_series;
+  next_state->combat_start_lives = next_combat_start_lives;
+  memcpy(next_state->combat_maps, next_combat_maps, sizeof(next_state->combat_maps));
+  next_state->combat_maps_left = next_combat_maps_left;
+  if (!gloom_map_load(resolved, &next_state->map, error, sizeof(error))) {
     fprintf(stderr, "Map parse failed for %s: %s\n", resolved, error[0] ? error : "unknown error");
     return false;
   }
 
-  if (!load_map_wall_textures(&next_state.map, &next_wall_textures)) {
+  if (!load_map_wall_textures(&next_state->map, &next_wall_textures)) {
     fprintf(stderr, "No map texture screens decoded from map texture names for %s\n", resolved);
-    gloom_map_free(&next_state.map);
+    gloom_map_free(&next_state->map);
     return false;
   }
 
-  if (!validate_map_wall_texture_references(&next_state.map, &next_wall_textures)) {
+  if (!validate_map_wall_texture_references(&next_state->map, &next_wall_textures)) {
     free_wall_texture_set(&next_wall_textures);
-    gloom_map_free(&next_state.map);
+    gloom_map_free(&next_state->map);
     return false;
   }
 
   if (!load_flat_texture_set_for_map(resolved, &next_flat_textures)) {
     free_wall_texture_set(&next_wall_textures);
-    gloom_map_free(&next_state.map);
+    gloom_map_free(&next_state->map);
     return false;
   }
 
-  if (!load_player_collision_radius(&next_state.player_radius)) {
+  if (!load_player_collision_radius(&next_state->player_radius)) {
     free_flat_texture_set(&next_flat_textures);
     free_wall_texture_set(&next_wall_textures);
-    gloom_map_free(&next_state.map);
+    gloom_map_free(&next_state->map);
     return false;
   }
 
-  if (!load_object_visual_set_for_map(&next_state.map, &next_object_visuals)) {
+  if (!load_object_visual_set_for_map(&next_state->map, &next_object_visuals)) {
     free_flat_texture_set(&next_flat_textures);
     free_wall_texture_set(&next_wall_textures);
-    gloom_map_free(&next_state.map);
+    gloom_map_free(&next_state->map);
     return false;
   }
 
-  compute_map_bounds(&next_state);
-  if (!initialize_camera_from_map_spawn(&next_state)) {
+  compute_map_bounds(next_state);
+  if (!initialize_camera_from_map_spawn(next_state)) {
     fprintf(stderr, "No player spawn found in map event data for %s\n", resolved);
     free_object_visual_set(&next_object_visuals);
     free_flat_texture_set(&next_flat_textures);
     free_wall_texture_set(&next_wall_textures);
-    gloom_map_free(&next_state.map);
+    gloom_map_free(&next_state->map);
     return false;
   }
 
   if (preserve_player) {
-    next_state.player_hitpoints = preserved_hitpoints > 0 ? preserved_hitpoints : GLOOM_PLAYER_INITIAL_HEALTH;
-    next_state.player_lives = preserved_lives > 0 ? preserved_lives : GLOOM_PLAYER_INITIAL_LIVES;
-    next_state.player_weapon = preserved_weapon;
-    next_state.player_reload = preserved_reload > 0u ? preserved_reload : (uint8_t)GLOOM_PLAYER_INITIAL_RELOAD;
+    restore_scriptplay_primary_player(next_state, preserved_hitpoints, preserved_lives, preserved_weapon,
+                                      preserved_reload);
+    if (two_player_mode) {
+      restore_scriptplay_secondary_player(&next_state->player2, preserved_p2_hitpoints, preserved_p2_lives,
+                                          preserved_p2_weapon, preserved_p2_reload);
+    }
   }
-  next_state.violence_mode = violence_mode;
-  initialize_runtime_objects(&next_state);
+  next_state->violence_mode = violence_mode;
+  initialize_runtime_objects(next_state);
 
-  if (next_state.map.zone_count > (size_t)GLOOM_MAX_RENDER_ZONES) {
+  if (next_state->map.zone_count > (size_t)GLOOM_MAX_RENDER_ZONES) {
     fprintf(stderr, "Cannot load %s: zone count %zu exceeds fixed render buffer capacity %u\n", resolved,
-            next_state.map.zone_count, (unsigned)GLOOM_MAX_RENDER_ZONES);
+            next_state->map.zone_count, (unsigned)GLOOM_MAX_RENDER_ZONES);
     free_object_visual_set(&next_object_visuals);
     free_flat_texture_set(&next_flat_textures);
     free_wall_texture_set(&next_wall_textures);
-    gloom_map_free(&next_state.map);
+    gloom_map_free(&next_state->map);
     return false;
   }
 
-  if (next_state.map.zone_count > 0u) {
-    memcpy(previous_zones, next_state.map.zones, next_state.map.zone_count * sizeof(*previous_zones));
-    memcpy(render_zones, next_state.map.zones, next_state.map.zone_count * sizeof(*render_zones));
+  if (next_state->map.zone_count > 0u) {
+    memcpy(previous_zones, next_state->map.zones, next_state->map.zone_count * sizeof(*previous_zones));
+    memcpy(render_zones, next_state->map.zones, next_state->map.zone_count * sizeof(*render_zones));
   }
 
   free_object_visual_set(object_visuals);
@@ -10237,7 +12875,7 @@ static bool load_runtime_level(const char *map_path, AppState *state, WallTextur
   free_wall_texture_set(wall_textures);
   gloom_map_free(&state->map);
 
-  *state = next_state;
+  *state = *next_state;
   *wall_textures = next_wall_textures;
   *flat_textures = next_flat_textures;
   *object_visuals = next_object_visuals;
@@ -10254,6 +12892,332 @@ static bool load_runtime_level(const char *map_path, AppState *state, WallTextur
   return true;
 }
 
+static int run_level_transition_selftest(void) {
+  AppState *state = NULL;
+  WallTextureSet *wall_textures = NULL;
+  FlatTextureSet *flat_textures = NULL;
+  ObjectVisualSet *object_visuals = NULL;
+  GloomZone *previous_zones = NULL;
+  GloomZone *render_zones = NULL;
+  char next_map_path[1024] = {0};
+  char resolved_map_path[1024] = {0};
+  ScriptCompletion completion;
+  MenuImage completion_image;
+  int16_t preserved_lives = 1;
+  int16_t preserved_p2_lives = 3;
+  int result = 1;
+
+  memset(&completion, 0, sizeof(completion));
+  memset(&completion_image, 0, sizeof(completion_image));
+  state = (AppState *)calloc(1u, sizeof(*state));
+  wall_textures = (WallTextureSet *)calloc(1u, sizeof(*wall_textures));
+  flat_textures = (FlatTextureSet *)calloc(1u, sizeof(*flat_textures));
+  object_visuals = (ObjectVisualSet *)calloc(1u, sizeof(*object_visuals));
+  previous_zones = (GloomZone *)malloc((size_t)GLOOM_MAX_RENDER_ZONES * sizeof(*previous_zones));
+  render_zones = (GloomZone *)malloc((size_t)GLOOM_MAX_RENDER_ZONES * sizeof(*render_zones));
+  if (state == NULL || wall_textures == NULL || flat_textures == NULL || object_visuals == NULL ||
+      previous_zones == NULL || render_zones == NULL) {
+    fprintf(stderr, "Level transition selftest failed: out of memory preparing fixed zone buffers\n");
+    goto cleanup;
+  }
+
+  if (!resolve_next_script_play_map("amiga/maps/map1_1", next_map_path, sizeof(next_map_path))) {
+    fprintf(stderr, "Level transition selftest failed: script did not resolve the map after map1_1\n");
+    goto cleanup;
+  }
+  if (resolve_next_script_play_map_or_done("amiga/maps/map4_7", next_map_path, sizeof(next_map_path), &completion) !=
+          SCRIPT_PLAY_NEXT_DONE ||
+      strcmp(completion.picture, "theend") != 0 ||
+      strcmp(completion.text, "congratulations! you have completed gloom!") != 0) {
+    fprintf(stderr, "Level transition selftest failed: scriptdone completion picture/text were not resolved\n");
+    goto cleanup;
+  }
+  if (!load_script_picture_image(completion.picture, &completion_image)) {
+    fprintf(stderr, "Level transition selftest failed: original completion picture could not be loaded\n");
+    goto cleanup;
+  }
+
+  share_levelover_two_player_lives(&preserved_lives, &preserved_p2_lives);
+  if (!load_runtime_level(next_map_path, state, wall_textures, flat_textures, object_visuals, previous_zones,
+                          render_zones, true, 11, preserved_lives, 2u, 0u, 0, preserved_p2_lives, 4u, 2u, true,
+                          true, GLOOM_VIOLENCE_MEATY_MESSY, resolved_map_path, sizeof(resolved_map_path))) {
+    fprintf(stderr, "Level transition selftest failed: could not load scriptplay next map %s\n", next_map_path);
+    goto cleanup;
+  }
+
+  if (!state->two_player_mode || state->player_lives != 3 || state->player2.player_lives != 3) {
+    fprintf(stderr, "Level transition selftest failed: levelover shared lives were not restored to both players\n");
+    goto cleanup;
+  }
+  if (state->player_hitpoints != 11 || state->player_weapon != 2u || state->player_reload != 0u) {
+    fprintf(stderr, "Level transition selftest failed: player one scriptplay state was not preserved exactly\n");
+    goto cleanup;
+  }
+  if (state->player2.player_hitpoints != GLOOM_PLAYER_INITIAL_HEALTH || state->player2.player_weapon != 4u ||
+      state->player2.player_reload != (uint8_t)GLOOM_PLAYER_INITIAL_RELOAD) {
+    fprintf(stderr, "Level transition selftest failed: player two scriptplay zero-health reset was not applied\n");
+    goto cleanup;
+  }
+  if (state->finished != 0 || state->finished2 != 0 || state->player_pixsizeadd != 0 ||
+      state->player2.player_pixsizeadd != 0) {
+    fprintf(stderr, "Level transition selftest failed: resetplayer/scriptplay transition flags were not cleared\n");
+    goto cleanup;
+  }
+
+  printf("Level transition selftest passed\n");
+  result = 0;
+
+cleanup:
+  free_menu_image(&completion_image);
+  free_object_visual_set(object_visuals);
+  free_flat_texture_set(flat_textures);
+  free_wall_texture_set(wall_textures);
+  if (state != NULL) {
+    gloom_map_free(&state->map);
+  }
+  free(object_visuals);
+  free(flat_textures);
+  free(wall_textures);
+  free(state);
+  free(previous_zones);
+  free(render_zones);
+  return result;
+}
+
+static bool run_menu_and_restart_game(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, int render_width,
+                                      int render_height, AppState *state, WallTextureSet *wall_textures,
+                                      FlatTextureSet *flat_textures, ObjectVisualSet *object_visuals,
+                                      GloomZone *previous_zones, GloomZone *render_zones, bool barrel_projectile_origin,
+                                      bool *io_two_player_mode, bool *io_combat_mode, uint8_t *io_violence_mode,
+                                      char *resolved_map_buffer, size_t resolved_map_buffer_size,
+                                      const char **io_resolved_map_path) {
+  MenuAssets menu_assets;
+  GloomGameMode menu_game_mode = GLOOM_GAME_MODE_ONE_PLAYER;
+  uint8_t menu_violence_mode = GLOOM_VIOLENCE_MEATY_MESSY;
+  char first_map_path[1024] = "amiga/maps/map1_1";
+
+  memset(&menu_assets, 0, sizeof(menu_assets));
+  if (renderer == NULL || framebuffer == NULL || state == NULL || wall_textures == NULL || flat_textures == NULL ||
+      object_visuals == NULL || previous_zones == NULL || render_zones == NULL || io_two_player_mode == NULL ||
+      io_combat_mode == NULL || io_violence_mode == NULL || resolved_map_buffer == NULL ||
+      resolved_map_buffer_size == 0u || io_resolved_map_path == NULL) {
+    return false;
+  }
+
+  menu_game_mode = *io_combat_mode ? GLOOM_GAME_MODE_COMBAT
+                                   : (*io_two_player_mode ? GLOOM_GAME_MODE_TWO_PLAYER : GLOOM_GAME_MODE_ONE_PLAYER);
+  menu_violence_mode = *io_violence_mode;
+  if (!load_menu_assets(&menu_assets)) {
+    fprintf(stderr, "Failed to load original menu assets\n");
+    return false;
+  }
+  if (run_start_menu(renderer, framebuffer, &menu_assets, render_width, render_height, &menu_game_mode,
+                     &menu_violence_mode, &g_control_config) != 0) {
+    free_menu_assets(&menu_assets);
+    return false;
+  }
+  free_menu_assets(&menu_assets);
+
+  *io_two_player_mode = menu_game_mode != GLOOM_GAME_MODE_ONE_PLAYER;
+  *io_combat_mode = menu_game_mode == GLOOM_GAME_MODE_COMBAT;
+  *io_violence_mode = menu_violence_mode;
+  state->combat_mode = *io_combat_mode;
+  if (*io_combat_mode) {
+    uint8_t series = 1u;
+    int16_t lives = 3;
+
+    if (run_combat_menu(renderer, framebuffer, render_width, render_height, &series, &lives) != 0) {
+      return false;
+    }
+    initialize_combat_rotation_state(state, series, lives);
+    if (!resolve_next_combat_map(state, first_map_path, sizeof(first_map_path))) {
+      fprintf(stderr, "Failed to pick original combat map\n");
+      return false;
+    }
+  }
+  if (!load_runtime_level(first_map_path, state, wall_textures, flat_textures, object_visuals, previous_zones,
+                          render_zones, false, 0, 0, 0u, 0u, 0, 0, 0u, 0u, barrel_projectile_origin,
+                          *io_two_player_mode, menu_violence_mode, resolved_map_buffer, resolved_map_buffer_size)) {
+    fprintf(stderr, "Failed to restart game from original selected map after menu selection\n");
+    return false;
+  }
+
+  *io_resolved_map_path = resolved_map_buffer;
+  return true;
+}
+
+#ifdef __EMSCRIPTEN__
+EM_JS(void, runtime_emscripten_canvas_cursor_default, (void), {
+  var c = Module['canvas'];
+  if (c) c.style.cursor = 'default';
+});
+
+EM_JS(void, runtime_emscripten_install_pointer_lock_listener, (void), {
+  Module['gloomPointerLockLost'] = 0;
+  document.addEventListener('pointerlockchange', function() {
+    if (!document.pointerLockElement && Module['canvas']) {
+      Module['gloomPointerLockLost'] = 1;
+    }
+  });
+});
+
+EM_JS(void, runtime_emscripten_install_fullscreen_listeners, (void), {
+  function gloomToggleCanvasFullscreen() {
+    var c = Module['canvas'];
+    if (!c) return;
+    var el = document.fullscreenElement || document.webkitFullscreenElement ||
+             document.mozFullScreenElement || document.msFullscreenElement;
+    if (el === c) {
+      var exit = document.exitFullscreen || document.webkitExitFullscreen ||
+                 document.mozCancelFullScreen || document.msExitFullscreen;
+      if (exit) exit.call(document);
+    } else {
+      var request = c.requestFullscreen || c.webkitRequestFullscreen ||
+                    c.mozRequestFullScreen || c.msRequestFullscreen;
+      if (request) {
+        var result = request.call(c);
+        if (result && result.catch) result.catch(function() {});
+      }
+    }
+  }
+  Module['gloomToggleCanvasFullscreen'] = gloomToggleCanvasFullscreen;
+  Module['gloomFullscreenResizePending'] = 0;
+  var mark = function() {
+    Module['gloomFullscreenResizePending'] = 1;
+    if (typeof window.triggerResize === 'function') window.triggerResize();
+  };
+  document.addEventListener('fullscreenchange', mark, false);
+  document.addEventListener('webkitfullscreenchange', mark, false);
+  window.addEventListener('keydown', function(e) {
+    if (e.code !== 'F11' && e.key !== 'F11' && e.keyCode !== 122) return;
+    e.preventDefault();
+    e.stopPropagation();
+    gloomToggleCanvasFullscreen();
+  }, true);
+});
+
+EM_JS(void, runtime_emscripten_canvas_fullscreen_toggle, (void), {
+  if (Module['gloomToggleCanvasFullscreen']) Module['gloomToggleCanvasFullscreen']();
+});
+
+EM_JS(int, runtime_emscripten_take_pointer_lock_lost, (void), {
+  var v = Module['gloomPointerLockLost'] | 0;
+  Module['gloomPointerLockLost'] = 0;
+  return v;
+});
+
+EM_JS(int, runtime_emscripten_take_fullscreen_resize, (void), {
+  var v = Module['gloomFullscreenResizePending'] | 0;
+  Module['gloomFullscreenResizePending'] = 0;
+  return v;
+});
+
+EM_JS(int, runtime_emscripten_screen_width, (void), {
+  var w = (typeof screen !== 'undefined' && screen.width) ? screen.width : 0;
+  if (w < 1 && typeof window !== 'undefined') w = window.innerWidth || 0;
+  return w | 0;
+});
+
+EM_JS(int, runtime_emscripten_screen_height, (void), {
+  var h = (typeof screen !== 'undefined' && screen.height) ? screen.height : 0;
+  if (h < 1 && typeof window !== 'undefined') h = window.innerHeight || 0;
+  return h | 0;
+});
+
+static bool runtime_emscripten_consume_pointer_lock_lost(void) {
+  return runtime_emscripten_take_pointer_lock_lost() != 0;
+}
+
+static bool runtime_emscripten_consume_fullscreen_resize(void) {
+  return runtime_emscripten_take_fullscreen_resize() != 0;
+}
+#else
+void runtime_emscripten_canvas_cursor_default(void) {
+}
+
+void runtime_emscripten_install_pointer_lock_listener(void) {
+}
+
+void runtime_emscripten_install_fullscreen_listeners(void) {
+}
+
+void runtime_emscripten_canvas_fullscreen_toggle(void) {
+}
+
+static bool runtime_emscripten_consume_pointer_lock_lost(void) {
+  return false;
+}
+
+static bool runtime_emscripten_consume_fullscreen_resize(void) {
+  return false;
+}
+#endif
+
+static void select_aspect_720p_resolution(int *io_width, int *io_height) {
+  static const int common_aspects[][2] = {{16, 9}, {16, 10}, {3, 2}, {4, 3}, {21, 9}, {32, 9}};
+  static const int aspect_720p[][2] = {{1280, 720}, {1152, 720}, {1080, 720}, {960, 720}, {1680, 720}, {2560, 720}};
+  int display_width = 0;
+  int display_height = 0;
+  int best_index = 0;
+  int best_diff_num = 0x7fffffff;
+  size_t i = 0u;
+
+  if (io_width == NULL || io_height == NULL) {
+    return;
+  }
+
+#ifdef __EMSCRIPTEN__
+  display_width = runtime_emscripten_screen_width();
+  display_height = runtime_emscripten_screen_height();
+#else
+  {
+    SDL_DisplayMode mode;
+
+    memset(&mode, 0, sizeof(mode));
+    if (SDL_GetCurrentDisplayMode(0, &mode) == 0 && mode.w > 0 && mode.h > 0) {
+      display_width = mode.w;
+      display_height = mode.h;
+    }
+  }
+#endif
+
+  if (display_width <= 0 || display_height <= 0) {
+    display_width = DEFAULT_WINDOW_WIDTH;
+    display_height = DEFAULT_WINDOW_HEIGHT;
+  }
+
+  for (i = 0u; i < sizeof(common_aspects) / sizeof(common_aspects[0]); ++i) {
+    int aspect_w = common_aspects[i][0];
+    int aspect_h = common_aspects[i][1];
+    int64_t diff = ((int64_t)display_width * (int64_t)aspect_h) - ((int64_t)display_height * (int64_t)aspect_w);
+    int64_t denom = (int64_t)display_height * (int64_t)aspect_w;
+    int normalized_diff = 0;
+
+    if (diff < 0) {
+      diff = -diff;
+    }
+    if (denom <= 0) {
+      continue;
+    }
+    normalized_diff = (int)((diff * 1000000) / denom);
+    if (normalized_diff < best_diff_num) {
+      best_diff_num = normalized_diff;
+      best_index = (int)i;
+    }
+  }
+
+  *io_width = aspect_720p[best_index][0];
+  *io_height = aspect_720p[best_index][1];
+}
+
+static void runtime_force_cursor_visible(void) {
+  int n = 0;
+
+  while (SDL_ShowCursor(SDL_QUERY) == SDL_DISABLE && n++ < 16) {
+    (void)SDL_ShowCursor(SDL_ENABLE);
+  }
+}
+
 static bool set_runtime_mouse_capture(SDL_Window *window, bool captured) {
   if (window == NULL) {
     return false;
@@ -10265,14 +13229,21 @@ static bool set_runtime_mouse_capture(SDL_Window *window, bool captured) {
       return false;
     }
     SDL_SetWindowGrab(window, SDL_TRUE);
+    g_runtime_mouse_capture_active = true;
     (void)SDL_ShowCursor(SDL_DISABLE);
   } else {
     if (SDL_SetRelativeMouseMode(SDL_FALSE) != 0) {
       fprintf(stderr, "SDL_SetRelativeMouseMode(SDL_FALSE) failed: %s\n", SDL_GetError());
-      return false;
     }
+    (void)SDL_CaptureMouse(SDL_FALSE);
     SDL_SetWindowGrab(window, SDL_FALSE);
+    g_runtime_mouse_capture_active = false;
     (void)SDL_ShowCursor(SDL_ENABLE);
+    runtime_force_cursor_visible();
+#ifdef __EMSCRIPTEN__
+    emscripten_run_script("if (document.pointerLockElement) document.exitPointerLock();");
+#endif
+    runtime_emscripten_canvas_cursor_default();
   }
 
   return true;
@@ -10291,6 +13262,7 @@ int main(int argc, char **argv) {
   ObjectVisualSet object_visuals;
   WeaponVisualSet weapon_visuals;
   HudFont hud_font;
+  MenuAssets menu_assets;
   RenderFramebuffer framebuffer;
   GloomZone *previous_zones = NULL;
   GloomZone *render_zones = NULL;
@@ -10312,8 +13284,11 @@ int main(int argc, char **argv) {
   bool explicit_resolution = false;
   bool barrel_projectile_origin = true;
   bool two_player_mode = false;
+  bool combat_mode = false;
+  bool skip_menu = false;
   uint8_t violence_mode = GLOOM_VIOLENCE_MEATY_MESSY;
   bool level_transition_pending = false;
+  bool combat_round_pending = false;
   AppState state;
   AppState previous_state;
 
@@ -10323,6 +13298,7 @@ int main(int argc, char **argv) {
   memset(&object_visuals, 0, sizeof(object_visuals));
   memset(&weapon_visuals, 0, sizeof(weapon_visuals));
   memset(&hud_font, 0, sizeof(hud_font));
+  memset(&menu_assets, 0, sizeof(menu_assets));
   memset(&framebuffer, 0, sizeof(framebuffer));
 
   if (argc > 1 && strcmp(argv[1], "--iff-info") == 0) {
@@ -10374,6 +13350,14 @@ int main(int argc, char **argv) {
     return run_hud_selftest();
   }
 
+  if (argc > 1 && strcmp(argv[1], "--menu-selftest") == 0) {
+    return run_menu_selftest();
+  }
+
+  if (argc > 1 && strcmp(argv[1], "--input-selftest") == 0) {
+    return run_input_selftest();
+  }
+
   if (argc > 1 && strcmp(argv[1], "--wall-selftest") == 0) {
     return run_wall_selftest();
   }
@@ -10384,6 +13368,10 @@ int main(int argc, char **argv) {
 
   if (argc > 1 && strcmp(argv[1], "--teleport-selftest") == 0) {
     return run_teleport_selftest();
+  }
+
+  if (argc > 1 && strcmp(argv[1], "--level-transition-selftest") == 0) {
+    return run_level_transition_selftest();
   }
 
   if (argc > 1 && strcmp(argv[1], "--replay-selftest") == 0) {
@@ -10441,6 +13429,11 @@ int main(int argc, char **argv) {
         barrel_projectile_origin = true;
       } else if (strcmp(argv[argi], "--two-player") == 0 || strcmp(argv[argi], "--2p") == 0) {
         two_player_mode = true;
+      } else if (strcmp(argv[argi], "--combat") == 0 || strcmp(argv[argi], "--two-player-combat") == 0) {
+        two_player_mode = true;
+        combat_mode = true;
+      } else if (strcmp(argv[argi], "--skip-menu") == 0) {
+        skip_menu = true;
       } else if (strcmp(argv[argi], "--player-projectiles") == 0 ||
                  strcmp(argv[argi], "--legacy-projectiles") == 0) {
         barrel_projectile_origin = false;
@@ -10456,19 +13449,6 @@ int main(int argc, char **argv) {
     }
   }
 
-  if (!explicit_resolution && classic_viewport) {
-    render_width = BASE_WIDTH;
-    render_height = BASE_HEIGHT;
-    window_width = render_width;
-    window_height = render_height;
-  }
-  render_width *= render_scale;
-  render_height *= render_scale;
-  if (!explicit_resolution || render_scale > 1) {
-    window_width = render_width;
-    window_height = render_height;
-  }
-
   if (resolve_runtime_file_path(map_path, map_path_buffer, sizeof(map_path_buffer))) {
     resolved_map_path = map_path_buffer;
   }
@@ -10477,6 +13457,15 @@ int main(int argc, char **argv) {
   memset(&previous_state, 0, sizeof(previous_state));
   state.barrel_projectile_origin = barrel_projectile_origin;
   state.two_player_mode = two_player_mode;
+  state.combat_mode = combat_mode;
+  if (state.combat_mode) {
+    initialize_combat_rotation_state(&state, 1u, 3);
+    if (!resolve_next_combat_map(&state, map_path_buffer, sizeof(map_path_buffer))) {
+      fprintf(stderr, "Failed to pick initial original combat map\n");
+      return 1;
+    }
+    resolved_map_path = map_path_buffer;
+  }
 
   if (!gloom_map_load(resolved_map_path, &state.map, error, sizeof(error))) {
     fprintf(stderr, "Map parse failed: %s\n", error[0] ? error : "unknown error");
@@ -10604,7 +13593,7 @@ int main(int argc, char **argv) {
   }
 
   memset(&g_audio, 0, sizeof(g_audio));
-  if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_AUDIO) != 0) {
+  if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) {
     fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
     free(previous_zones);
     free(render_zones);
@@ -10617,10 +13606,26 @@ int main(int argc, char **argv) {
     gloom_map_free(&state.map);
     return 1;
   }
+  if (!explicit_resolution) {
+    if (classic_viewport) {
+      render_width = BASE_WIDTH;
+      render_height = BASE_HEIGHT;
+    } else {
+      select_aspect_720p_resolution(&render_width, &render_height);
+    }
+  }
+  render_width *= render_scale;
+  render_height *= render_scale;
+  if (!explicit_resolution || render_scale > 1) {
+    window_width = render_width;
+    window_height = render_height;
+  }
+  gamepad_init();
 
   if (!audio_load_sfx_bank(&g_audio) || !audio_start(&g_audio)) {
     fprintf(stderr, "Failed to initialize SDL Paula SFX port from original amiga/sfxs assets\n");
     audio_shutdown(&g_audio);
+    gamepad_shutdown();
     SDL_Quit();
     free(previous_zones);
     free(render_zones);
@@ -10634,11 +13639,12 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  window = SDL_CreateWindow("Gloom PC Port", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, window_width,
+  window = SDL_CreateWindow("Gloom With Friends", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, window_width,
                             window_height, SDL_WINDOW_RESIZABLE);
   if (window == NULL) {
     fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
     audio_shutdown(&g_audio);
+    gamepad_shutdown();
     SDL_Quit();
     free(previous_zones);
     free(render_zones);
@@ -10660,6 +13666,29 @@ int main(int argc, char **argv) {
     fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
     SDL_DestroyWindow(window);
     audio_shutdown(&g_audio);
+    gamepad_shutdown();
+    SDL_Quit();
+    free(previous_zones);
+    free(render_zones);
+    free_hud_font(&hud_font);
+    free_weapon_visual_set(&weapon_visuals);
+    free_grid_offset_set(&grid_offsets);
+    free_object_visual_set(&object_visuals);
+    free_flat_texture_set(&flat_textures);
+    free_wall_texture_set(&wall_textures);
+    gloom_map_free(&state.map);
+    return 1;
+  }
+  runtime_emscripten_install_pointer_lock_listener();
+  runtime_emscripten_install_fullscreen_listeners();
+
+  (void)SDL_RenderSetIntegerScale(renderer, classic_viewport ? SDL_TRUE : SDL_FALSE);
+  (void)SDL_RenderSetLogicalSize(renderer, render_width, render_height);
+  if (!ensure_render_framebuffer(renderer, &framebuffer, render_width, render_height)) {
+    SDL_DestroyRenderer(renderer);
+    SDL_DestroyWindow(window);
+    audio_shutdown(&g_audio);
+    gamepad_shutdown();
     SDL_Quit();
     free(previous_zones);
     free(render_zones);
@@ -10673,23 +13702,126 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  (void)SDL_RenderSetIntegerScale(renderer, classic_viewport ? SDL_TRUE : SDL_FALSE);
-  (void)SDL_RenderSetLogicalSize(renderer, render_width, render_height);
-  if (!ensure_render_framebuffer(renderer, &framebuffer, render_width, render_height)) {
-    SDL_DestroyRenderer(renderer);
-    SDL_DestroyWindow(window);
-    audio_shutdown(&g_audio);
-    SDL_Quit();
-    free(previous_zones);
-    free(render_zones);
-    free_hud_font(&hud_font);
-    free_weapon_visual_set(&weapon_visuals);
-    free_grid_offset_set(&grid_offsets);
-    free_object_visual_set(&object_visuals);
-    free_flat_texture_set(&flat_textures);
-    free_wall_texture_set(&wall_textures);
-    gloom_map_free(&state.map);
-    return 1;
+  if (!skip_menu) {
+    GloomGameMode menu_game_mode =
+        combat_mode ? GLOOM_GAME_MODE_COMBAT
+                    : (two_player_mode ? GLOOM_GAME_MODE_TWO_PLAYER : GLOOM_GAME_MODE_ONE_PLAYER);
+    uint8_t menu_violence_mode = violence_mode;
+    char selected_map_path[1024] = "amiga/maps/map1_1";
+
+    if (!load_menu_assets(&menu_assets)) {
+      fprintf(stderr, "Failed to load original menu assets\n");
+      free_render_framebuffer(&framebuffer);
+      SDL_DestroyRenderer(renderer);
+      SDL_DestroyWindow(window);
+      audio_shutdown(&g_audio);
+      gamepad_shutdown();
+      SDL_Quit();
+      free(previous_zones);
+      free(render_zones);
+      free_hud_font(&hud_font);
+      free_weapon_visual_set(&weapon_visuals);
+      free_grid_offset_set(&grid_offsets);
+      free_object_visual_set(&object_visuals);
+      free_flat_texture_set(&flat_textures);
+      free_wall_texture_set(&wall_textures);
+      gloom_map_free(&state.map);
+      return 1;
+    }
+
+    if (run_start_menu(renderer, &framebuffer, &menu_assets, render_width, render_height, &menu_game_mode,
+                       &menu_violence_mode, &g_control_config) != 0) {
+      free_menu_assets(&menu_assets);
+      free_render_framebuffer(&framebuffer);
+      SDL_DestroyRenderer(renderer);
+      SDL_DestroyWindow(window);
+      audio_shutdown(&g_audio);
+      gamepad_shutdown();
+      SDL_Quit();
+      free(previous_zones);
+      free(render_zones);
+      free_hud_font(&hud_font);
+      free_weapon_visual_set(&weapon_visuals);
+      free_grid_offset_set(&grid_offsets);
+      free_object_visual_set(&object_visuals);
+      free_flat_texture_set(&flat_textures);
+      free_wall_texture_set(&wall_textures);
+      gloom_map_free(&state.map);
+      return 0;
+    }
+
+    free_menu_assets(&menu_assets);
+    two_player_mode = menu_game_mode != GLOOM_GAME_MODE_ONE_PLAYER;
+    combat_mode = menu_game_mode == GLOOM_GAME_MODE_COMBAT;
+    violence_mode = menu_violence_mode;
+    state.two_player_mode = two_player_mode;
+    state.combat_mode = combat_mode;
+    state.violence_mode = violence_mode;
+    if (combat_mode) {
+      uint8_t series = 1u;
+      int16_t lives = 3;
+
+      if (run_combat_menu(renderer, &framebuffer, render_width, render_height, &series, &lives) != 0) {
+        free_render_framebuffer(&framebuffer);
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        audio_shutdown(&g_audio);
+        gamepad_shutdown();
+        SDL_Quit();
+        free(previous_zones);
+        free(render_zones);
+        free_hud_font(&hud_font);
+        free_weapon_visual_set(&weapon_visuals);
+        free_grid_offset_set(&grid_offsets);
+        free_object_visual_set(&object_visuals);
+        free_flat_texture_set(&flat_textures);
+        free_wall_texture_set(&wall_textures);
+        gloom_map_free(&state.map);
+        return 0;
+      }
+      initialize_combat_rotation_state(&state, series, lives);
+      if (!resolve_next_combat_map(&state, selected_map_path, sizeof(selected_map_path))) {
+        fprintf(stderr, "Failed to pick original combat map\n");
+        free_render_framebuffer(&framebuffer);
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        audio_shutdown(&g_audio);
+        gamepad_shutdown();
+        SDL_Quit();
+        free(previous_zones);
+        free(render_zones);
+        free_hud_font(&hud_font);
+        free_weapon_visual_set(&weapon_visuals);
+        free_grid_offset_set(&grid_offsets);
+        free_object_visual_set(&object_visuals);
+        free_flat_texture_set(&flat_textures);
+        free_wall_texture_set(&wall_textures);
+        gloom_map_free(&state.map);
+        return 1;
+      }
+    }
+    if (!load_runtime_level(selected_map_path, &state, &wall_textures, &flat_textures, &object_visuals, previous_zones,
+                            render_zones, false, 0, 0, 0u, 0u, 0, 0, 0u, 0u, barrel_projectile_origin,
+                            two_player_mode, violence_mode, map_path_buffer, sizeof(map_path_buffer))) {
+      fprintf(stderr, "Failed to load original selected menu map\n");
+      free_render_framebuffer(&framebuffer);
+      SDL_DestroyRenderer(renderer);
+      SDL_DestroyWindow(window);
+      audio_shutdown(&g_audio);
+      gamepad_shutdown();
+      SDL_Quit();
+      free(previous_zones);
+      free(render_zones);
+      free_hud_font(&hud_font);
+      free_weapon_visual_set(&weapon_visuals);
+      free_grid_offset_set(&grid_offsets);
+      free_object_visual_set(&object_visuals);
+      free_flat_texture_set(&flat_textures);
+      free_wall_texture_set(&wall_textures);
+      gloom_map_free(&state.map);
+      return 1;
+    }
+    resolved_map_path = map_path_buffer;
   }
   mouse_captured = set_runtime_mouse_capture(window, true);
 
@@ -10704,6 +13836,7 @@ int main(int argc, char **argv) {
     SDL_Event event;
     AppState render_state;
     float render_alpha = 0.0f;
+    bool pause_menu_requested = false;
     uint64_t perf_now = SDL_GetPerformanceCounter();
     double elapsed = (double)(perf_now - perf_prev) / (double)perf_frequency;
     perf_prev = perf_now;
@@ -10715,17 +13848,53 @@ int main(int argc, char **argv) {
     accumulator += elapsed;
     title_timer += elapsed;
 
+#ifdef __EMSCRIPTEN__
+    if (runtime_emscripten_consume_pointer_lock_lost()) {
+      (void)set_runtime_mouse_capture(window, false);
+      mouse_captured = false;
+      mouse_dx_accum = 0;
+      suppress_mouse_fire_until_button_up = false;
+      pause_menu_requested = true;
+      SDL_FlushEvent(SDL_MOUSEMOTION);
+    }
+    if (runtime_emscripten_consume_fullscreen_resize()) {
+      SDL_PumpEvents();
+      (void)SDL_RenderSetLogicalSize(renderer, render_width, render_height);
+    }
+#endif
+
     while (SDL_PollEvent(&event) != 0) {
+      gamepad_handle_event(&event);
       if (event.type == SDL_QUIT) {
         running = false;
       }
-      if (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE) {
-        if (mouse_captured && set_runtime_mouse_capture(window, false)) {
-          mouse_captured = false;
-          mouse_dx_accum = 0;
-          suppress_mouse_fire_until_button_up = false;
-          SDL_FlushEvent(SDL_MOUSEMOTION);
+      if (event.type == SDL_KEYDOWN && event.key.repeat == 0) {
+        if (event.key.keysym.sym == SDLK_ESCAPE) {
+          pause_menu_requested = true;
+          if (mouse_captured || g_runtime_mouse_capture_active || SDL_GetRelativeMouseMode()) {
+            (void)set_runtime_mouse_capture(window, false);
+            mouse_captured = false;
+            mouse_dx_accum = 0;
+            suppress_mouse_fire_until_button_up = false;
+            SDL_FlushEvent(SDL_MOUSEMOTION);
+          }
+        } else if (event.key.keysym.sym == SDLK_p) {
+          pause_menu_requested = true;
+        } else if (event.key.keysym.sym == SDLK_F11) {
+#ifdef __EMSCRIPTEN__
+          runtime_emscripten_canvas_fullscreen_toggle();
+#else
+          Uint32 flags = SDL_GetWindowFlags(window);
+          if ((flags & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP)) != 0u) {
+            (void)SDL_SetWindowFullscreen(window, 0);
+          } else {
+            (void)SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP);
+          }
+#endif
         }
+      }
+      if (event.type == SDL_CONTROLLERBUTTONDOWN && event.cbutton.button == SDL_CONTROLLER_BUTTON_START) {
+        pause_menu_requested = true;
       }
       if (event.type == SDL_MOUSEBUTTONDOWN && event.button.clicks >= 2) {
         if (!mouse_captured && set_runtime_mouse_capture(window, true)) {
@@ -10743,8 +13912,59 @@ int main(int argc, char **argv) {
       }
     }
 
-    if (mouse_captured) {
-      apply_mouse_look(&state, mouse_dx_accum);
+    if (pause_menu_requested && running) {
+      render_alpha = (float)(accumulator / dt);
+      render_state =
+          interpolate_render_state(&previous_state, &state, render_alpha, render_zones, state.map.zone_count);
+      render(renderer, &framebuffer, &render_state, &grid_offsets, &wall_textures, &flat_textures, &object_visuals,
+             &weapon_visuals, &hud_font, render_width, render_height);
+
+      PauseMenuResult pause_result =
+          run_pause_menu(window, renderer, &framebuffer, render_width, render_height, &mouse_captured, &mouse_dx_accum,
+                         &suppress_mouse_fire_until_button_up);
+
+      perf_prev = SDL_GetPerformanceCounter();
+      accumulator = 0.0;
+      previous_state = state;
+      if (previous_zones != NULL) {
+        previous_state.map.zones = previous_zones;
+      }
+
+      if (pause_result == PAUSE_MENU_QUIT) {
+        running = false;
+        continue;
+      }
+      if (pause_result == PAUSE_MENU_MAIN_MENU) {
+        if (mouse_captured && set_runtime_mouse_capture(window, false)) {
+          mouse_captured = false;
+          mouse_dx_accum = 0;
+          suppress_mouse_fire_until_button_up = false;
+          SDL_FlushEvent(SDL_MOUSEMOTION);
+        }
+        if (!run_menu_and_restart_game(renderer, &framebuffer, render_width, render_height, &state, &wall_textures,
+                                       &flat_textures, &object_visuals, previous_zones, render_zones,
+                                       barrel_projectile_origin, &two_player_mode, &combat_mode, &violence_mode,
+                                       map_path_buffer, sizeof(map_path_buffer), &resolved_map_path)) {
+          running = false;
+          continue;
+        }
+        mouse_captured = set_runtime_mouse_capture(window, true);
+        previous_state = state;
+        if (previous_zones != NULL) {
+          previous_state.map.zones = previous_zones;
+        }
+        title_timer = 1.0;
+        continue;
+      }
+    }
+
+    {
+      int gamepad_dx = player1_gamepad_look_delta();
+      int keyboard_dx = player1_receives_keyboard_input() ? mouse_dx_accum : 0;
+
+      if (keyboard_dx != 0 || gamepad_dx != 0) {
+        apply_mouse_look(&state, keyboard_dx + gamepad_dx);
+      }
     }
     mouse_dx_accum = 0;
 
@@ -10763,25 +13983,31 @@ int main(int argc, char **argv) {
         level_transition_pending = true;
         break;
       }
+      if (state.finished == GLOOM_COMBAT_ROUND_FINISHED) {
+        combat_round_pending = true;
+        break;
+      }
       accumulator -= dt;
     }
 
     if (title_timer >= 1.0) {
+#ifndef __EMSCRIPTEN__
       char title[160];
       if (state.two_player_mode) {
         (void)snprintf(title, sizeof(title),
-                       "Gloom PC Port | 2P | P1 HP=%d L=%d | P2 HP=%d L=%d | zones=%zu",
+                       "Gloom With Friends | 2P | P1 HP=%d L=%d | P2 HP=%d L=%d | zones=%zu",
                        state.player_hitpoints, state.player_lives, state.player2.player_hitpoints,
                        state.player2.player_lives, state.map.zone_count);
       } else if (state.player_dead) {
-        (void)snprintf(title, sizeof(title), "Gloom PC Port | DEAD | x=%.0f z=%.0f angle=%.2f | zones=%zu",
+        (void)snprintf(title, sizeof(title), "Gloom With Friends | DEAD | x=%.0f z=%.0f angle=%.2f | zones=%zu",
                        state.camera_x, state.camera_z, state.camera_angle, state.map.zone_count);
       } else {
-        (void)snprintf(title, sizeof(title), "Gloom PC Port | HP=%d | x=%.0f z=%.0f angle=%.2f | zones=%zu",
+        (void)snprintf(title, sizeof(title), "Gloom With Friends | HP=%d | x=%.0f z=%.0f angle=%.2f | zones=%zu",
                        state.player_hitpoints, state.camera_x, state.camera_z, state.camera_angle,
                        state.map.zone_count);
       }
       SDL_SetWindowTitle(window, title);
+#endif
       title_timer = 0.0;
     }
 
@@ -10790,8 +14016,66 @@ int main(int argc, char **argv) {
     render(renderer, &framebuffer, &render_state, &grid_offsets, &wall_textures, &flat_textures, &object_visuals,
            &weapon_visuals, &hud_font, render_width, render_height);
 
+    if (combat_round_pending) {
+      char next_combat_map[1024] = {0};
+
+      combat_round_pending = false;
+      if (state.player_lives <= 0 || state.player2.player_lives <= 0) {
+        const char *message = state.player_lives <= 0 ? "PLAYER TWO WINS COMBAT GAME!" : "PLAYER ONE WINS COMBAT GAME!";
+
+        if (mouse_captured && set_runtime_mouse_capture(window, false)) {
+          mouse_captured = false;
+          mouse_dx_accum = 0;
+          suppress_mouse_fire_until_button_up = false;
+          SDL_FlushEvent(SDL_MOUSEMOTION);
+        }
+        if (!run_combat_result_screen(renderer, &framebuffer, render_width, render_height, message)) {
+          running = false;
+          continue;
+        }
+        if (!run_menu_and_restart_game(renderer, &framebuffer, render_width, render_height, &state, &wall_textures,
+                                       &flat_textures, &object_visuals, previous_zones, render_zones,
+                                       barrel_projectile_origin, &two_player_mode, &combat_mode, &violence_mode,
+                                       map_path_buffer, sizeof(map_path_buffer), &resolved_map_path)) {
+          running = false;
+          continue;
+        }
+        mouse_captured = set_runtime_mouse_capture(window, true);
+        previous_state = state;
+        if (previous_zones != NULL) {
+          previous_state.map.zones = previous_zones;
+        }
+        accumulator = 0.0;
+        title_timer = 1.0;
+        continue;
+      }
+
+      if (!resolve_next_combat_map(&state, next_combat_map, sizeof(next_combat_map))) {
+        fprintf(stderr, "Cannot continue combat game: failed to pick original combat map\n");
+        running = false;
+        continue;
+      }
+      if (!load_runtime_level(next_combat_map, &state, &wall_textures, &flat_textures, &object_visuals, previous_zones,
+                              render_zones, true, 0, state.player_lives, 0u, 0u, 0, state.player2.player_lives, 0u,
+                              0u, barrel_projectile_origin, true, violence_mode, map_path_buffer,
+                              sizeof(map_path_buffer))) {
+        fprintf(stderr, "Cannot continue combat game: failed to load %s\n", next_combat_map);
+        running = false;
+        continue;
+      }
+      resolved_map_path = map_path_buffer;
+      previous_state = state;
+      if (previous_zones != NULL) {
+        previous_state.map.zones = previous_zones;
+      }
+      accumulator = 0.0;
+      continue;
+    }
+
     if (level_transition_pending) {
       char next_map_path[1024] = {0};
+      ScriptCompletion completion;
+      ScriptPlayNextResult next_result = SCRIPT_PLAY_NEXT_ERROR;
       int16_t preserved_hitpoints = state.player_hitpoints;
       int16_t preserved_lives = state.player_lives;
       uint8_t preserved_weapon = state.player_weapon;
@@ -10800,37 +14084,59 @@ int main(int argc, char **argv) {
       int16_t preserved_p2_lives = state.player2.player_lives;
       uint8_t preserved_p2_weapon = state.player2.player_weapon;
       uint8_t preserved_p2_reload = state.player2.player_reload;
+      bool transition_two_player_mode = state.two_player_mode;
 
+      memset(&completion, 0, sizeof(completion));
       level_transition_pending = false;
-      if (!resolve_next_script_play_map(resolved_map_path, next_map_path, sizeof(next_map_path))) {
-        fprintf(stderr, "Cannot complete levelover: misc/script has no next play_ map after %s\n", resolved_map_path);
+      next_result =
+          resolve_next_script_play_map_or_done(resolved_map_path, next_map_path, sizeof(next_map_path), &completion);
+      if (next_result == SCRIPT_PLAY_NEXT_ERROR) {
+        fprintf(stderr, "Cannot complete levelover: misc/script has no next play_ map or done_ after %s\n",
+                resolved_map_path);
         running = false;
         continue;
+      }
+
+      if (next_result == SCRIPT_PLAY_NEXT_DONE) {
+        if (mouse_captured && set_runtime_mouse_capture(window, false)) {
+          mouse_captured = false;
+          mouse_dx_accum = 0;
+          suppress_mouse_fire_until_button_up = false;
+          SDL_FlushEvent(SDL_MOUSEMOTION);
+        }
+        if (!run_completion_screen(renderer, &framebuffer, &completion, render_width, render_height)) {
+          running = false;
+          continue;
+        }
+        if (!run_menu_and_restart_game(renderer, &framebuffer, render_width, render_height, &state, &wall_textures,
+                                       &flat_textures, &object_visuals, previous_zones, render_zones,
+                                       barrel_projectile_origin, &two_player_mode, &combat_mode, &violence_mode,
+                                       map_path_buffer, sizeof(map_path_buffer), &resolved_map_path)) {
+          running = false;
+          continue;
+        }
+        mouse_captured = set_runtime_mouse_capture(window, true);
+        previous_state = state;
+        if (previous_zones != NULL) {
+          previous_state.map.zones = previous_zones;
+        }
+        accumulator = 0.0;
+        title_timer = 1.0;
+        continue;
+      }
+
+      if (transition_two_player_mode) {
+        share_levelover_two_player_lives(&preserved_lives, &preserved_p2_lives);
       }
 
       if (!load_runtime_level(next_map_path, &state, &wall_textures, &flat_textures, &object_visuals,
-                              previous_zones, render_zones, true, preserved_hitpoints, preserved_lives,
-                              preserved_weapon, preserved_reload, barrel_projectile_origin, two_player_mode, violence_mode,
-                              map_path_buffer, sizeof(map_path_buffer))) {
+                               previous_zones, render_zones, true, preserved_hitpoints, preserved_lives,
+                               preserved_weapon, preserved_reload, preserved_p2_hitpoints, preserved_p2_lives,
+                               preserved_p2_weapon, preserved_p2_reload, barrel_projectile_origin,
+                               transition_two_player_mode, violence_mode, map_path_buffer, sizeof(map_path_buffer))) {
         fprintf(stderr, "Cannot complete levelover: failed to load next script map %s\n", next_map_path);
         running = false;
         continue;
-      }
-
-      if (state.two_player_mode) {
-        int16_t shared_lives = preserved_lives > preserved_p2_lives ? preserved_lives : preserved_p2_lives;
-
-        state.player2.player_hitpoints =
-            preserved_p2_hitpoints > 0 ? preserved_p2_hitpoints : GLOOM_PLAYER_INITIAL_HEALTH;
-        state.player2.player_lives = preserved_p2_lives > 0 ? preserved_p2_lives : GLOOM_PLAYER_INITIAL_LIVES;
-        state.player2.player_weapon = preserved_p2_weapon;
-        state.player2.player_reload =
-            preserved_p2_reload > 0u ? preserved_p2_reload : (uint8_t)GLOOM_PLAYER_INITIAL_RELOAD;
-        if (shared_lives <= 0) {
-          shared_lives = GLOOM_PLAYER_INITIAL_LIVES;
-        }
-        state.player_lives = shared_lives;
-        state.player2.player_lives = shared_lives;
       }
 
       resolved_map_path = map_path_buffer;
@@ -10844,6 +14150,7 @@ int main(int argc, char **argv) {
 
   free(previous_zones);
   free(render_zones);
+  free_menu_assets(&menu_assets);
   free_hud_font(&hud_font);
   free_weapon_visual_set(&weapon_visuals);
   free_render_framebuffer(&framebuffer);
@@ -10854,6 +14161,7 @@ int main(int argc, char **argv) {
   SDL_DestroyRenderer(renderer);
   SDL_DestroyWindow(window);
   audio_shutdown(&g_audio);
+  gamepad_shutdown();
   SDL_Quit();
   gloom_map_free(&state.map);
 

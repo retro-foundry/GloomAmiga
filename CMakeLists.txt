@@ -8,8 +8,9 @@ set(CMAKE_C_EXTENSIONS OFF)
 include(FetchContent)
 
 option(GLOOM_FETCH_SDL "Fetch SDL2 from source" ON)
+option(GLOOM_ENABLE_WEB_ASSETS "Preload game assets when targeting Emscripten" ON)
 
-if(GLOOM_FETCH_SDL)
+if(NOT EMSCRIPTEN AND GLOOM_FETCH_SDL)
   set(SDL_SHARED OFF CACHE BOOL "" FORCE)
   set(SDL_STATIC ON CACHE BOOL "" FORCE)
   set(SDL_TEST OFF CACHE BOOL "" FORCE)
@@ -35,6 +36,42 @@ set_target_properties(gloom_pc PROPERTIES
   VS_DPI_AWARE OFF
 )
 
+if(EMSCRIPTEN)
+  set(CMAKE_EXECUTABLE_SUFFIX ".html")
+  target_compile_options(gloom_pc PRIVATE
+    "SHELL:-sUSE_SDL=2"
+  )
+  target_link_options(gloom_pc PRIVATE
+    "SHELL:-s USE_SDL=2"
+    "SHELL:-s DISABLE_DEPRECATED_FIND_EVENT_TARGET_BEHAVIOR=0"
+    "SHELL:-sALLOW_MEMORY_GROWTH=1"
+    "SHELL:-sINITIAL_MEMORY=134217728"
+    "SHELL:-sSTACK_SIZE=4194304"
+    "SHELL:-sASYNCIFY"
+    "SHELL:-sEXPORTED_FUNCTIONS=_main,_SetWebRTCGuestConnected,_SetWebRTCGuestPlayer2Input"
+  )
+  if(GLOOM_ENABLE_WEB_ASSETS)
+    target_link_options(gloom_pc PRIVATE
+      "SHELL:--preload-file ${CMAKE_SOURCE_DIR}/amiga@/amiga"
+      "SHELL:--shell-file ${CMAKE_SOURCE_DIR}/package/template.html"
+    )
+    set_property(TARGET gloom_pc APPEND PROPERTY LINK_DEPENDS
+      "${CMAKE_SOURCE_DIR}/package/template.html"
+    )
+    add_custom_command(TARGET gloom_pc POST_BUILD
+      COMMAND ${CMAKE_COMMAND} -E copy
+        "${CMAKE_SOURCE_DIR}/package/favicon.ico"
+        "$<TARGET_FILE_DIR:gloom_pc>/"
+      COMMAND ${CMAKE_COMMAND} -E copy
+        "${CMAKE_SOURCE_DIR}/package/icon.png"
+        "$<TARGET_FILE_DIR:gloom_pc>/"
+      COMMAND ${CMAKE_COMMAND} -E copy
+        "${CMAKE_SOURCE_DIR}/package/icon256.png"
+        "$<TARGET_FILE_DIR:gloom_pc>/"
+      COMMENT "Copying web shell icons"
+    )
+  endif()
+else()
 add_custom_command(TARGET gloom_pc POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:gloom_pc>/amiga"
   COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:gloom_pc>/amiga/data"
@@ -58,6 +95,7 @@ add_custom_command(TARGET gloom_pc POST_BUILD
     "${CMAKE_SOURCE_DIR}/amiga/sparks4.bin"
     "${CMAKE_SOURCE_DIR}/amiga/sparks5.bin"
     "${CMAKE_SOURCE_DIR}/amiga/gridoffs4.bin"
+    "${CMAKE_SOURCE_DIR}/amiga/theend.iff"
     "$<TARGET_FILE_DIR:gloom_pc>/amiga/"
   COMMAND ${CMAKE_COMMAND} -E copy_directory
     "${CMAKE_SOURCE_DIR}/amiga/maps"
@@ -91,19 +129,22 @@ add_custom_command(TARGET gloom_pc POST_BUILD
     "$<TARGET_FILE_DIR:gloom_pc>/amiga/ggfx"
   COMMENT "Copying runtime map/texture/object data to output directory"
 )
+endif()
 
 target_include_directories(gloom_pc PRIVATE src)
 
-if(TARGET SDL2::SDL2-static)
-  target_link_libraries(gloom_pc PRIVATE SDL2::SDL2-static)
-elseif(TARGET SDL2::SDL2)
-  target_link_libraries(gloom_pc PRIVATE SDL2::SDL2)
-else()
-  message(FATAL_ERROR "SDL2 target not found. Enable GLOOM_FETCH_SDL or provide SDL2.")
-endif()
+if(NOT EMSCRIPTEN)
+  if(TARGET SDL2::SDL2-static)
+    target_link_libraries(gloom_pc PRIVATE SDL2::SDL2-static)
+  elseif(TARGET SDL2::SDL2)
+    target_link_libraries(gloom_pc PRIVATE SDL2::SDL2)
+  else()
+    message(FATAL_ERROR "SDL2 target not found. Enable GLOOM_FETCH_SDL or provide SDL2.")
+  endif()
 
-if(TARGET SDL2::SDL2main)
-  target_link_libraries(gloom_pc PRIVATE SDL2::SDL2main)
+  if(TARGET SDL2::SDL2main)
+    target_link_libraries(gloom_pc PRIVATE SDL2::SDL2main)
+  endif()
 endif()
 
 if(MSVC)

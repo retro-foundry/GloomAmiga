@@ -1,0 +1,24 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "gloom-tiny-signal",
+  "main": "src/index.js",
+  "compatibility_date": "2026-03-10",
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "ROOM",
+        "class_name": "Room"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["Room"]
+    }
+  ],
+  "vars": {
+    "APP_ORIGINS": "https://binaryfoundry.github.io,https://retro-foundry.github.io",
+    "SIGNAL_HOST": "tiny-signal.retrofoundry.workers.dev"
+  }
+}

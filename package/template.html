@@ -1,0 +1,932 @@
+<!doctype html>
+<html lang="en-us">
+  <head>
+    <meta charset="utf-8">
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <title>Gloom With Friends</title>
+    <script>
+      (function () {
+        const fixedTitle = 'Gloom With Friends';
+        function restoreTitle() {
+          if (document.title !== fixedTitle) {
+            document.title = fixedTitle;
+          }
+        }
+        document.addEventListener('DOMContentLoaded', function () {
+          const title = document.querySelector('title');
+          if (title) {
+            new MutationObserver(restoreTitle).observe(title, { childList: true });
+          }
+          restoreTitle();
+        });
+      })();
+    </script>
+    <link rel="icon" href="favicon.ico" sizes="any">
+    <link rel="icon" href="icon.png" type="image/png">
+    <link rel="apple-touch-icon" href="icon256.png" type="image/png">
+    <style type="text/css">
+      html, body {
+        margin: 0;
+      }
+      .emscripten {
+        width: 100%;
+        height: 100%;
+        display: flex;
+        position: absolute;
+        align-items: center;
+        justify-content: center;
+      }
+      .game {
+        width: 100%;
+        height: 100%;
+        display: block;
+      }
+      .loading {
+        position: absolute;
+      }
+      .game[width] + .loading {
+        display: none;
+      }
+      .credit-overlay {
+        position: fixed;
+        top: 12px;
+        left: 12px;
+        z-index: 9999;
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        padding: 12px 16px;
+        background: rgba(18, 18, 22, 0.85);
+        border-radius: 12px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.35);
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        font-size: 15px;
+      }
+      .credit-overlay a {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        width: 44px;
+        height: 44px;
+        color: #a0a0a8;
+        border-radius: 10px;
+        transition: color 0.2s, background 0.2s, transform 0.15s;
+      }
+      .credit-overlay a:hover {
+        color: #fff;
+        background: rgba(255, 255, 255, 0.1);
+        transform: scale(1.08);
+      }
+      .credit-overlay a:active {
+        transform: scale(0.98);
+      }
+      .credit-overlay .icon {
+        width: 28px;
+        height: 28px;
+        fill: currentColor;
+      }
+      .credit-overlay .icon-gh { color: #a0a0a8; }
+      .credit-overlay a:hover .icon-gh { color: #e6edf3; }
+      .credit-overlay .icon-discord { color: #a0a0a8; }
+      .credit-overlay a:hover .icon-discord { color: #5865f2; }
+      .credit-overlay .icon-patreon { color: #a0a0a8; }
+      .credit-overlay a:hover .icon-patreon { color: #ff424d; }
+      /* WebRTC multiplayer: top-right floating status + join link (host) */
+      .webrtc-overlay {
+        position: fixed;
+        top: 12px;
+        right: 12px;
+        z-index: 9999;
+        min-width: 200px;
+        max-width: min(420px, calc(100vw - 24px));
+        padding: 12px 16px;
+        background: rgba(18, 18, 22, 0.85);
+        border-radius: 12px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.35);
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        font-size: 14px;
+      }
+      .webrtc-overlay__title {
+        color: #8b949e;
+        font-size: 12px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        margin-bottom: 8px;
+      }
+      .webrtc-overlay__status {
+        color: #e6edf3;
+        margin-bottom: 10px;
+        font-weight: 500;
+      }
+      .webrtc-overlay__status::before {
+        content: '';
+        display: inline-block;
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        margin-right: 8px;
+        vertical-align: middle;
+        background: #8b949e;
+      }
+      .webrtc-overlay__status.connected::before { background: #3fb950; }
+      .webrtc-overlay__status.hosting::before { background: #d29922; }
+      .webrtc-overlay__status.error::before { background: #f85149; }
+      .webrtc-overlay__link-row {
+        display: flex;
+        gap: 8px;
+        align-items: center;
+      }
+      .webrtc-overlay__input {
+        flex: 1;
+        min-width: 0;
+        padding: 8px 10px;
+        background: rgba(0, 0, 0, 0.35);
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 8px;
+        color: #c9d1d9;
+        font-size: 13px;
+        font-family: inherit;
+      }
+      .webrtc-overlay__input:focus {
+        outline: none;
+        border-color: rgba(255, 255, 255, 0.25);
+      }
+      .webrtc-overlay__copy {
+        flex-shrink: 0;
+        padding: 8px 14px;
+        background: rgba(255, 255, 255, 0.1);
+        border: 1px solid rgba(255, 255, 255, 0.15);
+        border-radius: 8px;
+        color: #c9d1d9;
+        font-size: 13px;
+        font-weight: 500;
+        cursor: pointer;
+        transition: color 0.2s, background 0.2s, border-color 0.2s;
+      }
+      .webrtc-overlay__copy:hover {
+        color: #fff;
+        background: rgba(255, 255, 255, 0.15);
+        border-color: rgba(255, 255, 255, 0.25);
+      }
+      .webrtc-overlay__copy:active { background: rgba(255, 255, 255, 0.08); }
+      .webrtc-overlay__copy.copied { color: #3fb950; border-color: #3fb950; }
+      .webrtc-overlay__volume-row {
+        margin-top: 12px;
+        padding-top: 12px;
+        border-top: 1px solid rgba(255, 255, 255, 0.08);
+      }
+      .webrtc-overlay__volume-label {
+        display: block;
+        color: #8b949e;
+        font-size: 12px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        margin-bottom: 6px;
+      }
+      .webrtc-overlay__volume-slider {
+        width: 100%;
+        height: 6px;
+        -webkit-appearance: none;
+        appearance: none;
+        background: rgba(0, 0, 0, 0.35);
+        border-radius: 3px;
+        outline: none;
+      }
+      .webrtc-overlay__volume-slider::-webkit-slider-thumb {
+        -webkit-appearance: none;
+        appearance: none;
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        background: #c9d1d9;
+        cursor: pointer;
+        border: none;
+        transition: background 0.2s;
+      }
+      .webrtc-overlay__volume-slider::-webkit-slider-thumb:hover { background: #fff; }
+      .webrtc-overlay__volume-slider::-moz-range-thumb {
+        width: 14px;
+        height: 14px;
+        border-radius: 50%;
+        background: #c9d1d9;
+        cursor: pointer;
+        border: none;
+      }
+      .webrtc-overlay__volume-slider::-moz-range-thumb:hover { background: #fff; }
+      body.webrtc-join-mode .webrtc-overlay .webrtc-overlay__link-row { display: none !important; }
+      /* Remote multiplayer tip: below-center at start, dismiss on any input */
+      .remote-multiplayer-tip {
+        position: fixed;
+        left: 50%;
+        top: 75%;
+        transform: translate(-50%, -50%);
+        z-index: 10000;
+        min-width: 280px;
+        max-width: min(560px, calc(100vw - 48px));
+        max-height: min(42vh, 360px);
+        overflow: auto;
+        padding: 20px 24px;
+        background: rgba(18, 18, 22, 0.92);
+        border-radius: 12px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        box-shadow: 0 4px 20px rgba(0, 0, 0, 0.35);
+        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+        font-size: 14px;
+        color: #e6edf3;
+        line-height: 1.5;
+      }
+      .remote-multiplayer-tip.hidden { display: none !important; }
+      .remote-multiplayer-tip__title {
+        color: #8b949e;
+        font-size: 12px;
+        font-weight: 600;
+        text-transform: uppercase;
+        letter-spacing: 0.04em;
+        margin-bottom: 10px;
+      }
+      .remote-multiplayer-tip__body { margin-bottom: 8px; }
+      .remote-multiplayer-tip__body p { margin: 0 0 10px 0; }
+      .remote-multiplayer-tip__body p:last-child { margin-bottom: 0; }
+      .remote-multiplayer-tip__note {
+        color: #8b949e;
+        font-size: 12px;
+        margin-top: 12px;
+      }
+      /* Join mode: video only, scaled to page with aspect ratio maintained; no game UI */
+      body.webrtc-join-mode .emscripten { display: none !important; }
+      body.webrtc-join-mode #webrtcRemoteVideo {
+        display: block !important;
+        position: fixed;
+        left: 0;
+        top: 0;
+        width: 100%;
+        height: 100%;
+        object-fit: contain;
+        object-position: center;
+      }
+    </style>
+  </head>
+  <body>
+    <script type="text/javascript">
+      (function() {
+        var q = new URLSearchParams(window.location.search);
+        window.WEBRTC_JOIN_MODE = !!(q.get('join') === '1' && q.get('room'));
+        if (window.WEBRTC_JOIN_MODE) document.body.classList.add('webrtc-join-mode');
+      })();
+    </script>
+    <div class="emscripten">
+      <canvas id="canvas" class="game" oncontextmenu="event.preventDefault()"></canvas>
+      <div class="loading">Loading...</div>
+    </div>
+    <video id="webrtcRemoteVideo" autoplay playsinline style="display:none;pointer-events:none;"></video>
+    <div class="webrtc-overlay" id="webrtcOverlay" aria-label="WebRTC multiplayer">
+      <div class="webrtc-overlay__title">Multiplayer join link</div>
+      <div class="webrtc-overlay__status" id="webrtcStatus">Connecting...</div>
+      <div class="webrtc-overlay__link-row" id="webrtcLinkRow" style="display:none">
+        <input type="text" readonly class="webrtc-overlay__input" id="webrtcJoinLink" value="" />
+        <button type="button" class="webrtc-overlay__copy" id="webrtcCopyBtn">Copy</button>
+      </div>
+      <div class="webrtc-overlay__volume-row">
+        <label class="webrtc-overlay__volume-label" for="webrtcVolume">Volume</label>
+        <input type="range" id="webrtcVolume" class="webrtc-overlay__volume-slider" min="0" max="100" value="100" />
+      </div>
+    </div>
+    <div class="remote-multiplayer-tip" id="remoteMultiplayerTip" aria-label="Remote multiplayer info">
+      <div class="remote-multiplayer-tip__title">README</div>
+      <div class="remote-multiplayer-tip__body">
+        <p>For more projects use the top left links (GitHub, Discord, or Patreon).</p>
+        <p><strong>Remote multiplayer:</strong> Copy the join link from the top right and send it to a friend. They open the link to watch the host stream and play as player two; remote keyboard and gamepads always control player two.</p>
+        <p><strong>Fullscreen:</strong> Press F11 to toggle browser fullscreen.</p>
+        <p>Guest controls: WASD or arrows move/turn, Q/E strafe, Space or Ctrl fires. A connected gamepad also works.</p>
+      </div>
+      <div class="remote-multiplayer-tip__note">
+        Connection is peer-to-peer and may not work behind strict corporate firewalls or some networks.
+      </div>
+    </div>
+    <script type="text/javascript">
+      (function() {
+        var el = document.getElementById('remoteMultiplayerTip');
+        if (!el) return;
+        function dismiss() {
+          el.classList.add('hidden');
+          document.removeEventListener('keydown', dismiss);
+          document.removeEventListener('click', dismiss, true);
+          document.removeEventListener('touchstart', dismiss, true);
+        }
+        document.addEventListener('keydown', dismiss, { once: true });
+        document.addEventListener('click', dismiss, { once: true, capture: true });
+        document.addEventListener('touchstart', dismiss, { once: true, capture: true });
+      })();
+    </script>
+    <div class="credit-overlay" aria-label="Links">
+      <a href="https://retro-foundry.github.io/" target="_blank" rel="noopener noreferrer" title="Retro Foundry - Projects">
+        <svg class="icon icon-gh" viewBox="0 0 16 16" aria-hidden="true"><path fill-rule="evenodd" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+      </a>
+      <a href="https://discord.gg/ZrgkWCjRDW" target="_blank" rel="noopener noreferrer" title="Discord - retrofoundry">
+        <svg class="icon icon-discord" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057a.082.082 0 0 0 .031.057 19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028 14.09 14.09 0 0 0 1.226-1.994.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z"/></svg>
+      </a>
+      <a href="https://www.patreon.com/cw/retrofoundry" target="_blank" rel="noopener noreferrer" title="Patreon - retrofoundry">
+        <svg class="icon icon-patreon" viewBox="0 0 1080 1080" aria-hidden="true"><path fill="currentColor" d="M1033.05,324.45c-0.19-137.9-107.59-250.92-233.6-291.7c-156.48-50.64-362.86-43.3-512.28,27.2C106.07,145.41,49.18,332.61,47.06,519.31c-1.74,153.5,13.58,557.79,241.62,560.67c169.44,2.15,194.67-216.18,273.07-321.33c55.78-74.81,127.6-95.94,216.01-117.82C929.71,603.22,1033.27,483.3,1033.05,324.45z"/></svg>
+      </a>
+    </div>
+    <script type="text/javascript">
+        const $game = document.querySelector('.game');
+        function resize() {
+            if (window.WEBRTC_JOIN_MODE) return;
+            const canvas = document.getElementById('canvas');
+            if (!canvas || typeof Module === 'undefined' || !Module.canvas) return;
+            const w = Math.max(1, window.innerWidth);
+            const h = Math.max(1, window.innerHeight);
+            if (canvas.width !== w || canvas.height !== h) {
+                canvas.width = w;
+                canvas.height = h;
+            }
+        }
+        var Module = {
+            print(text) {
+                console.log(Array.prototype.slice.call(arguments).join(' '));
+            },
+            printErr() {
+                console.error(Array.prototype.slice.call(arguments).join(' '));
+            },
+            canvas: document.getElementById('canvas') || $game,
+            noStdioInit: true,
+            gloomRuntimeReady: false,
+            onRuntimeInitialized() {
+                Module.gloomRuntimeReady = true;
+                if (typeof window.gloomSyncWebRTCStateToWasm === 'function') {
+                    window.gloomSyncWebRTCStateToWasm();
+                }
+            }
+        };
+        if (window.WEBRTC_JOIN_MODE) Module.noInitialRun = true;
+        if (!window.WEBRTC_JOIN_MODE) Module['arguments'] = ['--two-player'];
+        // Strip WebRTC query params from argv so the game does not see host=1, room=, join= as CLI args
+        (Module.preRun = Module.preRun || []).push(function() {
+            if (Module['arguments']) {
+                var webRtcKeys = { host: 1, room: 1, join: 1 };
+                Module['arguments'] = Module['arguments'].filter(function(a) {
+                    var key = (String(a).split('=')[0] || '').toLowerCase();
+                    return !webRtcKeys[key];
+                });
+            }
+        });
+        window.addEventListener('resize', resize, false);
+        window.triggerResize = resize;
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', function() { resize(); });
+        } else {
+            resize();
+        }
+        // Work-around chromium autoplay policy
+        // https://github.com/emscripten-core/emscripten/issues/6511
+        function resumeAudio(e) {
+            if (typeof Module === 'undefined'
+                || typeof Module.SDL2 == 'undefined'
+                || typeof Module.SDL2.audioContext == 'undefined')
+                return;
+            if (Module.SDL2.audioContext.state == 'suspended') {
+                Module.SDL2.audioContext.resume();
+            }
+            if (Module.SDL2.audioContext.state == 'running') {
+                $game.removeEventListener('click', resumeAudio);
+                document.removeEventListener('keydown', resumeAudio);
+            }
+        }
+        $game.addEventListener('click', resumeAudio);
+        document.addEventListener('keydown', resumeAudio);
+
+        // WebRTC multiplayer: auto-host with 8-digit room, or auto-join via ?join=1&room=XXXXXXXX
+        (function() {
+            const SIGNAL_BASE = "https://tiny-signal.retrofoundry.workers.dev";
+            const canvas = document.getElementById('canvas');
+            const remoteVideo = document.getElementById('webrtcRemoteVideo');
+            const webrtcStatusEl = document.getElementById('webrtcStatus');
+            const webrtcLinkRow = document.getElementById('webrtcLinkRow');
+            const webrtcJoinLinkInput = document.getElementById('webrtcJoinLink');
+            const webrtcCopyBtn = document.getElementById('webrtcCopyBtn');
+            const webrtcVolumeSlider = document.getElementById('webrtcVolume');
+
+            var VOLUME_STORAGE_KEY = 'gloom-webrtc-volume';
+
+            // setupWebRTCAudioRouting: called once the host's SDL2 audio node is ready.
+            // Inserts a ChannelSplitter so the stereo output (L=P1, R=P2) is split:
+            //   left  → GainNode → audioContext.destination  (host hears P1 only)
+            //   right → MediaStreamDestinationNode           (guest receives P2 only)
+            function setupWebRTCAudioRouting() {
+                if (state.role !== 'host') return false;
+                var SDL2 = (typeof Module !== 'undefined') ? Module.SDL2 : null;
+                if (!SDL2 || !SDL2.audioContext || !SDL2.audio || !SDL2.audio.scriptProcessorNode) return false;
+                if (SDL2.audio._webrtcRoutingDone) return true;
+                var ctx = SDL2.audioContext;
+                var sp = SDL2.audio.scriptProcessorNode;
+                try { sp.disconnect(); } catch (e) {}
+                var splitter = ctx.createChannelSplitter(2);
+                sp.connect(splitter);
+                var hostGain = ctx.createGain();
+                splitter.connect(hostGain, 0, 0);
+                hostGain.connect(ctx.destination);
+                if (webrtcVolumeSlider) hostGain.gain.value = parseInt(webrtcVolumeSlider.value, 10) / 100;
+                SDL2.audio.gainNode = hostGain;
+                var p2Dest = ctx.createMediaStreamDestination();
+                splitter.connect(p2Dest, 1, 0);
+                state.p2AudioStream = p2Dest.stream;
+                SDL2.audio._webrtcRoutingDone = true;
+                return true;
+            }
+
+            function applyVolume(value01) {
+                if (state.role === 'guest') {
+                    if (remoteVideo) remoteVideo.volume = value01;
+                    return;
+                }
+                var SDL2 = (typeof Module !== 'undefined') ? Module.SDL2 : null;
+                if (!SDL2 || !SDL2.audioContext || !SDL2.audio) return;
+                var audio = SDL2.audio;
+                if (audio.gainNode) {
+                    audio.gainNode.gain.value = value01;
+                }
+            }
+
+            if (webrtcVolumeSlider) {
+                var saved = localStorage.getItem(VOLUME_STORAGE_KEY);
+                if (saved !== null) {
+                    var n = parseInt(saved, 10);
+                    if (!isNaN(n) && n >= 0 && n <= 100) {
+                        webrtcVolumeSlider.value = n;
+                    }
+                }
+                webrtcVolumeSlider.addEventListener('input', function() {
+                    var pct = parseInt(webrtcVolumeSlider.value, 10);
+                    var v = Math.max(0, Math.min(1, pct / 100));
+                    applyVolume(v);
+                    localStorage.setItem(VOLUME_STORAGE_KEY, String(pct));
+                });
+                webrtcVolumeSlider.addEventListener('change', function() {
+                    var pct = parseInt(webrtcVolumeSlider.value, 10);
+                    localStorage.setItem(VOLUME_STORAGE_KEY, String(pct));
+                });
+            }
+
+            function makePeerId() {
+                if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+                    return window.crypto.randomUUID();
+                }
+                var bytes = new Uint8Array(16);
+                if (window.crypto && typeof window.crypto.getRandomValues === 'function') {
+                    window.crypto.getRandomValues(bytes);
+                } else {
+                    for (var i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
+                }
+                return Array.prototype.map.call(bytes, function(b) {
+                    return ('0' + b.toString(16)).slice(-2);
+                }).join('');
+            }
+
+            function setWebRTCStatus(text, className) {
+                if (!webrtcStatusEl) return;
+                webrtcStatusEl.textContent = text;
+                webrtcStatusEl.className = 'webrtc-overlay__status' + (className ? ' ' + className : '');
+            }
+
+            function notifyGuestConnected() {
+                state.guestConnected = true;
+                setWebRTCStatus('Connected', 'connected');
+                syncWebRTCStateToWasm();
+            }
+
+            function notifyGuestDisconnected() {
+                if (!state.guestConnected) return;
+                state.guestConnected = false;
+                state.targetPeerId = null;
+                setWebRTCStatus('Waiting for guest', 'hosting');
+                guestInput.keys.clear();
+                guestInput.gamepads.clear();
+                syncWebRTCStateToWasm();
+            }
+
+            if (webrtcCopyBtn && webrtcJoinLinkInput) {
+                webrtcCopyBtn.addEventListener('click', function() {
+                    var url = webrtcJoinLinkInput.value;
+                    if (!url) return;
+                    navigator.clipboard.writeText(url).then(function() {
+                        webrtcCopyBtn.textContent = 'Copied!';
+                        webrtcCopyBtn.classList.add('copied');
+                        setTimeout(function() {
+                            webrtcCopyBtn.textContent = 'Copy';
+                            webrtcCopyBtn.classList.remove('copied');
+                        }, 1500);
+                    });
+                });
+            }
+
+            function makeRoomId() {
+                return String(Math.floor(10000000 + Math.random() * 90000000));
+            }
+
+            function buildGuestJoinUrl(roomId) {
+                var url = new URL(window.location.href);
+                url.search = '';
+                url.hash = '';
+                url.searchParams.set('join', '1');
+                url.searchParams.set('room', roomId);
+                return url.toString();
+            }
+
+            const state = {
+                role: null,
+                room: null,
+                peerId: makePeerId(),
+                targetPeerId: null,
+                ws: null,
+                pc: null,
+                dc: null,
+                streamAdded: false,
+                captureStream: null,
+                p2AudioStream: null,
+                p2AudioTrackAdded: false,
+                offerInProgress: false,
+                gamepadLoopHandle: null,
+                guestConnected: false
+            };
+
+            const guestInput = {
+                keys: new Set(),
+                gamepads: new Map()
+            };
+            var GLOOM_INPUT_LEFT = 1;
+            var GLOOM_INPUT_RIGHT = 2;
+            var GLOOM_INPUT_FORWARD = 4;
+            var GLOOM_INPUT_BACK = 8;
+            var GLOOM_INPUT_STRAFE_LEFT = 16;
+            var GLOOM_INPUT_STRAFE_RIGHT = 32;
+            var GLOOM_INPUT_FIRE = 64;
+            function btnPressed(bt, i) {
+                if (!bt || i < 0 || i >= (bt.length || 0)) return false;
+                var b = bt[i];
+                if (b == null) return false;
+                if (typeof b === 'object') return !!(b.pressed || (typeof b.value === 'number' && b.value > 0.5));
+                return b === true || b === 1;
+            }
+            function axisAtLeast(ax, i, threshold) {
+                if (!ax || i < 0 || i >= (ax.length || 0)) return false;
+                var v = ax[i];
+                return typeof v === 'number' && v >= threshold;
+            }
+            function axisAtMost(ax, i, threshold) {
+                if (!ax || i < 0 || i >= (ax.length || 0)) return false;
+                var v = ax[i];
+                return typeof v === 'number' && v <= threshold;
+            }
+            function guestInputToPlayer2Dword() {
+                var d = 0;
+                var k = guestInput.keys;
+                if (k.has('ArrowLeft') || k.has('a') || k.has('A')) d |= GLOOM_INPUT_LEFT;
+                if (k.has('ArrowRight') || k.has('d') || k.has('D')) d |= GLOOM_INPUT_RIGHT;
+                if (k.has('ArrowUp') || k.has('w') || k.has('W')) d |= GLOOM_INPUT_FORWARD;
+                if (k.has('ArrowDown') || k.has('s') || k.has('S')) d |= GLOOM_INPUT_BACK;
+                if (k.has('q') || k.has('Q')) d |= GLOOM_INPUT_STRAFE_LEFT;
+                if (k.has('e') || k.has('E')) d |= GLOOM_INPUT_STRAFE_RIGHT;
+                if (k.has(' ') || k.has('Spacebar') || k.has('Control') || k.has('Ctrl')) d |= GLOOM_INPUT_FIRE;
+                var pads = guestInput.gamepads;
+                pads.forEach(function(p) {
+                    var ax = p.axes || [], bt = p.buttons || [];
+                    if (axisAtMost(ax, 2, -0.15) || btnPressed(bt, 14)) d |= GLOOM_INPUT_LEFT;
+                    if (axisAtLeast(ax, 2, 0.15) || btnPressed(bt, 15)) d |= GLOOM_INPUT_RIGHT;
+                    if (axisAtMost(ax, 1, -0.15) || btnPressed(bt, 12)) d |= GLOOM_INPUT_FORWARD;
+                    if (axisAtLeast(ax, 1, 0.15) || btnPressed(bt, 13)) d |= GLOOM_INPUT_BACK;
+                    if (axisAtMost(ax, 0, -0.15)) d |= GLOOM_INPUT_STRAFE_LEFT;
+                    if (axisAtLeast(ax, 0, 0.15)) d |= GLOOM_INPUT_STRAFE_RIGHT;
+                    if (axisAtLeast(ax, 5, 0.15) || btnPressed(bt, 7) || btnPressed(bt, 0) || btnPressed(bt, 5)) d |= GLOOM_INPUT_FIRE;
+                });
+                return d;
+            }
+            function flushGuestInputToWasm() {
+                syncWebRTCStateToWasm();
+            }
+            function syncWebRTCStateToWasm() {
+                if (state.role !== 'host' || typeof Module === 'undefined') return;
+                if (!Module.gloomRuntimeReady) return;
+                try {
+                    if (typeof Module._SetWebRTCGuestConnected === 'function') {
+                        Module._SetWebRTCGuestConnected(state.guestConnected ? 1 : 0);
+                    }
+                    if (typeof Module._SetWebRTCGuestPlayer2Input === 'function') {
+                        Module._SetWebRTCGuestPlayer2Input(state.guestConnected ? guestInputToPlayer2Dword() : 0);
+                    }
+                } catch (err) {
+                    console.error('WebRTC WASM input sync failed', err);
+                }
+            }
+            window.gloomSyncWebRTCStateToWasm = syncWebRTCStateToWasm;
+            setInterval(syncWebRTCStateToWasm, 250);
+
+            async function createSession(room, peer) {
+                const res = await fetch(SIGNAL_BASE + '/session', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ room, peer })
+                });
+                const text = await res.text();
+                var data = {};
+                if (text) {
+                    try {
+                        data = JSON.parse(text);
+                    } catch (err) {
+                        throw new Error('Signaling returned non-JSON response: ' + text.slice(0, 120));
+                    }
+                }
+                if (!res.ok) throw new Error(data.error || 'Failed to create session');
+                return data;
+            }
+
+            async function sendHostOffer() {
+                if (state.role !== 'host' || !state.pc || !state.ws || state.ws.readyState !== WebSocket.OPEN ||
+                    !state.targetPeerId || state.offerInProgress) {
+                    return;
+                }
+                state.offerInProgress = true;
+                try {
+                    await startHostOffer();
+                } finally {
+                    state.offerInProgress = false;
+                }
+            }
+
+            function setupPeerConnection() {
+                const pc = new RTCPeerConnection({
+                    iceServers: [
+                        { urls: 'stun:stun.l.google.com:19302' },
+                        { urls: 'stun:stun1.l.google.com:19302' }
+                    ]
+                });
+
+                pc.onicecandidate = function(event) {
+                    if (!event.candidate || !state.targetPeerId || !state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+                    state.ws.send(JSON.stringify({ type: 'ice', to: state.targetPeerId, payload: event.candidate }));
+                };
+
+                pc.ontrack = function(event) {
+                    if (state.role === 'guest') {
+                        remoteVideo.srcObject = (event.streams && event.streams.length) ? event.streams[0] : new MediaStream([event.track]);
+                        remoteVideo.muted = true;
+                        remoteVideo.play().catch(function(e) { console.warn('Remote video play failed:', e); });
+                        // Browsers block autoplay for unmuted media; unmute on first gesture.
+                        function unmute() {
+                            remoteVideo.muted = false;
+                            if (webrtcVolumeSlider) remoteVideo.volume = Math.max(0, Math.min(1, parseInt(webrtcVolumeSlider.value, 10) / 100));
+                            document.removeEventListener('click', unmute, true);
+                            document.removeEventListener('keydown', unmute, true);
+                        }
+                        document.addEventListener('click', unmute, true);
+                        document.addEventListener('keydown', unmute, true);
+                    }
+                };
+
+                pc.onconnectionstatechange = function() {
+                    var s = pc.connectionState;
+                    if (state.role === 'host' && (s === 'disconnected' || s === 'failed' || s === 'closed')) {
+                        notifyGuestDisconnected();
+                    }
+                };
+                pc.ondatachannel = function(event) {
+                    state.dc = event.channel;
+                    state.dc.onopen = function() {
+                        if (state.role === 'host') {
+                            notifyGuestConnected();
+                        } else {
+                            setWebRTCStatus('Connected to host', 'connected');
+                        }
+                    };
+                    state.dc.onclose = function() {
+                        if (state.role === 'host') notifyGuestDisconnected();
+                    };
+                    state.dc.onmessage = function(e) {
+                        if (state.role !== 'host') return;
+                        try {
+                            var msg = JSON.parse(e.data);
+                            handleGuestInput(msg);
+                        } catch (err) { console.error('Bad data channel message', err); }
+                    };
+                };
+
+                state.pc = pc;
+                return pc;
+            }
+
+            function markGuestConnected() {
+                if (state.role !== 'host' || state.guestConnected) return;
+                notifyGuestConnected();
+            }
+            function handleGuestInput(msg) {
+                markGuestConnected();
+                if (msg.type === 'key') {
+                    var key = String(msg.key || '');
+                    if (!key) return;
+                    if (msg.down) guestInput.keys.add(key);
+                    else guestInput.keys.delete(key);
+                    flushGuestInputToWasm();
+                    return;
+                }
+                if (msg.type === 'gamepad') {
+                    if (typeof msg.index !== 'number') return;
+                    guestInput.gamepads.set(msg.index, { id: msg.id || '', axes: Array.isArray(msg.axes) ? msg.axes : [], buttons: Array.isArray(msg.buttons) ? msg.buttons : [] });
+                    flushGuestInputToWasm();
+                    return;
+                }
+                if (msg.type === 'gamepad-disconnect') {
+                    if (typeof msg.index !== 'number') return;
+                    guestInput.gamepads.delete(msg.index);
+                    flushGuestInputToWasm();
+                }
+            }
+
+            async function connectSignaling(room, peer) {
+                const session = await createSession(room, peer);
+                const ws = new WebSocket(session.wsUrl);
+                state.ws = ws;
+                await new Promise(function(resolve, reject) {
+                    ws.onopen = resolve;
+                    ws.onerror = function() { reject(new Error('WebSocket failed')); };
+                });
+                ws.onmessage = async function(event) {
+                    const msg = JSON.parse(event.data);
+                    if (msg.type === 'peers') {
+                        const others = (msg.peers || []).filter(function(id) { return id !== state.peerId; });
+                        if (state.role === 'host' && others.length && !state.targetPeerId) {
+                            state.targetPeerId = others[0];
+                            await sendHostOffer();
+                        }
+                        if (state.role === 'host' && !others.length) {
+                            notifyGuestDisconnected();
+                        }
+                    }
+                    if (msg.type === 'offer') {
+                        state.targetPeerId = msg.from;
+                        await state.pc.setRemoteDescription(msg.payload);
+                        const answer = await state.pc.createAnswer();
+                        await state.pc.setLocalDescription(answer);
+                        ws.send(JSON.stringify({ type: 'answer', to: state.targetPeerId, payload: answer }));
+                    }
+                    if (msg.type === 'answer') await state.pc.setRemoteDescription(msg.payload);
+                    if (msg.type === 'ice') {
+                        try { await state.pc.addIceCandidate(msg.payload); } catch (err) { console.error('ICE candidate error', err); }
+                    }
+                };
+            }
+
+            async function startHostOffer() {
+                if (!state.pc || !state.ws || state.ws.readyState !== WebSocket.OPEN || !state.targetPeerId) return;
+                // Video only from canvas (captureStream has no audio); guest audio is a separate P2-only track below.
+                if (!state.streamAdded && canvas) {
+                    try {
+                        const stream = canvas.captureStream(30);
+                        state.captureStream = stream;
+                        var videoTracks = stream.getVideoTracks();
+                        for (var i = 0; i < videoTracks.length; i++) state.pc.addTrack(videoTracks[i], stream);
+                        state.streamAdded = true;
+                    } catch (err) { console.error('captureStream failed', err); }
+                }
+                // P2-only audio from channel splitter (right channel); not from video. One track, same stream ID as video for sync.
+                if (!state.p2AudioTrackAdded && state.captureStream && state.p2AudioStream) {
+                    var audioTracks = state.p2AudioStream.getAudioTracks();
+                    for (var t = 0; t < audioTracks.length; t++) {
+                        try { state.pc.addTrack(audioTracks[t], state.captureStream); } catch (e) {}
+                    }
+                    state.p2AudioTrackAdded = true;
+                }
+                if (!state.dc) {
+                    state.dc = state.pc.createDataChannel('inputs');
+                    state.dc.onopen = function() {
+                        if (state.role === 'host') notifyGuestConnected();
+                    };
+                    state.dc.onclose = function() {
+                        if (state.role === 'host') notifyGuestDisconnected();
+                    };
+                    state.dc.onmessage = function(e) {
+                        try {
+                            var msg = JSON.parse(e.data);
+                            handleGuestInput(msg);
+                        } catch (err) { console.error('Bad data channel message', err); }
+                    };
+                }
+                const offer = await state.pc.createOffer();
+                await state.pc.setLocalDescription(offer);
+                state.ws.send(JSON.stringify({ type: 'offer', to: state.targetPeerId, payload: offer }));
+            }
+
+            function sendInput(payload) {
+                if (state.role !== 'guest' || !state.dc || state.dc.readyState !== 'open') return;
+                state.dc.send(JSON.stringify(payload));
+            }
+
+            function setupGuestInput() {
+                window.addEventListener('keydown', function(e) {
+                    if (state.role !== 'guest') return;
+                    sendInput({ type: 'key', key: e.key, code: e.code, down: true });
+                    if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space','Spacebar','Control','Ctrl','q','Q','e','E'].includes(e.key) || e.code === 'Space' || e.code === 'ControlLeft' || e.code === 'ControlRight') e.preventDefault();
+                }, { passive: false });
+                window.addEventListener('keyup', function(e) {
+                    if (state.role !== 'guest') return;
+                    sendInput({ type: 'key', key: e.key, code: e.code, down: false });
+                    if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight','Space','Spacebar','Control','Ctrl','q','Q','e','E'].includes(e.key) || e.code === 'Space' || e.code === 'ControlLeft' || e.code === 'ControlRight') e.preventDefault();
+                }, { passive: false });
+                function snapshotGamepad(gp) {
+                    return { type: 'gamepad', index: gp.index, id: gp.id, axes: (gp.axes || []).map(function(v) { return Math.round(v * 1000) / 1000; }), buttons: (gp.buttons || []).map(function(btn) { return { pressed: !!btn.pressed, touched: !!btn.touched, value: Math.round(btn.value * 1000) / 1000 }; }) };
+                }
+                function guestTabVisible() {
+                    return typeof document.visibilityState !== 'undefined' && document.visibilityState === 'visible';
+                }
+                function pollGamepads() {
+                    if (state.role === 'guest' && guestTabVisible()) {
+                        var pads = navigator.getGamepads ? navigator.getGamepads() : [];
+                        for (var i = 0; i < (pads.length || 0); i++) {
+                            if (!pads[i]) continue;
+                            sendInput(snapshotGamepad(pads[i]));
+                        }
+                    }
+                    state.gamepadLoopHandle = requestAnimationFrame(pollGamepads);
+                }
+                window.addEventListener('gamepadconnected', function(e) {
+                    if (state.role === 'guest' && guestTabVisible()) sendInput(snapshotGamepad(e.gamepad));
+                });
+                window.addEventListener('gamepaddisconnected', function(e) {
+                    if (state.role === 'guest' && guestTabVisible()) sendInput({ type: 'gamepad-disconnect', index: e.gamepad.index });
+                });
+                document.addEventListener('visibilitychange', function() {
+                    if (state.role !== 'guest' || guestTabVisible() || !state.dc || state.dc.readyState !== 'open') return;
+                    var pads = navigator.getGamepads ? navigator.getGamepads() : [];
+                    for (var i = 0; i < (pads.length || 0); i++) {
+                        if (pads[i]) sendInput({ type: 'gamepad-disconnect', index: i });
+                    }
+                });
+                pollGamepads();
+            }
+
+            async function startHost() {
+                state.role = 'host';
+                state.room = makeRoomId();
+                state.targetPeerId = null;
+                var joinUrl = buildGuestJoinUrl(state.room);
+                console.log('WebRTC join URL (share with guest):', joinUrl);
+                setWebRTCStatus('Connecting...', '');
+                if (webrtcJoinLinkInput) webrtcJoinLinkInput.value = joinUrl;
+                if (webrtcLinkRow) webrtcLinkRow.style.display = 'flex';
+                setupPeerConnection();
+                await connectSignaling(state.room, state.peerId);
+                setWebRTCStatus('Hosting - share link with guest', 'hosting');
+                // Poll until SDL2 audio is ready, then set up the channel-split routing
+                // (P1 left → host speakers, P2 right → guest stream) and apply saved volume.
+                var hostVolumeTries = 0;
+                var hostVolumeInterval = setInterval(function() {
+                    if (state.role === 'host' && setupWebRTCAudioRouting()) {
+                        if (webrtcVolumeSlider) applyVolume(parseInt(webrtcVolumeSlider.value, 10) / 100);
+                        if (state.targetPeerId && !state.p2AudioTrackAdded) {
+                            sendHostOffer().catch(function(err) {
+                                console.error('WebRTC audio renegotiation failed', err);
+                            }).then(function() {
+                                if (state.p2AudioTrackAdded) clearInterval(hostVolumeInterval);
+                            });
+                        } else {
+                            clearInterval(hostVolumeInterval);
+                        }
+                    } else if (++hostVolumeTries > 40) {
+                        clearInterval(hostVolumeInterval);
+                    }
+                }, 500);
+            }
+
+            async function startGuest(roomId) {
+                state.role = 'guest';
+                state.room = roomId;
+                setWebRTCStatus('Joining...', '');
+                setupPeerConnection();
+                await connectSignaling(state.room, state.peerId);
+            }
+
+            setupGuestInput();
+
+            var urlParams = new URLSearchParams(window.location.search);
+            var roomFromUrl = urlParams.get('room');
+            var shouldJoin = urlParams.get('join') === '1';
+
+            if (shouldJoin && roomFromUrl) {
+                startGuest(roomFromUrl).catch(function(err) {
+                    console.error('WebRTC join failed', err);
+                    setWebRTCStatus('Join failed', 'error');
+                });
+            } else {
+                startHost().catch(function(err) {
+                    console.error('WebRTC host failed', err);
+                    setWebRTCStatus('Host failed', 'error');
+                });
+            }
+        })();
+    </script>
+    {{{ SCRIPT }}}
+  </body>
+</html>
