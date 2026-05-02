@@ -75,6 +75,7 @@ enum {
   GLOOM_PLAYER_FIRE_Y = -60,
   GLOOM_PROJECTILE_RADIUS = 32,
   GLOOM_PROJECTILE_BARREL_FORWARD = (GLOOM_PROJECTILE_RADIUS * 5) / 2,
+  GLOOM_PLAYER_PROJECTILE_RENDER_MIN_DISTANCE = GLOOM_PROJECTILE_RADIUS * 3,
   GLOOM_PICKUP_RADIUS = 48,
   GLOOM_HUD_FONT_PLANE_COUNT = 7,
   GLOOM_HUD_WEAPON_FIRST_CHAR = 39,
@@ -726,6 +727,7 @@ typedef struct {
   float screen_w;
   float screen_h;
   float depth;
+  int source_pad;
   const ObjectFrame *frame;
 } DebugSprite;
 
@@ -6377,6 +6379,26 @@ static bool spawn_player_projectile(AppState *state, uint8_t weapon_index) {
   return spawn_player_projectile_at_angle(state, weapon_index, state->camera_angle, true);
 }
 
+static bool player_projectile_visible_from_owner_view(const AppState *state, const RuntimeProjectile *projectile,
+                                                      float view_depth) {
+  float dx = 0.0f;
+  float dz = 0.0f;
+
+  if (state == NULL || projectile == NULL || projectile->enemy ||
+      projectile->player_owner_index != state->active_player_index) {
+    return true;
+  }
+
+  if (view_depth < (float)GLOOM_PLAYER_PROJECTILE_RENDER_MIN_DISTANCE) {
+    return false;
+  }
+
+  dx = projectile->x - state->camera_x;
+  dz = projectile->z - state->camera_z;
+  return (dx * dx + dz * dz) >=
+         (float)(GLOOM_PLAYER_PROJECTILE_RENDER_MIN_DISTANCE * GLOOM_PLAYER_PROJECTILE_RENDER_MIN_DISTANCE);
+}
+
 static void update_projectiles(AppState *state, const ObjectVisualSet *object_visuals) {
   float step_scale = fixed_step_amiga_scale();
   size_t i = 0u;
@@ -8507,11 +8529,27 @@ static void append_player_debug_sprite(const AppState *state, const ObjectVisual
   sp->screen_w = ((float)frame->width * scale * focal) / svz;
   sp->screen_h = ((float)frame->height * scale * focal) / svz;
   sp->depth = svz;
+  sp->source_pad = 0;
   sp->frame = frame;
 
   if (sp->screen_w >= 1.0f && sp->screen_h >= 1.0f) {
     *sprite_write += 1u;
   }
+}
+
+static int projectile_sprite_source_pad(uint8_t weapon_index) {
+  static const int source_pad_by_weapon[GLOOM_WEAPON_COUNT] = {0, 2, 3, 3, 4};
+
+  if (weapon_index >= (uint8_t)GLOOM_WEAPON_COUNT) {
+    return 0;
+  }
+
+  /*
+   * bullet1.bin already has the expected edge shape. The larger green/purple original
+   * bullet*.bin frames reach their source bounds, so the PC billboard gets transparent
+   * source padding without changing the original pixels or gameplay scale.
+   */
+  return source_pad_by_weapon[weapon_index];
 }
 
 static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *state, const GridOffsetSet *grid_offsets,
@@ -8553,6 +8591,7 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
   if (depth_buffer == NULL || sprite_depth_buffer == NULL || filled_stamps == NULL) {
     return;
   }
+  memset(debug_sprites, 0, sizeof(debug_sprites));
 
   wall_candidate_count =
       collect_wall_candidates_from_grid(&state->map, grid_offsets, cam_x, cam_z, wall_candidates,
@@ -8898,6 +8937,7 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
         sp->screen_w = ((float)frame->width * scale * focal) / svz;
         sp->screen_h = ((float)frame->height * scale * focal) / svz;
         sp->depth = svz;
+        sp->source_pad = 0;
         sp->frame = frame;
 
         if (sp->screen_w >= 1.0f && sp->screen_h >= 1.0f) {
@@ -8929,6 +8969,10 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
       float top_view_y = 0.0f;
       float left_view_x = 0.0f;
       size_t frame_index = 0u;
+      int source_pad = 0;
+      float source_pad_view = 0.0f;
+      float padded_width = 0.0f;
+      float padded_height = 0.0f;
 
       if (!projectile->active || projectile->weapon_index >= (uint8_t)GLOOM_WEAPON_COUNT) {
         continue;
@@ -8952,17 +8996,26 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
       if (svz < near_plane || svz >= far_depth || SDL_fabsf(svx) > svz * frustum_ratio * 1.1f) {
         continue;
       }
+      if (!player_projectile_visible_from_owner_view(state, projectile, svz)) {
+        continue;
+      }
 
       object_y = projectile->y - state->camera_y;
       scale = (float)visual->scale / 256.0f;
       top_view_y = object_y - ((float)frame->handle_y * scale);
       left_view_x = svx - ((float)frame->handle_x * scale);
+      source_pad = projectile_sprite_source_pad(projectile->weapon_index);
+      source_pad_view = (float)source_pad * scale;
+      padded_width = ((float)frame->width + (float)(source_pad * 2)) * scale;
+      padded_height = ((float)frame->height + (float)(source_pad * 2)) * scale;
 
-      debug_sprites[sprite_write].screen_x = (float)x + (float)w * 0.5f + (left_view_x / svz) * focal;
-      debug_sprites[sprite_write].screen_y = (float)horizon_y + (top_view_y / svz) * focal;
-      debug_sprites[sprite_write].screen_w = ((float)frame->width * scale * focal) / svz;
-      debug_sprites[sprite_write].screen_h = ((float)frame->height * scale * focal) / svz;
+      debug_sprites[sprite_write].screen_x =
+          (float)x + (float)w * 0.5f + ((left_view_x - source_pad_view) / svz) * focal;
+      debug_sprites[sprite_write].screen_y = (float)horizon_y + ((top_view_y - source_pad_view) / svz) * focal;
+      debug_sprites[sprite_write].screen_w = (padded_width * focal) / svz;
+      debug_sprites[sprite_write].screen_h = (padded_height * focal) / svz;
       debug_sprites[sprite_write].depth = svz;
+      debug_sprites[sprite_write].source_pad = source_pad;
       debug_sprites[sprite_write].frame = frame;
 
       if (debug_sprites[sprite_write].screen_w >= 1.0f && debug_sprites[sprite_write].screen_h >= 1.0f) {
@@ -9017,6 +9070,7 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
       debug_sprites[sprite_write].screen_w = ((float)frame->width * scale * focal) / svz;
       debug_sprites[sprite_write].screen_h = ((float)frame->height * scale * focal) / svz;
       debug_sprites[sprite_write].depth = svz;
+      debug_sprites[sprite_write].source_pad = 0;
       debug_sprites[sprite_write].frame = frame;
 
       if (debug_sprites[sprite_write].screen_w >= 1.0f && debug_sprites[sprite_write].screen_h >= 1.0f) {
@@ -9073,6 +9127,7 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
       debug_sprites[sprite_write].screen_w = ((float)frame->width * scale * focal) / svz;
       debug_sprites[sprite_write].screen_h = ((float)frame->height * scale * focal) / svz;
       debug_sprites[sprite_write].depth = svz;
+      debug_sprites[sprite_write].source_pad = 0;
       debug_sprites[sprite_write].frame = frame;
 
       if (debug_sprites[sprite_write].screen_w >= 1.0f && debug_sprites[sprite_write].screen_h >= 1.0f) {
@@ -9127,6 +9182,7 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
       debug_sprites[sprite_write].screen_w = ((float)frame->width * scale * focal) / svz;
       debug_sprites[sprite_write].screen_h = ((float)frame->height * scale * focal) / svz;
       debug_sprites[sprite_write].depth = svz;
+      debug_sprites[sprite_write].source_pad = 0;
       debug_sprites[sprite_write].frame = frame;
 
       if (debug_sprites[sprite_write].screen_w >= 1.0f && debug_sprites[sprite_write].screen_h >= 1.0f) {
@@ -9243,8 +9299,22 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
           continue;
         }
 
-        sx = (int)(tu * (float)(frame->width - 1));
-        sy = (int)(tv * (float)(frame->height - 1));
+        if (sp->source_pad > 0) {
+          float padded_width = (float)(frame->width + (sp->source_pad * 2));
+          float padded_height = (float)(frame->height + (sp->source_pad * 2));
+          float source_x = (tu * padded_width) - (float)sp->source_pad;
+          float source_y = (tv * padded_height) - (float)sp->source_pad;
+
+          if (source_x < 0.0f || source_y < 0.0f || source_x >= (float)frame->width ||
+              source_y >= (float)frame->height) {
+            continue;
+          }
+          sx = (int)source_x;
+          sy = (int)source_y;
+        } else {
+          sx = (int)(tu * (float)(frame->width - 1));
+          sy = (int)(tv * (float)(frame->height - 1));
+        }
         argb = frame->argb_pixels[(size_t)sy * (size_t)frame->width + (size_t)sx];
 
         alpha = (uint8_t)(argb >> 24);
@@ -9344,15 +9414,41 @@ static void render_object_frame_scaled(RenderFramebuffer *framebuffer, const Obj
   render_argb_pixels_scaled(framebuffer, frame->argb_pixels, frame->width, frame->height, screen_x, screen_y, scale);
 }
 
-static size_t player_weapon_muzzle_frame_index(uint8_t weapon_index) {
-  uint32_t clamped_weapon = weapon_index;
+static size_t player_weapon_muzzle_frame_index(const AppState *state) {
+  static const uint8_t flash_by_weapon[GLOOM_WEAPON_COUNT] = {0u, 1u, 1u, 2u, 2u};
+  uint8_t weapon_index = state != NULL ? state->player_weapon : 0u;
 
-  if (clamped_weapon >= (uint32_t)GLOOM_WEAPON_COUNT) {
-    clamped_weapon = 0u;
+  if (weapon_index >= (uint8_t)GLOOM_WEAPON_COUNT) {
+    weapon_index = 0u;
   }
 
-  return (size_t)GLOOM_GUN_MUZZLE_FIRST_FRAME +
-         (size_t)((clamped_weapon * (uint32_t)GLOOM_GUN_MUZZLE_FRAME_COUNT) / (uint32_t)GLOOM_WEAPON_COUNT);
+  /*
+   * amiga/gloom2.s: checkfire always selects bullet/spark art from wtable using ob_weapon.
+   * ob_mega adds two/three-way spread and ob_bouncecnt changes projectile bounce count, but
+   * neither changes the underlying shot colour.
+   */
+  return (size_t)GLOOM_GUN_MUZZLE_FIRST_FRAME + (size_t)flash_by_weapon[weapon_index];
+}
+
+static int player_weapon_muzzle_frame_y_offset(size_t muzzle_frame_index) {
+  static const int offset_by_muzzle_frame[GLOOM_GUN_MUZZLE_FRAME_COUNT] = {0, 6, 10};
+  size_t relative_frame = 0u;
+
+  if (muzzle_frame_index < (size_t)GLOOM_GUN_MUZZLE_FIRST_FRAME) {
+    return 0;
+  }
+
+  relative_frame = muzzle_frame_index - (size_t)GLOOM_GUN_MUZZLE_FIRST_FRAME;
+  if (relative_frame >= (size_t)GLOOM_GUN_MUZZLE_FRAME_COUNT) {
+    return 0;
+  }
+
+  /*
+   * The red flash already sits correctly. The original gun asset's green and purple flashes
+   * are taller (51/55 pixels versus red's 45), so draw them higher by the height delta to keep
+   * the barrel contact point aligned with the red frame.
+   */
+  return offset_by_muzzle_frame[relative_frame];
 }
 
 static void render_player_weapon(RenderFramebuffer *framebuffer, const AppState *state,
@@ -9403,7 +9499,7 @@ static void render_player_weapon(RenderFramebuffer *framebuffer, const AppState 
 
   if (state->player_weapon_flash > 0.0f &&
       gun->frame_count >= (size_t)(GLOOM_GUN_MUZZLE_FIRST_FRAME + GLOOM_GUN_MUZZLE_FRAME_COUNT)) {
-    size_t muzzle_frame_index = player_weapon_muzzle_frame_index(state->player_weapon);
+    size_t muzzle_frame_index = player_weapon_muzzle_frame_index(state);
     float muzzle_anchor_y = (float)y + (float)h + (float)(GLOOM_GUN_MUZZLE_LOWER_OFFSET * ui_scale);
 
     if (muzzle_frame_index < gun->frame_count) {
@@ -9412,7 +9508,10 @@ static void render_player_weapon(RenderFramebuffer *framebuffer, const AppState 
 
       muzzle_frame = &gun->frames[muzzle_frame_index];
       muzzle_draw_x = round_float_to_int32(anchor_x - (float)(muzzle_frame->handle_x * ui_scale));
-      muzzle_draw_y = round_float_to_int32(muzzle_anchor_y - (float)(muzzle_frame->handle_y * ui_scale));
+      muzzle_draw_y =
+          round_float_to_int32(muzzle_anchor_y -
+                               (float)((muzzle_frame->handle_y + player_weapon_muzzle_frame_y_offset(muzzle_frame_index)) *
+                                       ui_scale));
       render_object_frame_scaled(framebuffer, muzzle_frame, muzzle_draw_x, muzzle_draw_y, ui_scale);
     }
   }
@@ -11734,6 +11833,30 @@ static int run_pickup_selftest(void) {
       !pickup.active) {
     fprintf(stderr, "Pickup selftest failed: bouncygot consumed pickup past original max 3\n");
     return 1;
+  }
+
+  {
+    static const size_t expected_muzzle_by_weapon[GLOOM_WEAPON_COUNT] = {
+        (size_t)GLOOM_GUN_MUZZLE_FIRST_FRAME, (size_t)GLOOM_GUN_MUZZLE_FIRST_FRAME + 1u,
+        (size_t)GLOOM_GUN_MUZZLE_FIRST_FRAME + 1u, (size_t)GLOOM_GUN_MUZZLE_FIRST_FRAME + 2u,
+        (size_t)GLOOM_GUN_MUZZLE_FIRST_FRAME + 2u};
+
+    for (i = 0u; i < (size_t)GLOOM_WEAPON_COUNT; ++i) {
+      memset(&state, 0, sizeof(state));
+      state.player_weapon = (uint8_t)i;
+      if (player_weapon_muzzle_frame_index(&state) != expected_muzzle_by_weapon[i]) {
+        fprintf(stderr, "Pickup selftest failed: weapon %zu muzzle flash did not match original shot colour\n",
+                i + 1u);
+        return 1;
+      }
+    }
+    state.player_weapon = 0u;
+    state.player_bouncy_bullets = 3u;
+    state.player_mega_timer = 250.0f;
+    if (player_weapon_muzzle_frame_index(&state) != (size_t)GLOOM_GUN_MUZZLE_FIRST_FRAME) {
+      fprintf(stderr, "Pickup selftest failed: powerups changed muzzle colour instead of preserving wtable shot art\n");
+      return 1;
+    }
   }
 
   memset(&pickup, 0, sizeof(pickup));
