@@ -21,6 +21,12 @@ enum {
   DEFAULT_WINDOW_HEIGHT = 720,
   GLOOM_AMIGA_GAME_TICK_HZ = 25,
   FIXED_TICK_HZ = 60,
+  GLOOM_TEXTURE_SCREENS = 8,
+  GLOOM_TEXTURES_PER_SCREEN = 20,
+  GLOOM_TOTAL_WALL_TEXTURES = GLOOM_TEXTURE_SCREENS * GLOOM_TEXTURES_PER_SCREEN,
+  GLOOM_TEXTURE_WIDTH = 64,
+  GLOOM_TEXTURE_HEIGHT = 64,
+  GLOOM_TEXTURE_COLUMN_BYTES = 65,
   GLOOM_MAX_ACTIVE_DOORS = 16,
   GLOOM_MAX_ACTIVE_ROTPOLYS = 32,
   GLOOM_MAX_ROTPOLY_ZONES = 32,
@@ -285,6 +291,7 @@ typedef struct {
 typedef struct {
   uint64_t tick_count;
   GloomMap map;
+  uint8_t wall_texture_remap[GLOOM_TOTAL_WALL_TEXTURES];
   int16_t min_x;
   int16_t max_x;
   int16_t min_z;
@@ -380,11 +387,6 @@ typedef struct {
 } HudFont;
 
 enum {
-  GLOOM_TEXTURE_SCREENS = 8,
-  GLOOM_TEXTURES_PER_SCREEN = 20,
-  GLOOM_TEXTURE_WIDTH = 64,
-  GLOOM_TEXTURE_HEIGHT = 64,
-  GLOOM_TEXTURE_COLUMN_BYTES = 65,
   GLOOM_FLAT_TEXTURE_SIZE = 128,
   GLOOM_MAX_RENDER_ZONES = 2048,
   GLOOM_MAX_WALL_CANDIDATES = 2048,
@@ -605,6 +607,8 @@ static bool audio_start(AudioSystem *audio);
 static void audio_shutdown(AudioSystem *audio);
 static void audio_play_sfx(int sfx_id, int volume, int priority);
 static void audio_vblank_tick(void);
+static void initialize_wall_texture_remap(AppState *state);
+static void update_wall_animations(AppState *state);
 static void update_rotpolys(AppState *state);
 static void update_doors(AppState *state);
 static void check_event_triggers(AppState *state);
@@ -617,6 +621,88 @@ static uint8_t g_depth_subtract_values[GLOOM_AMIGA_MAX_Z];
 
 static uint64_t sim_ticks_to_amiga_ticks(uint64_t ticks) {
   return (ticks * (uint64_t)GLOOM_AMIGA_GAME_TICK_HZ) / (uint64_t)FIXED_TICK_HZ;
+}
+
+static uint32_t elapsed_amiga_ticks_for_sim_tick(uint64_t tick_count) {
+  uint64_t current = 0u;
+  uint64_t previous = 0u;
+
+  if (tick_count == 0u) {
+    return 0u;
+  }
+
+  current = sim_ticks_to_amiga_ticks(tick_count);
+  previous = sim_ticks_to_amiga_ticks(tick_count - 1u);
+  return (uint32_t)(current - previous);
+}
+
+static void initialize_wall_texture_remap(AppState *state) {
+  size_t i = 0u;
+
+  if (state == NULL) {
+    return;
+  }
+
+  for (i = 0u; i < (size_t)GLOOM_TOTAL_WALL_TEXTURES; ++i) {
+    state->wall_texture_remap[i] = (uint8_t)i;
+  }
+}
+
+static uint8_t remap_wall_texture_index(const AppState *state, uint8_t texture_index) {
+  if (state == NULL || texture_index >= (uint8_t)GLOOM_TOTAL_WALL_TEXTURES) {
+    return texture_index;
+  }
+
+  return state->wall_texture_remap[texture_index];
+}
+
+static void advance_wall_animations_amiga_tick(AppState *state) {
+  size_t anim_index = 0u;
+
+  if (state == NULL || state->map.animations == NULL) {
+    return;
+  }
+
+  for (anim_index = 0u; anim_index < state->map.animation_count; ++anim_index) {
+    GloomAnim *anim = &state->map.animations[anim_index];
+    uint16_t first_frame = anim->first_frame;
+    uint16_t frame_count = anim->frame_count;
+    int16_t current = (int16_t)(uint16_t)(anim->current - 1u);
+    uint8_t first_texture = 0u;
+    size_t frame_index = 0u;
+
+    if (frame_count < 2u || first_frame >= (uint16_t)GLOOM_TOTAL_WALL_TEXTURES ||
+        frame_count > (uint16_t)GLOOM_TOTAL_WALL_TEXTURES - first_frame) {
+      continue;
+    }
+
+    anim->current = (uint16_t)current;
+    if (current > 0) {
+      continue;
+    }
+
+    anim->current = anim->delay;
+    first_texture = state->wall_texture_remap[first_frame];
+    for (frame_index = 0u; frame_index + 1u < (size_t)frame_count; ++frame_index) {
+      state->wall_texture_remap[first_frame + frame_index] =
+          state->wall_texture_remap[first_frame + frame_index + 1u];
+    }
+    state->wall_texture_remap[first_frame + (size_t)frame_count - 1u] = first_texture;
+  }
+}
+
+static void update_wall_animations(AppState *state) {
+  uint32_t tick_count = 0u;
+  uint32_t i = 0u;
+
+  if (state == NULL) {
+    return;
+  }
+
+  tick_count = elapsed_amiga_ticks_for_sim_tick(state->tick_count);
+  for (i = 0u; i < tick_count; ++i) {
+    advance_wall_animations_amiga_tick(state);
+  }
 }
 
 static void player_redpal(AppState *state) {
@@ -700,6 +786,7 @@ static bool initialize_camera_from_map_spawn(AppState *state) {
     return false;
   }
 
+  initialize_wall_texture_remap(state);
   state->camera_x = (float)spawn->x;
   state->camera_z = (float)spawn->z;
   state->player_rot_fixed = amiga_rotation_to_fixed(spawn->rotation);
@@ -2108,6 +2195,7 @@ static bool load_map_wall_textures(const GloomMap *map, WallTextureSet *set) {
 static bool validate_map_wall_texture_references(const GloomMap *map, const WallTextureSet *set) {
   bool ok = true;
   size_t zone_index = 0;
+  size_t anim_index = 0u;
 
   if (map == NULL || set == NULL) {
     return false;
@@ -2133,6 +2221,43 @@ static bool validate_map_wall_texture_references(const GloomMap *map, const Wall
       } else if (local_index >= set->screens[screen_index].texture_count) {
         fprintf(stderr, "Zone %zu references texture %u, but screen %zu only has %zu textures\n", zone_index,
                 texture_index, screen_index, set->screens[screen_index].texture_count);
+        ok = false;
+      }
+    }
+  }
+
+  for (anim_index = 0u; anim_index < map->animation_count; ++anim_index) {
+    const GloomAnim *anim = &map->animations[anim_index];
+    uint16_t frame_offset = 0u;
+
+    if (anim->frame_count < 2u) {
+      fprintf(stderr, "Animation %zu has %u frame(s), but amiga/gloom2.s doanims expects at least 2\n",
+              anim_index, (unsigned)anim->frame_count);
+      ok = false;
+      continue;
+    }
+
+    if (anim->first_frame >= (uint16_t)GLOOM_TOTAL_WALL_TEXTURES ||
+        anim->frame_count > (uint16_t)GLOOM_TOTAL_WALL_TEXTURES - anim->first_frame) {
+      fprintf(stderr, "Animation %zu references texture range %u..%u outside the original textures table\n",
+              anim_index, (unsigned)anim->first_frame,
+              (unsigned)(anim->first_frame + anim->frame_count - 1u));
+      ok = false;
+      continue;
+    }
+
+    for (frame_offset = 0u; frame_offset < anim->frame_count; ++frame_offset) {
+      uint16_t texture_index = (uint16_t)(anim->first_frame + frame_offset);
+      size_t screen_index = texture_index / (uint16_t)GLOOM_TEXTURES_PER_SCREEN;
+      size_t local_index = texture_index % (uint16_t)GLOOM_TEXTURES_PER_SCREEN;
+
+      if (screen_index >= GLOOM_TEXTURE_SCREENS || !set->screens[screen_index].loaded) {
+        fprintf(stderr, "Animation %zu references texture %u, but texture screen %zu is not loaded\n", anim_index,
+                (unsigned)texture_index, screen_index);
+        ok = false;
+      } else if (local_index >= set->screens[screen_index].texture_count) {
+        fprintf(stderr, "Animation %zu references texture %u, but screen %zu only has %zu textures\n", anim_index,
+                (unsigned)texture_index, screen_index, set->screens[screen_index].texture_count);
         ok = false;
       }
     }
@@ -2538,32 +2663,6 @@ static bool load_flat_texture_set_for_map(const char *map_path, FlatTextureSet *
   return true;
 }
 
-static uint8_t choose_zone_texture_index(const GloomZone *zone, uint64_t tick_count) {
-  uint8_t sequence[8] = {0};
-  size_t count = 0;
-  size_t i = 0;
-  uint64_t amiga_ticks = sim_ticks_to_amiga_ticks(tick_count);
-
-  if (zone == NULL) {
-    return 0u;
-  }
-
-  for (i = 0; i < sizeof(zone->textures); ++i) {
-    if (zone->textures[i] != 255u) {
-      sequence[count++] = zone->textures[i];
-    }
-  }
-
-  if (count == 0u) {
-    return 0u;
-  }
-  if (count == 1u) {
-    return sequence[0];
-  }
-
-  return sequence[(amiga_ticks / 10u) % count];
-}
-
 static uint32_t sample_wall_texture_argb_ex(const WallTextureSet *set, uint8_t texture_index, float u, float v,
                                             bool *out_transparent_column) {
   size_t screen_index = texture_index / (uint8_t)GLOOM_TEXTURES_PER_SCREEN;
@@ -2611,12 +2710,8 @@ static uint32_t sample_wall_texture_argb_ex(const WallTextureSet *set, uint8_t t
   return set->screens[screen_index].palette[palette_index];
 }
 
-static uint32_t sample_wall_texture_argb(const WallTextureSet *set, uint8_t texture_index, float u, float v) {
-  return sample_wall_texture_argb_ex(set, texture_index, u, v, NULL);
-}
-
-static uint32_t sample_zone_wall_texture_argb(const WallTextureSet *set, const GloomZone *zone, float wall_u,
-                                              float wall_v) {
+static uint32_t sample_zone_wall_texture_argb(const WallTextureSet *set, const AppState *state,
+                                              const GloomZone *zone, float wall_u, float wall_v) {
   float scaled_u = wall_u;
   float local_u = 0.0f;
   int tile_index = 0;
@@ -2650,8 +2745,8 @@ static uint32_t sample_zone_wall_texture_argb(const WallTextureSet *set, const G
   }
 
   tile_index = tile_base & 7;
-  texture_index = zone->textures[tile_index];
-  return sample_wall_texture_argb(set, texture_index, local_u, wall_v);
+  texture_index = remap_wall_texture_index(state, zone->textures[tile_index]);
+  return sample_wall_texture_argb_ex(set, texture_index, local_u, wall_v, NULL);
 }
 
 static const ObjectVisualDefinition *object_visual_definitions(void) {
@@ -5452,6 +5547,7 @@ static void update_with_controls(AppState *state, const PlayerControls *controls
   state->tick_count += 1;
   audio_vblank_tick();
   update_player_power_timers(state);
+  update_wall_animations(state);
   update_rotpolys(state);
   update_doors(state);
   update_runtime_objects(state);
@@ -7110,7 +7206,7 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
           if (local_u < 0.0f) local_u = 0.0f;
           if (local_u > 1.0f) local_u = 1.0f;
           tile_index = tile_base & 7;
-          texture_index = zone->textures[tile_index];
+          texture_index = remap_wall_texture_index(state, zone->textures[tile_index]);
           screen_index = texture_index / (uint8_t)GLOOM_TEXTURES_PER_SCREEN;
           local_index = texture_index % (uint8_t)GLOOM_TEXTURES_PER_SCREEN;
           if (screen_index < (size_t)GLOOM_TEXTURE_SCREENS && wall_textures->screens[screen_index].loaded &&
@@ -7151,7 +7247,7 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
           }
           argb = wall_palette[palette_index];
         } else {
-          argb = sample_zone_wall_texture_argb(wall_textures, hit->wall->zone, hit->wall_u, wall_v);
+          argb = sample_zone_wall_texture_argb(wall_textures, state, hit->wall->zone, hit->wall_u, wall_v);
           argb = shade_argb_subtract(argb, subtract);
         }
         alpha = (uint8_t)(argb >> 24);
@@ -8600,6 +8696,198 @@ static int run_pickup_selftest(void) {
   return 0;
 }
 
+static int run_wall_selftest(void) {
+  AppState state;
+  GloomAnim anim;
+  GloomZone zones[8];
+  GloomTextureChangeCommand texture_change;
+  GloomRotPolyCommand rotpoly_command;
+  WallCandidate candidates[8];
+  size_t candidate_count = 0u;
+  int i = 0;
+
+  memset(&state, 0, sizeof(state));
+  memset(&anim, 0, sizeof(anim));
+  initialize_wall_texture_remap(&state);
+  anim.frame_count = 3u;
+  anim.first_frame = 10u;
+  anim.delay = 2u;
+  anim.current = 1u;
+  state.map.animations = &anim;
+  state.map.animation_count = 1u;
+
+  advance_wall_animations_amiga_tick(&state);
+  if (anim.current != 2u || state.wall_texture_remap[10] != 11u || state.wall_texture_remap[11] != 12u ||
+      state.wall_texture_remap[12] != 10u) {
+    fprintf(stderr, "Wall selftest failed: doanims texture pointer rotation did not match the Amiga table shift\n");
+    return 1;
+  }
+
+  advance_wall_animations_amiga_tick(&state);
+  if (anim.current != 1u || state.wall_texture_remap[10] != 11u) {
+    fprintf(stderr, "Wall selftest failed: doanims countdown rotated before reaching zero\n");
+    return 1;
+  }
+
+  advance_wall_animations_amiga_tick(&state);
+  if (anim.current != 2u || state.wall_texture_remap[10] != 12u || state.wall_texture_remap[11] != 10u ||
+      state.wall_texture_remap[12] != 11u) {
+    fprintf(stderr, "Wall selftest failed: repeated doanims countdown did not keep rotating the global table\n");
+    return 1;
+  }
+
+  memset(&texture_change, 0, sizeof(texture_change));
+  memset(zones, 0, sizeof(zones));
+  state.map.zones = zones;
+  state.map.zone_count = 1u;
+  state.map.texture_change_commands = &texture_change;
+  state.map.texture_change_command_count = 1u;
+  for (i = 0; i < 8; ++i) {
+    zones[0].textures[i] = 4u;
+  }
+  texture_change.event_id = 5u;
+  texture_change.zone_index = 0u;
+  texture_change.texture_index = 10u;
+  execute_map_event(&state, 5u);
+  if (zones[0].textures[0] != 10u || remap_wall_texture_index(&state, zones[0].textures[0]) != 12u) {
+    fprintf(stderr, "Wall selftest failed: exec_changetxt did not store the raw zone texture byte before remap\n");
+    return 1;
+  }
+
+  memset(&state, 0, sizeof(state));
+  memset(zones, 0, sizeof(zones));
+  state.map.zones = zones;
+  state.map.zone_count = 1u;
+  zones[0].x1 = 100;
+  zones[0].z1 = 200;
+  zones[0].x2 = 164;
+  zones[0].z2 = 200;
+  start_runtime_door(&state, 0u);
+  if (!state.doors[0].active || state.doors[0].frac_add != 0x0100) {
+    fprintf(stderr, "Wall selftest failed: exec_opendoor equivalent did not start a door item\n");
+    return 1;
+  }
+  for (i = 0; i < 60; ++i) {
+    update_doors(&state);
+  }
+  {
+    int32_t frac_fixed = round_float_to_int32(state.doors[0].frac);
+    int32_t expected_move = amiga_arithmetic_shift_right_16((int64_t)64 * (int64_t)frac_fixed * 4);
+
+    if (zones[0].event_id != (int16_t)(uint16_t)(frac_fixed * 2) || zones[0].x1 != (int16_t)(100 - expected_move) ||
+        zones[0].x2 != (int16_t)(164 - expected_move) || zones[0].z1 != 200 || zones[0].z2 != 200) {
+      fprintf(stderr, "Wall selftest failed: dodoors geometry/open fraction update is wrong\n");
+      return 1;
+    }
+  }
+
+  memset(&state, 0, sizeof(state));
+  memset(zones, 0, sizeof(zones));
+  memset(&rotpoly_command, 0, sizeof(rotpoly_command));
+  state.map.zones = zones;
+  state.map.zone_count = 8u;
+  zones[0].x1 = 0;
+  zones[0].z1 = 0;
+  zones[0].x2 = 64;
+  zones[0].z2 = 0;
+  zones[1].x1 = 64;
+  zones[1].z1 = 0;
+  zones[1].x2 = 64;
+  zones[1].z2 = 64;
+  zones[2].x1 = 64;
+  zones[2].z1 = 64;
+  zones[2].x2 = 0;
+  zones[2].z2 = 64;
+  zones[3].x1 = 0;
+  zones[3].z1 = 64;
+  zones[3].x2 = 0;
+  zones[3].z2 = 0;
+  zones[4].x1 = 64;
+  zones[4].z1 = 0;
+  zones[5].x1 = 128;
+  zones[5].z1 = 0;
+  zones[6].x1 = 128;
+  zones[6].z1 = 64;
+  zones[7].x1 = 64;
+  zones[7].z1 = 64;
+  rotpoly_command.first_zone_index = 0u;
+  rotpoly_command.zone_count = 4u;
+  rotpoly_command.speed = 4096;
+  rotpoly_command.flags = 1u;
+  start_runtime_rotpoly(&state, &rotpoly_command);
+  update_rotpolys(&state);
+  if (zones[0].x1 <= 0 || zones[0].x2 <= 64 || zones[3].x2 != zones[0].x1 || zones[3].z2 != zones[0].z1) {
+    fprintf(stderr, "Wall selftest failed: dorots morph did not move live zone endpoints as a closed polygon\n");
+    return 1;
+  }
+
+  memset(&state, 0, sizeof(state));
+  memset(zones, 0, sizeof(zones));
+  memset(&rotpoly_command, 0, sizeof(rotpoly_command));
+  memset(candidates, 0, sizeof(candidates));
+  candidate_count = 0u;
+  state.map.zones = zones;
+  state.map.zone_count = 4u;
+  zones[0].x1 = 0;
+  zones[0].z1 = 0;
+  zones[0].x2 = 64;
+  zones[0].z2 = 0;
+  zones[1].x1 = 64;
+  zones[1].z1 = 0;
+  zones[1].x2 = 64;
+  zones[1].z2 = 64;
+  zones[2].x1 = 64;
+  zones[2].z1 = 64;
+  zones[2].x2 = 0;
+  zones[2].z2 = 64;
+  zones[3].x1 = 0;
+  zones[3].z1 = 64;
+  zones[3].x2 = 0;
+  zones[3].z2 = 0;
+  rotpoly_command.first_zone_index = 0u;
+  rotpoly_command.zone_count = 4u;
+  rotpoly_command.speed = 256;
+  rotpoly_command.flags = 0u;
+  start_runtime_rotpoly(&state, &rotpoly_command);
+  append_runtime_rotpoly_wall_candidates(&state, candidates, &candidate_count, 8u, 32.0f, 32.0f);
+  update_rotpolys(&state);
+  if (candidate_count != 4u || (zones[0].x1 == 0 && zones[0].z1 == 0) || zones[3].x2 != zones[0].x1 ||
+      zones[3].z2 != zones[0].z1) {
+    fprintf(stderr, "Wall selftest failed: dorots rotation was not exposed to render/collision candidates\n");
+    return 1;
+  }
+
+  {
+    GloomMap map;
+    WallTextureSet wall_textures;
+    char error[256] = {0};
+
+    memset(&map, 0, sizeof(map));
+    memset(&wall_textures, 0, sizeof(wall_textures));
+    if (!gloom_map_load("amiga/maps/map1_1", &map, error, sizeof(error))) {
+      fprintf(stderr, "Wall selftest failed: could not parse animated source map1_1: %s\n",
+              error[0] ? error : "unknown error");
+      return 1;
+    }
+    if (map.animation_count == 0u) {
+      fprintf(stderr, "Wall selftest failed: map1_1 no longer exposes an animation table fixture\n");
+      gloom_map_free(&map);
+      return 1;
+    }
+    if (!load_map_wall_textures(&map, &wall_textures) || !validate_map_wall_texture_references(&map, &wall_textures)) {
+      fprintf(stderr, "Wall selftest failed: map1_1 animated wall texture references are not renderable\n");
+      free_wall_texture_set(&wall_textures);
+      gloom_map_free(&map);
+      return 1;
+    }
+    free_wall_texture_set(&wall_textures);
+    gloom_map_free(&map);
+  }
+
+  printf("Wall selftest passed\n");
+  return 0;
+}
+
 static int run_teleport_selftest(void) {
   AppState state;
   GloomTeleportCommand command;
@@ -9216,6 +9504,10 @@ int main(int argc, char **argv) {
 
   if (argc > 1 && strcmp(argv[1], "--pickup-selftest") == 0) {
     return run_pickup_selftest();
+  }
+
+  if (argc > 1 && strcmp(argv[1], "--wall-selftest") == 0) {
+    return run_wall_selftest();
   }
 
   if (argc > 1 && strcmp(argv[1], "--teleport-selftest") == 0) {
