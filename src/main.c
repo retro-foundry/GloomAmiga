@@ -57,11 +57,21 @@ enum {
   GLOOM_PROJECTILE_BARREL_FORWARD = (GLOOM_PROJECTILE_RADIUS * 5) / 2,
   GLOOM_PICKUP_RADIUS = 48,
   GLOOM_HUD_FONT_PLANE_COUNT = 7,
-  GLOOM_HUD_WEAPON_EMPTY_CHAR = 50,
-  GLOOM_HUD_WEAPON_FIRST_CHAR = 49,
-  GLOOM_HUD_WEAPON_X = 44,
-  GLOOM_HUD_WEAPON_Y = 12,
+  GLOOM_HUD_WEAPON_FIRST_CHAR = 39,
+  GLOOM_HUD_LIFE_CHAR = 44,
+  GLOOM_HUD_HEALTH_CHAR = 45,
+  GLOOM_HUD_CLEAR_CHAR = 46,
+  GLOOM_HUD_PANEL_CHAR = 47,
+  GLOOM_HUD_STATUS_HEIGHT = 13,
+  GLOOM_HUD_WEAPON_X = 55,
+  GLOOM_HUD_WEAPON_Y = 2,
   GLOOM_HUD_WEAPON_SPACING = 10,
+  GLOOM_HUD_LIVES_X = 218,
+  GLOOM_HUD_LIVES_Y = 2,
+  GLOOM_HUD_LIVES_SPACING = 8,
+  GLOOM_HUD_HEALTH_X = 267,
+  GLOOM_HUD_HEALTH_Y = 3,
+  GLOOM_HUD_HEALTH_SPACING = 2,
   GLOOM_GUN_IDLE_FRAME = 0,
   GLOOM_GUN_RECOIL_FRAME = 1,
   GLOOM_GUN_MUZZLE_FIRST_FRAME = 2,
@@ -73,6 +83,7 @@ enum {
   GLOOM_GUN_RECOIL_BACK_OFFSET = 7,
   GLOOM_GUN_SIDE_BOB = 6,
   GLOOM_GUN_SIDE_LIFT = 4,
+  GLOOM_PLAYER_INITIAL_LIVES = 3,
   GLOOM_AUDIO_CHANNEL_COUNT = 4,
   GLOOM_PAULA_PAL_CLOCK_HZ = 3546895
 };
@@ -283,6 +294,7 @@ typedef struct {
   int32_t player_rotspeed;
   float player_bounce;
   int16_t player_hitpoints;
+  int16_t player_lives;
   bool player_dead;
   uint8_t player_weapon;
   uint8_t player_reload;
@@ -583,6 +595,17 @@ static uint64_t sim_ticks_to_amiga_ticks(uint64_t ticks) {
   return (ticks * (uint64_t)GLOOM_AMIGA_GAME_TICK_HZ) / (uint64_t)FIXED_TICK_HZ;
 }
 
+static void mark_player_dead(AppState *state) {
+  if (state == NULL || state->player_dead) {
+    return;
+  }
+
+  if (state->player_lives > 0) {
+    state->player_lives -= 1;
+  }
+  state->player_dead = true;
+}
+
 static void compute_map_bounds(AppState *state) {
   size_t i = 0;
 
@@ -650,6 +673,7 @@ static bool initialize_camera_from_map_spawn(AppState *state) {
   state->player_rotspeed = 0;
   state->player_bounce = 0;
   state->player_hitpoints = GLOOM_PLAYER_INITIAL_HEALTH;
+  state->player_lives = GLOOM_PLAYER_INITIAL_LIVES;
   state->player_dead = false;
   state->player_weapon = 0u;
   state->player_reload = (uint8_t)GLOOM_PLAYER_INITIAL_RELOAD;
@@ -1444,8 +1468,8 @@ static bool resolve_object_asset_path(const char *name, char *out_path, size_t o
 }
 
 static bool resolve_hud_font_path(char *out_path, size_t out_path_size) {
-  const char *candidates[4] = {"amiga/misc/smallfont.bin", "amiga/prog/misc/smallfont.bin", "misc/smallfont.bin",
-                               "data/misc/smallfont.bin"};
+  const char *candidates[4] = {"amiga/misc/smallfont2.bin", "amiga/prog/misc/smallfont2.bin", "misc/smallfont2.bin",
+                               "data/misc/smallfont2.bin"};
   size_t i = 0u;
 
   if (out_path == NULL || out_path_size == 0u) {
@@ -1631,6 +1655,97 @@ static void free_hud_font(HudFont *font) {
   memset(font, 0, sizeof(*font));
 }
 
+static bool load_hud_panel_shapes(HudFont *font, const char *resolved_path, const uint8_t *data, size_t data_size) {
+  uint32_t first_shape_offset = 0u;
+  uint32_t palette_offset = 0u;
+  size_t shape_count = 0u;
+  HudGlyph *glyphs = NULL;
+  uint32_t palette[256];
+  size_t shape_index = 0u;
+
+  if (font == NULL || resolved_path == NULL || data == NULL || data_size < 16u) {
+    return false;
+  }
+
+  first_shape_offset = main_read_be32(data + 12u);
+  palette_offset = main_read_be32(data + 8u);
+  if (first_shape_offset < 16u || first_shape_offset > palette_offset || palette_offset >= data_size ||
+      ((first_shape_offset - 12u) % 4u) != 0u) {
+    fprintf(stderr, "HUD panel %s has invalid showstats shape table offsets\n", resolved_path);
+    return false;
+  }
+
+  shape_count = (size_t)(first_shape_offset - 12u) / 4u;
+  if (shape_count <= (size_t)GLOOM_HUD_PANEL_CHAR) {
+    fprintf(stderr, "HUD panel %s is missing showstats/predrawall shapes 39-47\n", resolved_path);
+    return false;
+  }
+
+  glyphs = (HudGlyph *)calloc(shape_count, sizeof(*glyphs));
+  if (glyphs == NULL) {
+    return false;
+  }
+
+  set_default_texture_palette(palette);
+  load_packed_palette(palette, data, data_size, (size_t)palette_offset);
+
+  for (shape_index = 0u; shape_index < shape_count; ++shape_index) {
+    uint32_t shape_offset = main_read_be32(data + 12u + shape_index * 4u);
+    uint32_t shape_limit = shape_index + 1u < shape_count ? main_read_be32(data + 12u + (shape_index + 1u) * 4u)
+                                                          : palette_offset;
+    int16_t width = 0;
+    int16_t height = 0;
+    uint32_t *pixels = NULL;
+    int sx = 0;
+
+    if ((size_t)shape_offset + 8u > (size_t)shape_limit || shape_limit > palette_offset || shape_limit > data_size) {
+      fprintf(stderr, "HUD panel %s shape %zu is out of bounds\n", resolved_path, shape_index);
+      goto fail;
+    }
+
+    width = (int16_t)main_read_be16(data + shape_offset + 4u);
+    height = (int16_t)main_read_be16(data + shape_offset + 6u);
+    if (width <= 0 || height <= 0 || (size_t)shape_offset + 8u + (size_t)width * (size_t)height > shape_limit) {
+      fprintf(stderr, "HUD panel %s shape %zu has invalid chunky dimensions\n", resolved_path, shape_index);
+      goto fail;
+    }
+
+    pixels = (uint32_t *)calloc((size_t)width * (size_t)height, sizeof(*pixels));
+    if (pixels == NULL) {
+      goto fail;
+    }
+
+    for (sx = 0; sx < width; ++sx) {
+      int sy = 0;
+
+      for (sy = 0; sy < height; ++sy) {
+        uint8_t palette_index = data[(size_t)shape_offset + 8u + (size_t)sx * (size_t)height + (size_t)sy];
+
+        pixels[(size_t)sy * (size_t)width + (size_t)sx] =
+            palette_index == 0u && shape_index != (size_t)GLOOM_HUD_PANEL_CHAR ? 0x00000000u : palette[palette_index];
+      }
+    }
+
+    glyphs[shape_index].argb_pixels = pixels;
+    glyphs[shape_index].width = width;
+    glyphs[shape_index].height = height;
+  }
+
+  font->loaded = true;
+  font->glyph_count = shape_count;
+  font->glyphs = glyphs;
+  (void)snprintf(font->source_name, sizeof(font->source_name), "%s", resolved_path);
+  printf("Loaded %zu HUD panel shapes from original showstats panel asset\n", shape_count);
+  return true;
+
+fail:
+  for (shape_index = 0u; shape_index < shape_count; ++shape_index) {
+    free(glyphs[shape_index].argb_pixels);
+  }
+  free(glyphs);
+  return false;
+}
+
 static bool load_hud_font(HudFont *font) {
   char resolved_path[1024] = {0};
   uint8_t *data = NULL;
@@ -1675,14 +1790,15 @@ static bool load_hud_font(HudFont *font) {
   first_glyph_offset = main_read_be32(data + 4u);
   if (first_glyph_offset < 8u || first_glyph_offset > palette_offset || palette_offset >= data_size ||
       ((first_glyph_offset - 4u) % 4u) != 0u) {
-    fprintf(stderr, "HUD font %s has invalid shape table offsets\n", resolved_path);
+    bool panel_loaded = load_hud_panel_shapes(font, resolved_path, data, data_size);
+
     free(data);
-    return false;
+    return panel_loaded;
   }
 
   glyph_count = (size_t)(first_glyph_offset - 4u) / 4u;
-  if (glyph_count <= GLOOM_HUD_WEAPON_EMPTY_CHAR) {
-    fprintf(stderr, "HUD font %s is missing weapon status glyphs\n", resolved_path);
+  if (glyph_count <= (size_t)GLOOM_HUD_PANEL_CHAR) {
+    fprintf(stderr, "HUD font %s is missing showstats glyphs\n", resolved_path);
     free(data);
     return false;
   }
@@ -3881,7 +3997,7 @@ static void damage_player_from_object(AppState *state, const RuntimeObjectState 
     state->player_hitpoints = 0;
   }
   if (state->player_hitpoints == 0) {
-    state->player_dead = true;
+    mark_player_dead(state);
   }
 }
 
@@ -4649,7 +4765,7 @@ static bool damage_projectile_player(AppState *state, RuntimeProjectile *project
     state->player_hitpoints = 0;
   }
   if (state->player_hitpoints == 0) {
-    state->player_dead = true;
+    mark_player_dead(state);
   }
   spawn_runtime_sparks(state, projectile->weapon_index, state->camera_x, (float)GLOOM_PLAYER_FIRE_Y, state->camera_z);
   return true;
@@ -5273,7 +5389,7 @@ static void update(AppState *state, const uint8_t *keyboard, const ObjectVisualS
   check_event_triggers(state);
 
   if (state->player_dead || state->player_hitpoints <= 0) {
-    state->player_dead = true;
+    mark_player_dead(state);
     settle_player_bounce(state);
     update_player_camera_y(state);
     return;
@@ -7256,29 +7372,60 @@ static void render_hud_glyph(SDL_Renderer *renderer, const HudGlyph *glyph, int 
 static void render_player_weapon_status(SDL_Renderer *renderer, const AppState *state, const HudFont *hud_font, int x,
                                         int y, int w, int h) {
   int slot = 0;
+  int count = 0;
+  int base_x = x;
   int weapon_char = 0;
-
-  (void)w;
-  (void)h;
+  int status_y = y + h - GLOOM_HUD_STATUS_HEIGHT;
 
   if (renderer == NULL || state == NULL || hud_font == NULL || !hud_font->loaded || hud_font->glyphs == NULL ||
-      hud_font->glyph_count <= GLOOM_HUD_WEAPON_EMPTY_CHAR || state->player_weapon >= GLOOM_WEAPON_COUNT) {
+      state->player_weapon >= GLOOM_WEAPON_COUNT || (size_t)GLOOM_HUD_LIFE_CHAR >= hud_font->glyph_count ||
+      (size_t)GLOOM_HUD_HEALTH_CHAR >= hud_font->glyph_count) {
     return;
   }
 
-  weapon_char = GLOOM_HUD_WEAPON_FIRST_CHAR - (int)state->player_weapon;
+  if (w > BASE_WIDTH) {
+    base_x += (w - BASE_WIDTH) / 2;
+  }
+
+  count = state->player_hitpoints;
+  if (count > GLOOM_PLAYER_INITIAL_HEALTH) {
+    count = GLOOM_PLAYER_INITIAL_HEALTH;
+  }
+  for (slot = 0; slot < count; ++slot) {
+    render_hud_glyph(renderer, &hud_font->glyphs[GLOOM_HUD_HEALTH_CHAR],
+                     base_x + GLOOM_HUD_HEALTH_X + (slot * GLOOM_HUD_HEALTH_SPACING),
+                     status_y + GLOOM_HUD_HEALTH_Y);
+  }
+
+  count = state->player_lives;
+  if (count > 6) {
+    count = 6;
+  }
+  for (slot = 0; slot < count; ++slot) {
+    int draw_x = base_x + GLOOM_HUD_LIVES_X + ((6 - count) * GLOOM_HUD_LIVES_SPACING) +
+                 (slot * GLOOM_HUD_LIVES_SPACING);
+
+    render_hud_glyph(renderer, &hud_font->glyphs[GLOOM_HUD_LIFE_CHAR], draw_x, status_y + GLOOM_HUD_LIVES_Y);
+  }
+
+  weapon_char = GLOOM_HUD_WEAPON_FIRST_CHAR + (int)state->player_weapon;
   if (weapon_char < 0 || (size_t)weapon_char >= hud_font->glyph_count) {
     return;
   }
 
-  for (slot = 1; slot <= GLOOM_WEAPON_COUNT; ++slot) {
-    int glyph_index = slot < (int)state->player_reload ? GLOOM_HUD_WEAPON_EMPTY_CHAR : weapon_char;
-    int draw_x = x + GLOOM_HUD_WEAPON_X + ((slot - 1) * GLOOM_HUD_WEAPON_SPACING);
-    int draw_y = y + GLOOM_HUD_WEAPON_Y;
+  count = 6 - (int)state->player_reload;
+  if (count < 0) {
+    count = 0;
+  }
+  if (count > GLOOM_WEAPON_COUNT) {
+    count = GLOOM_WEAPON_COUNT;
+  }
 
-    if (glyph_index >= 0 && (size_t)glyph_index < hud_font->glyph_count) {
-      render_hud_glyph(renderer, &hud_font->glyphs[glyph_index], draw_x, draw_y);
-    }
+  for (slot = 0; slot < count; ++slot) {
+    int draw_x = base_x + GLOOM_HUD_WEAPON_X + (slot * GLOOM_HUD_WEAPON_SPACING);
+    int draw_y = status_y + GLOOM_HUD_WEAPON_Y;
+
+    render_hud_glyph(renderer, &hud_font->glyphs[weapon_char], draw_x, draw_y);
   }
 }
 
@@ -8127,9 +8274,9 @@ static int run_teleport_selftest(void) {
 static bool load_runtime_level(const char *map_path, AppState *state, WallTextureSet *wall_textures,
                                FlatTextureSet *flat_textures, ObjectVisualSet *object_visuals,
                                GloomZone **previous_zones, GloomZone **render_zones, bool preserve_player,
-                               int16_t preserved_hitpoints, uint8_t preserved_weapon, uint8_t preserved_reload,
-                               bool barrel_projectile_origin, uint8_t violence_mode, char *resolved_map_path,
-                               size_t resolved_map_path_size) {
+                               int16_t preserved_hitpoints, int16_t preserved_lives, uint8_t preserved_weapon,
+                               uint8_t preserved_reload, bool barrel_projectile_origin, uint8_t violence_mode,
+                               char *resolved_map_path, size_t resolved_map_path_size) {
   AppState next_state;
   WallTextureSet next_wall_textures;
   FlatTextureSet next_flat_textures;
@@ -8204,6 +8351,7 @@ static bool load_runtime_level(const char *map_path, AppState *state, WallTextur
 
   if (preserve_player) {
     next_state.player_hitpoints = preserved_hitpoints > 0 ? preserved_hitpoints : GLOOM_PLAYER_INITIAL_HEALTH;
+    next_state.player_lives = preserved_lives > 0 ? preserved_lives : GLOOM_PLAYER_INITIAL_LIVES;
     next_state.player_weapon = preserved_weapon;
     next_state.player_reload = preserved_reload > 0u ? preserved_reload : (uint8_t)GLOOM_PLAYER_INITIAL_RELOAD;
   }
@@ -8631,6 +8779,7 @@ int main(int argc, char **argv) {
     if (level_transition_pending) {
       char next_map_path[1024] = {0};
       int16_t preserved_hitpoints = state.player_hitpoints;
+      int16_t preserved_lives = state.player_lives;
       uint8_t preserved_weapon = state.player_weapon;
       uint8_t preserved_reload = state.player_reload;
 
@@ -8642,9 +8791,9 @@ int main(int argc, char **argv) {
       }
 
       if (!load_runtime_level(next_map_path, &state, &wall_textures, &flat_textures, &object_visuals,
-                              &previous_zones, &render_zones, true, preserved_hitpoints, preserved_weapon,
-                              preserved_reload, barrel_projectile_origin, violence_mode, map_path_buffer,
-                              sizeof(map_path_buffer))) {
+                              &previous_zones, &render_zones, true, preserved_hitpoints, preserved_lives,
+                              preserved_weapon, preserved_reload, barrel_projectile_origin, violence_mode,
+                              map_path_buffer, sizeof(map_path_buffer))) {
         fprintf(stderr, "Cannot complete levelover: failed to load next script map %s\n", next_map_path);
         running = false;
         continue;
