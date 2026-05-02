@@ -357,7 +357,8 @@ typedef struct {
   uint32_t *pixels;
   float *depth_buffer;
   float *sprite_depth_buffer;
-  uint8_t *filled_pixels;
+  uint32_t *filled_stamps;
+  uint32_t filled_stamp;
   int pitch_pixels;
   int width;
   int height;
@@ -423,6 +424,7 @@ typedef struct {
   bool loaded;
   char source_name[64];
   uint32_t palette[256];
+  uint32_t shaded_palette[16][256];
   uint8_t *texels;
   uint8_t *column_flags;
   size_t texture_count;
@@ -437,6 +439,7 @@ typedef struct {
   bool loaded;
   char source_name[64];
   uint32_t palette[256];
+  uint32_t shaded_palette[16][256];
   uint8_t *texels;
 } FlatTexture;
 
@@ -551,6 +554,8 @@ typedef struct {
   float vx2;
   float vz2;
   float sort_depth;
+  int column_min;
+  int column_max;
 } SceneWall;
 
 typedef struct {
@@ -604,6 +609,9 @@ static void check_event_triggers(AppState *state);
 static void update_with_controls(AppState *state, const PlayerControls *controls, const ObjectVisualSet *object_visuals);
 
 static AudioSystem g_audio;
+static bool g_depth_tables_initialized = false;
+static uint8_t g_depth_dark_indices[GLOOM_AMIGA_MAX_Z];
+static uint8_t g_depth_subtract_values[GLOOM_AMIGA_MAX_Z];
 
 static uint64_t sim_ticks_to_amiga_ticks(uint64_t ticks) {
   return (ticks * (uint64_t)GLOOM_AMIGA_GAME_TICK_HZ) / (uint64_t)FIXED_TICK_HZ;
@@ -1654,6 +1662,36 @@ static void load_packed_palette(uint32_t palette[256], const uint8_t *data, size
   }
 }
 
+static uint32_t shade_palette_argb(uint32_t argb, int subtract) {
+  uint8_t alpha = (uint8_t)(argb >> 24);
+  int r = (int)((argb >> 16) & 0xFFu) - subtract;
+  int g = (int)((argb >> 8) & 0xFFu) - subtract;
+  int b = (int)(argb & 0xFFu) - subtract;
+
+  if (r < 0) r = 0;
+  if (g < 0) g = 0;
+  if (b < 0) b = 0;
+
+  return ((uint32_t)alpha << 24u) | ((uint32_t)r << 16u) | ((uint32_t)g << 8u) | (uint32_t)b;
+}
+
+static void build_shaded_palette(uint32_t shaded_palette[16][256], const uint32_t palette[256]) {
+  size_t shade = 0u;
+
+  if (shaded_palette == NULL || palette == NULL) {
+    return;
+  }
+
+  for (shade = 0u; shade < 16u; ++shade) {
+    int subtract = (int)shade * 17;
+    size_t i = 0u;
+
+    for (i = 0u; i < 256u; ++i) {
+      shaded_palette[shade][i] = shade_palette_argb(palette[i], subtract);
+    }
+  }
+}
+
 static void free_hud_font(HudFont *font) {
   size_t i = 0u;
 
@@ -2005,6 +2043,7 @@ static bool load_wall_texture_screen(const char *path, const char *source_name, 
   }
 
   load_packed_palette(out_screen->palette, data, file_size, (size_t)palette_offset);
+  build_shaded_palette(out_screen->shaded_palette, out_screen->palette);
 
   out_screen->loaded = true;
   out_screen->texels = texels;
@@ -2447,6 +2486,7 @@ static bool load_flat_texture(const char *kind, const char *tile_tag, FlatTextur
   memcpy(texels, data, (size_t)FLAT_TEXEL_BYTES);
   set_default_texture_palette(out_texture->palette);
   load_packed_palette(out_texture->palette, data, data_size, (size_t)FLAT_TEXEL_BYTES);
+  build_shaded_palette(out_texture->shaded_palette, out_texture->palette);
 
   out_texture->texels = texels;
   out_texture->loaded = true;
@@ -5542,11 +5582,33 @@ static float amiga_rotation_to_radians(int16_t rotation) {
   return player_rotation_fixed_to_radians(amiga_rotation_to_fixed(rotation));
 }
 
+static void initialize_depth_tables(void) {
+  int z = 0;
+
+  if (g_depth_tables_initialized) {
+    return;
+  }
+
+  for (z = 0; z < GLOOM_AMIGA_MAX_Z; ++z) {
+    int source_z = (GLOOM_AMIGA_MAX_Z - 1) - z;
+    int root = (int)SDL_sqrtf((float)(source_z << 3));
+    int palette_index = (root >> 3) ^ 15;
+
+    if (palette_index < 0) palette_index = 0;
+    if (palette_index > 15) palette_index = 15;
+    g_depth_dark_indices[z] = (uint8_t)palette_index;
+    g_depth_subtract_values[z] = (uint8_t)(palette_index * 17);
+  }
+
+  g_depth_tables_initialized = true;
+}
+
 static uint8_t amiga_depth_dark_index(float depth) {
   int z = floor_to_int(depth);
-  int source_z = 0;
-  int root = 0;
-  int palette_index = 0;
+
+  if (!g_depth_tables_initialized) {
+    initialize_depth_tables();
+  }
 
   if (z < 0) {
     z = 0;
@@ -5555,18 +5617,28 @@ static uint8_t amiga_depth_dark_index(float depth) {
     z = GLOOM_AMIGA_MAX_Z - 1;
   }
 
-  source_z = (GLOOM_AMIGA_MAX_Z - 1) - z;
-  root = (int)SDL_sqrtf((float)(source_z << 3));
-  palette_index = (root >> 3) ^ 15;
-  if (palette_index < 0) palette_index = 0;
-  if (palette_index > 15) palette_index = 15;
-
-  return (uint8_t)palette_index;
+  return g_depth_dark_indices[z];
 }
 
-static uint32_t apply_amiga_depth_argb(uint32_t argb, float depth) {
+static int depth_subtract_for_depth(float depth) {
+  int z = floor_to_int(depth);
+
+  if (!g_depth_tables_initialized) {
+    initialize_depth_tables();
+  }
+
+  if (z < 0) {
+    z = 0;
+  }
+  if (z >= GLOOM_AMIGA_MAX_Z) {
+    z = GLOOM_AMIGA_MAX_Z - 1;
+  }
+
+  return (int)g_depth_subtract_values[z];
+}
+
+static uint32_t shade_argb_subtract(uint32_t argb, int subtract) {
   uint8_t alpha = (uint8_t)(argb >> 24);
-  int subtract = (int)amiga_depth_dark_index(depth) * 17;
   int r = (int)((argb >> 16) & 0xFFu) - subtract;
   int g = (int)((argb >> 8) & 0xFFu) - subtract;
   int b = (int)(argb & 0xFFu) - subtract;
@@ -5576,6 +5648,10 @@ static uint32_t apply_amiga_depth_argb(uint32_t argb, float depth) {
   if (b < 0) b = 0;
 
   return ((uint32_t)alpha << 24u) | ((uint32_t)r << 16u) | ((uint32_t)g << 8u) | (uint32_t)b;
+}
+
+static uint32_t apply_amiga_depth_argb(uint32_t argb, float depth) {
+  return shade_argb_subtract(argb, depth_subtract_for_depth(depth));
 }
 
 static uint32_t amiga_blood_argb(uint16_t color_mask, float depth) {
@@ -6500,14 +6576,14 @@ static void free_render_framebuffer(RenderFramebuffer *framebuffer) {
   }
   free(framebuffer->depth_buffer);
   free(framebuffer->sprite_depth_buffer);
-  free(framebuffer->filled_pixels);
+  free(framebuffer->filled_stamps);
   memset(framebuffer, 0, sizeof(*framebuffer));
 }
 
 static bool ensure_render_framebuffer(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, int width, int height) {
   float *depth_buffer = NULL;
   float *sprite_depth_buffer = NULL;
-  uint8_t *filled_pixels = NULL;
+  uint32_t *filled_stamps = NULL;
   SDL_Texture *texture = NULL;
 
   if (renderer == NULL || framebuffer == NULL || width <= 0 || height <= 0) {
@@ -6520,12 +6596,12 @@ static bool ensure_render_framebuffer(SDL_Renderer *renderer, RenderFramebuffer 
 
   depth_buffer = (float *)malloc((size_t)width * sizeof(*depth_buffer));
   sprite_depth_buffer = (float *)malloc((size_t)width * sizeof(*sprite_depth_buffer));
-  filled_pixels = (uint8_t *)malloc((size_t)height);
-  if (depth_buffer == NULL || sprite_depth_buffer == NULL || filled_pixels == NULL) {
+  filled_stamps = (uint32_t *)calloc((size_t)height, sizeof(*filled_stamps));
+  if (depth_buffer == NULL || sprite_depth_buffer == NULL || filled_stamps == NULL) {
     fprintf(stderr, "Cannot allocate PC renderer scratch buffers %dx%d\n", width, height);
     free(depth_buffer);
     free(sprite_depth_buffer);
-    free(filled_pixels);
+    free(filled_stamps);
     return false;
   }
 
@@ -6534,7 +6610,7 @@ static bool ensure_render_framebuffer(SDL_Renderer *renderer, RenderFramebuffer 
     fprintf(stderr, "Cannot create PC renderer framebuffer texture %dx%d: %s\n", width, height, SDL_GetError());
     free(depth_buffer);
     free(sprite_depth_buffer);
-    free(filled_pixels);
+    free(filled_stamps);
     return false;
   }
   (void)SDL_SetTextureScaleMode(texture, SDL_ScaleModeNearest);
@@ -6544,7 +6620,8 @@ static bool ensure_render_framebuffer(SDL_Renderer *renderer, RenderFramebuffer 
   framebuffer->texture = texture;
   framebuffer->depth_buffer = depth_buffer;
   framebuffer->sprite_depth_buffer = sprite_depth_buffer;
-  framebuffer->filled_pixels = filled_pixels;
+  framebuffer->filled_stamps = filled_stamps;
+  framebuffer->filled_stamp = 0u;
   framebuffer->width = width;
   framebuffer->height = height;
   return true;
@@ -6655,8 +6732,16 @@ static void render_flat_textures(RenderFramebuffer *framebuffer, const AppState 
   for (row = 0; row < h; ++row) {
     float centered_y = (float)(row - (h / 2));
     const FlatTexture *texture = NULL;
+    const uint8_t *texels = NULL;
+    const uint32_t *palette = NULL;
     float plane_distance = 0.0f;
     float depth = 0.0f;
+    float view_x = 0.0f;
+    float view_x_step = 0.0f;
+    float world_x = 0.0f;
+    float world_z = 0.0f;
+    float world_x_step = 0.0f;
+    float world_z_step = 0.0f;
     int col = 0;
 
     if (centered_y > 0.5f) {
@@ -6675,16 +6760,25 @@ static void render_flat_textures(RenderFramebuffer *framebuffer, const AppState 
       continue;
     }
 
+    texels = texture->texels;
+    view_x = ((float)(0 - (w / 2)) * depth) / focal;
+    view_x_step = depth / focal;
+    world_x = state->camera_x + (view_x * view_cos) + (depth * view_sin);
+    world_z = state->camera_z - (view_x * view_sin) + (depth * view_cos);
+    world_x_step = view_x_step * view_cos;
+    world_z_step = -view_x_step * view_sin;
+    palette = texture->shaded_palette[amiga_depth_dark_index(depth)];
+
     for (col = 0; col < w; ++col) {
       size_t dst = (size_t)(y + row) * (size_t)framebuffer->pitch_pixels + (size_t)(x + col);
-      float ray_x = ((float)(col - (w / 2))) / focal;
-      float view_x = ray_x * depth;
-      float world_x = state->camera_x + (view_x * view_cos) + (depth * view_sin);
-      float world_z = state->camera_z - (view_x * view_sin) + (depth * view_cos);
-      uint32_t argb = sample_flat_texture_argb(texture, world_x, world_z);
+      int tx = floor_to_int(world_x) & (GLOOM_FLAT_TEXTURE_SIZE - 1);
+      int tz = floor_to_int(world_z) & (GLOOM_FLAT_TEXTURE_SIZE - 1);
+      uint8_t palette_index = texels[(tx * GLOOM_FLAT_TEXTURE_SIZE) + tz];
+      uint32_t argb = palette[palette_index];
 
-      argb = apply_amiga_depth_argb(argb, depth);
       framebuffer->pixels[dst] = 0xFF000000u | (argb & 0x00FFFFFFu);
+      world_x += world_x_step;
+      world_z += world_z_step;
     }
   }
 }
@@ -6713,7 +6807,7 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
   float far_depth = (float)GLOOM_AMIGA_MAX_Z;
   float *depth_buffer = NULL;
   float *sprite_depth_buffer = NULL;
-  uint8_t *filled_pixels = NULL;
+  uint32_t *filled_stamps = NULL;
   DebugSprite debug_sprites[GLOOM_MAX_DEBUG_SPRITES];
   WallCandidate wall_candidates[GLOOM_MAX_WALL_CANDIDATES];
   SceneWall scene_walls[GLOOM_MAX_WALL_CANDIDATES];
@@ -6733,8 +6827,8 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
 
   depth_buffer = framebuffer != NULL ? framebuffer->depth_buffer : NULL;
   sprite_depth_buffer = framebuffer != NULL ? framebuffer->sprite_depth_buffer : NULL;
-  filled_pixels = framebuffer != NULL ? framebuffer->filled_pixels : NULL;
-  if (depth_buffer == NULL || sprite_depth_buffer == NULL || filled_pixels == NULL) {
+  filled_stamps = framebuffer != NULL ? framebuffer->filled_stamps : NULL;
+  if (depth_buffer == NULL || sprite_depth_buffer == NULL || filled_stamps == NULL) {
     return;
   }
 
@@ -6792,6 +6886,22 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
     scene_wall->vx2 = vx2;
     scene_wall->vz2 = vz2;
     scene_wall->sort_depth = wall_candidates[i].sort_depth;
+    scene_wall->column_min = 0;
+    scene_wall->column_max = w - 1;
+    if (vz1 > near_plane && vz2 > near_plane) {
+      float ratio1 = vx1 / vz1;
+      float ratio2 = vx2 / vz2;
+      float min_ratio = ratio1 < ratio2 ? ratio1 : ratio2;
+      float max_ratio = ratio1 > ratio2 ? ratio1 : ratio2;
+
+      scene_wall->column_min = (int)((float)(w / 2) + (min_ratio * focal)) - 2;
+      scene_wall->column_max = (int)((float)(w / 2) + (max_ratio * focal)) + 2;
+      if (scene_wall->column_min < 0) scene_wall->column_min = 0;
+      if (scene_wall->column_max > w - 1) scene_wall->column_max = w - 1;
+    }
+    if (scene_wall->column_min > scene_wall->column_max) {
+      scene_wall_count -= 1u;
+    }
   }
 
   for (i = 0; i < (size_t)w; ++i) {
@@ -6801,8 +6911,14 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
     size_t hit_count = 0u;
     size_t wall_index = 0;
     size_t hit_index = 0;
+    uint32_t filled_stamp = 0u;
 
-    memset(filled_pixels, 0, (size_t)h);
+    framebuffer->filled_stamp += 1u;
+    if (framebuffer->filled_stamp == 0u) {
+      memset(filled_stamps, 0, (size_t)h * sizeof(*filled_stamps));
+      framebuffer->filled_stamp = 1u;
+    }
+    filled_stamp = framebuffer->filled_stamp;
 
     for (wall_index = 0; wall_index < scene_wall_count; ++wall_index) {
       const SceneWall *wall = &scene_walls[wall_index];
@@ -6811,6 +6927,10 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
       float denom = ray_x * sz - sx;
       float depth = 0.0f;
       float wall_u = 0.0f;
+
+      if ((int)i < wall->column_min || (int)i > wall->column_max) {
+        continue;
+      }
 
       if (SDL_fabsf(denom) < 0.0001f) {
         continue;
@@ -6868,6 +6988,13 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
       int y0 = (int)wall_top;
       int y1 = (int)wall_bottom;
       int draw_y = 0;
+      int subtract = 0;
+      int dark_index = 0;
+      bool fast_wall_column = false;
+      bool transparent_wall_column = false;
+      const uint8_t *wall_texels = NULL;
+      const uint32_t *wall_palette = NULL;
+      size_t wall_texel_base = 0u;
 
       if (wall_height < 1.0f) {
         float center_y = (wall_top + wall_bottom) * 0.5f;
@@ -6884,26 +7011,95 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
         continue;
       }
 
+      dark_index = (int)amiga_depth_dark_index(hit->depth);
+      subtract = dark_index * 17;
+      {
+        const GloomZone *zone = hit->wall->zone;
+        float scaled_u = hit->wall_u;
+        float local_u = 0.0f;
+        int tile_base = 0;
+        int tile_index = 0;
+        uint8_t texture_index = 0u;
+        size_t screen_index = 0u;
+        size_t local_index = 0u;
+        size_t tx = 0u;
+
+        if (zone != NULL) {
+          if (zone->scale > 0) {
+            scaled_u = hit->wall_u * (float)zone->scale;
+          } else if (zone->scale < 0) {
+            int shift = -zone->scale;
+            float divisor = 1.0f;
+
+            if (shift > 1) {
+              divisor = (float)(1u << (uint32_t)(shift - 1));
+            }
+            scaled_u = hit->wall_u / divisor;
+          }
+
+          tile_base = (int)scaled_u;
+          local_u = scaled_u - (float)tile_base;
+          if (local_u < 0.0f) {
+            local_u += 1.0f;
+            tile_base -= 1;
+          }
+
+          if (local_u < 0.0f) local_u = 0.0f;
+          if (local_u > 1.0f) local_u = 1.0f;
+          tile_index = tile_base & 7;
+          texture_index = zone->textures[tile_index];
+          screen_index = texture_index / (uint8_t)GLOOM_TEXTURES_PER_SCREEN;
+          local_index = texture_index % (uint8_t)GLOOM_TEXTURES_PER_SCREEN;
+          if (screen_index < (size_t)GLOOM_TEXTURE_SCREENS && wall_textures->screens[screen_index].loaded &&
+              wall_textures->screens[screen_index].texels != NULL &&
+              local_index < wall_textures->screens[screen_index].texture_count) {
+            const WallTextureScreen *screen = &wall_textures->screens[screen_index];
+
+            tx = (size_t)(local_u * (float)(GLOOM_TEXTURE_WIDTH - 1));
+            wall_texels = screen->texels;
+            wall_palette = screen->shaded_palette[dark_index];
+            wall_texel_base = local_index * ((size_t)GLOOM_TEXTURE_WIDTH * (size_t)GLOOM_TEXTURE_HEIGHT) + tx;
+            transparent_wall_column =
+                screen->column_flags != NULL &&
+                screen->column_flags[(local_index * (size_t)GLOOM_TEXTURE_WIDTH) + tx] != 0u;
+            fast_wall_column = true;
+          }
+        }
+      }
       for (draw_y = y0; draw_y <= y1; ++draw_y) {
         float wall_v = ((float)draw_y + 0.5f - wall_top) / wall_height;
         uint32_t argb = 0u;
         uint8_t alpha = 0u;
 
-        if (filled_pixels[draw_y - y] != 0u) {
+        if (filled_stamps[draw_y - y] == filled_stamp) {
           continue;
         }
 
-        argb = sample_zone_wall_texture_argb(wall_textures, hit->wall->zone, hit->wall_u, wall_v);
+        if (fast_wall_column) {
+          size_t ty = 0u;
+          uint8_t palette_index = 0u;
+
+          if (wall_v < 0.0f) wall_v = 0.0f;
+          if (wall_v > 1.0f) wall_v = 1.0f;
+          ty = (size_t)(wall_v * (float)(GLOOM_TEXTURE_HEIGHT - 1));
+          palette_index = wall_texels[wall_texel_base + (ty * (size_t)GLOOM_TEXTURE_WIDTH)];
+          if (transparent_wall_column && palette_index == 0u) {
+            continue;
+          }
+          argb = wall_palette[palette_index];
+        } else {
+          argb = sample_zone_wall_texture_argb(wall_textures, hit->wall->zone, hit->wall_u, wall_v);
+          argb = shade_argb_subtract(argb, subtract);
+        }
         alpha = (uint8_t)(argb >> 24);
 
         if (alpha == 0u) {
           continue;
         }
 
-        argb = apply_amiga_depth_argb(argb, hit->depth);
         framebuffer->pixels[(size_t)draw_y * (size_t)framebuffer->pitch_pixels + (size_t)screen_x] =
             0xFF000000u | (argb & 0x00FFFFFFu);
-        filled_pixels[draw_y - y] = 1u;
+        filled_stamps[draw_y - y] = filled_stamp;
 
         if (hit->depth < depth_buffer[i]) {
           depth_buffer[i] = hit->depth;
@@ -7275,6 +7471,7 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
     int y0 = 0;
     int y1 = 0;
     int screen_x = 0;
+    int subtract = 0;
 
     if (frame == NULL || sp->screen_w < 1.0f || sp->screen_h < 1.0f) {
       continue;
@@ -7294,6 +7491,7 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
     if (y0 < y) y0 = y;
     if (y1 > y + h - 1) y1 = y + h - 1;
 
+    subtract = depth_subtract_for_depth(sp->depth);
     for (screen_x = x0; screen_x <= x1; ++screen_x) {
       int rel_x = screen_x - x;
       int draw_y = 0;
@@ -7325,7 +7523,7 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
           continue;
         }
 
-        argb = apply_amiga_depth_argb(argb, sp->depth);
+        argb = shade_argb_subtract(argb, subtract);
         framebuffer->pixels[(size_t)draw_y * (size_t)framebuffer->pitch_pixels + (size_t)screen_x] =
             0xFF000000u | (argb & 0x00FFFFFFu);
         column_drawn = true;
