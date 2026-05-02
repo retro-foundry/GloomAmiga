@@ -22,7 +22,8 @@ enum {
   GLOOM_MAX_ACTIVE_DOORS = 16,
   GLOOM_MAX_ACTIVE_ROTPOLYS = 32,
   GLOOM_MAX_ROTPOLY_ZONES = 32,
-  GLOOM_TELEPORT_DELAY_TICKS = 12,
+  GLOOM_LEVEL_EXIT_EVENT_ID = 24,
+  GLOOM_LEVEL_COMPLETE_FINISHED = 3,
   GLOOM_AMIGA_FOCAL_SHIFT = 6,
   GLOOM_AMIGA_FOCAL = 1 << GLOOM_AMIGA_FOCAL_SHIFT,
   GLOOM_AMIGA_VIEW_COLUMNS = 106,
@@ -300,10 +301,16 @@ typedef struct {
   bool teleport_active;
   uint8_t violence_mode;
   uint16_t gore_write_index;
-  uint8_t teleport_ticks;
+  int16_t player_pixsize;
+  int16_t player_pixsizeadd;
+  float player_pixsize_accum;
   int16_t teleport_x;
   int16_t teleport_z;
   int16_t teleport_rotation;
+  int16_t finished;
+  int16_t finished2;
+  bool level_transition_reported;
+  bool lock_teleport_reported;
   RuntimeDoor doors[GLOOM_MAX_ACTIVE_DOORS];
   RuntimeRotPoly rotpolys[GLOOM_MAX_ACTIVE_ROTPOLYS];
   RuntimeProjectile projectiles[GLOOM_MAX_RUNTIME_PROJECTILES];
@@ -576,19 +583,6 @@ static uint64_t sim_ticks_to_amiga_ticks(uint64_t ticks) {
   return (ticks * (uint64_t)GLOOM_AMIGA_GAME_TICK_HZ) / (uint64_t)FIXED_TICK_HZ;
 }
 
-static uint8_t amiga_ticks_to_sim_ticks(uint8_t ticks) {
-  uint32_t scaled = ((uint32_t)ticks * (uint32_t)FIXED_TICK_HZ + ((uint32_t)GLOOM_AMIGA_GAME_TICK_HZ / 2u)) /
-                    (uint32_t)GLOOM_AMIGA_GAME_TICK_HZ;
-
-  if (scaled > 255u) {
-    scaled = 255u;
-  }
-  if (scaled == 0u && ticks != 0u) {
-    scaled = 1u;
-  }
-  return (uint8_t)scaled;
-}
-
 static void compute_map_bounds(AppState *state) {
   size_t i = 0;
 
@@ -667,6 +661,14 @@ static bool initialize_camera_from_map_spawn(AppState *state) {
   state->player_thermo_timer = 0.0f;
   state->player_hyper_timer = 0.0f;
   state->player_last_fire = false;
+  state->teleport_active = false;
+  state->player_pixsize = 0;
+  state->player_pixsizeadd = 0;
+  state->player_pixsize_accum = 0.0f;
+  state->finished = 0;
+  state->finished2 = 0;
+  state->level_transition_reported = false;
+  state->lock_teleport_reported = false;
   state->rng_state = 0x47524F4Fu ^ ((uint32_t)(uint16_t)spawn->x << 16u) ^ (uint32_t)(uint16_t)spawn->z;
   state->violence_mode = GLOOM_VIOLENCE_MEATY_MESSY;
   state->camera_angle = player_rotation_fixed_to_radians(state->player_rot_fixed);
@@ -2133,6 +2135,108 @@ static bool resolve_script_tile_tag_for_map(const char *map_path, char *out_tag,
   }
 
   fprintf(stderr, "No script tile tag found for map %s\n", map_name);
+  free(script);
+  return false;
+}
+
+static bool load_game_script_blob(uint8_t **out_script, size_t *out_script_size) {
+  const char *script_candidates[2] = {"amiga/misc/script", "amiga/data/misc/script"};
+  size_t candidate_index = 0u;
+  char error[256] = {0};
+
+  if (out_script == NULL || out_script_size == NULL) {
+    return false;
+  }
+
+  *out_script = NULL;
+  *out_script_size = 0u;
+
+  for (candidate_index = 0u; candidate_index < sizeof(script_candidates) / sizeof(script_candidates[0]); ++candidate_index) {
+    char resolved_path[1024] = {0};
+    uint8_t *script = NULL;
+    size_t script_size = 0u;
+
+    if (!resolve_runtime_file_path(script_candidates[candidate_index], resolved_path, sizeof(resolved_path))) {
+      continue;
+    }
+    if (!read_binary_blob(resolved_path, &script, &script_size)) {
+      continue;
+    }
+    if (!gloom_decrunch_crm_buffer(&script, &script_size, error, sizeof(error))) {
+      fprintf(stderr, "Failed to decrunch script %s: %s\n", resolved_path, error[0] ? error : "unknown error");
+      free(script);
+      return false;
+    }
+
+    *out_script = script;
+    *out_script_size = script_size;
+    return true;
+  }
+
+  fprintf(stderr, "Unable to load game script for scriptplay level progression\n");
+  return false;
+}
+
+static bool resolve_next_script_play_map(const char *current_map_path, char *out_map_path, size_t out_map_path_size) {
+  char current_map_name[64] = {0};
+  uint8_t *script = NULL;
+  size_t script_size = 0u;
+  size_t pos = 0u;
+  bool found_current = false;
+
+  if (!map_leaf_name(current_map_path, current_map_name, sizeof(current_map_name)) || out_map_path == NULL ||
+      out_map_path_size == 0u) {
+    return false;
+  }
+
+  if (!load_game_script_blob(&script, &script_size)) {
+    return false;
+  }
+
+  while (pos < script_size) {
+    size_t line_start = pos;
+    size_t line_len = 0u;
+    const char *line = NULL;
+
+    while (pos < script_size && script[pos] != '\n') {
+      pos += 1u;
+    }
+
+    line = (const char *)script + line_start;
+    line_len = pos - line_start;
+    if (pos < script_size && script[pos] == '\n') {
+      pos += 1u;
+    }
+
+    while (line_len > 0u && (*line == ' ' || *line == '\t')) {
+      line += 1;
+      line_len -= 1u;
+    }
+    while (line_len > 0u && (line[line_len - 1u] == '\r' || line[line_len - 1u] == ' ' || line[line_len - 1u] == '\t')) {
+      line_len -= 1u;
+    }
+
+    if (line_len > 5u && memcmp(line, "play_", 5u) == 0) {
+      const char *map_name = line + 5u;
+      size_t map_len = line_len - 5u;
+
+      if (found_current) {
+        if (map_len + strlen("amiga/maps/") >= out_map_path_size) {
+          free(script);
+          return false;
+        }
+        (void)snprintf(out_map_path, out_map_path_size, "amiga/maps/%.*s", (int)map_len, map_name);
+        free(script);
+        return true;
+      }
+
+      found_current = map_len == strlen(current_map_name) && memcmp(map_name, current_map_name, map_len) == 0;
+    } else if (found_current && line_len >= 5u && memcmp(line, "done_", 5u) == 0) {
+      break;
+    }
+  }
+
+  fprintf(stderr, "No following play_ command found in misc/script after play_%s\n", current_map_name);
   free(script);
   return false;
 }
@@ -4865,6 +4969,52 @@ static void update_chunks(AppState *state) {
   }
 }
 
+static bool update_player_pixsize_transition(AppState *state) {
+  float previous_pixsize = 0.0f;
+  bool reached_midpoint = false;
+
+  if (state == NULL || state->player_pixsizeadd == 0) {
+    return false;
+  }
+
+  previous_pixsize = state->player_pixsize_accum;
+  state->player_pixsize_accum += (float)state->player_pixsizeadd * fixed_step_amiga_scale();
+
+  if (state->player_pixsizeadd < 0 && previous_pixsize > 0.0f && state->player_pixsize_accum <= 0.0f) {
+    state->player_pixsize_accum = 0.0f;
+    state->player_pixsize = 0;
+    state->player_pixsizeadd = 0;
+    state->teleport_active = false;
+    return false;
+  }
+
+  if (state->player_pixsizeadd > 0 && previous_pixsize < 24.0f && state->player_pixsize_accum >= 24.0f) {
+    state->player_pixsize_accum = 24.0f;
+    reached_midpoint = true;
+  }
+
+  state->player_pixsize = (int16_t)round_float_to_int32(state->player_pixsize_accum);
+
+  if (reached_midpoint) {
+    state->finished = state->finished2;
+    if (state->finished != 0) {
+      if (state->finished == GLOOM_LEVEL_COMPLETE_FINISHED) {
+        state->level_transition_reported = true;
+      }
+      return true;
+    }
+
+    state->camera_x = (float)state->teleport_x;
+    state->camera_z = (float)state->teleport_z;
+    state->player_rot_fixed = amiga_rotation_to_fixed(state->teleport_rotation);
+    state->player_rotspeed = 0;
+    state->camera_angle = player_rotation_fixed_to_radians(state->player_rot_fixed);
+    state->player_pixsizeadd = (int16_t)-state->player_pixsizeadd;
+  }
+
+  return true;
+}
+
 static void update_player_weapon(AppState *state, const PlayerControls *controls) {
   float step_scale = fixed_step_amiga_scale();
   bool fire_pressed = false;
@@ -5104,21 +5254,9 @@ static void update(AppState *state, const uint8_t *keyboard, const ObjectVisualS
   update_blood(state);
   update_chunks(state);
 
-  if (state->teleport_active) {
-    if (state->teleport_ticks > 0u) {
-      state->teleport_ticks -= 1u;
-    }
-    if (state->teleport_ticks == 0u) {
-      state->camera_x = (float)state->teleport_x;
-      state->camera_z = (float)state->teleport_z;
-      state->player_rot_fixed = amiga_rotation_to_fixed(state->teleport_rotation);
-      state->player_rotspeed = 0;
-      state->camera_angle = player_rotation_fixed_to_radians(state->player_rot_fixed);
-      state->teleport_active = false;
-    } else {
-      update_player_camera_y(state);
-      return;
-    }
+  if (update_player_pixsize_transition(state)) {
+    update_player_camera_y(state);
+    return;
   }
 
   {
@@ -5785,16 +5923,47 @@ static void start_runtime_door(AppState *state, uint16_t zone_index) {
 }
 
 static void start_pending_teleport(AppState *state, const GloomTeleportCommand *command) {
-  if (state == NULL || command == NULL || command->control_word != 0) {
+  if (state == NULL || command == NULL) {
+    return;
+  }
+
+  state->teleport_x = command->x;
+  state->teleport_z = command->z;
+  state->teleport_rotation = command->rotation;
+
+  if (state->finished != 0 || state->finished2 != 0) {
+    return;
+  }
+
+  if (command->control_word != 0) {
+    if (!state->lock_teleport_reported) {
+      fprintf(stderr,
+              "Cannot execute lock teleport command for event %u: amiga/gloom2.s exec_teleport locklogic is not "
+              "ported yet\n",
+              (unsigned)command->event_id);
+      state->lock_teleport_reported = true;
+    }
     return;
   }
 
   state->teleport_active = true;
-  state->teleport_ticks = amiga_ticks_to_sim_ticks((uint8_t)GLOOM_TELEPORT_DELAY_TICKS);
-  state->teleport_x = command->x;
-  state->teleport_z = command->z;
-  state->teleport_rotation = command->rotation;
-  audio_play_sfx(GLOOM_SFX_TELEPORT, 64, 0);
+  state->player_pixsize = 0;
+  state->player_pixsize_accum = 0.0f;
+  state->player_pixsizeadd = 2;
+  audio_play_sfx(GLOOM_SFX_TELEPORT, 64, 10);
+}
+
+static void start_level_exit_transition(AppState *state) {
+  if (state == NULL || state->player_pixsizeadd != 0 || state->finished2 != 0) {
+    return;
+  }
+
+  state->finished2 = GLOOM_LEVEL_COMPLETE_FINISHED;
+  state->teleport_active = true;
+  state->player_pixsize = 0;
+  state->player_pixsize_accum = 0.0f;
+  state->player_pixsizeadd = 1;
+  audio_play_sfx(GLOOM_SFX_TELEPORT, 64, 10);
 }
 
 static void start_runtime_rotpoly(AppState *state, const GloomRotPolyCommand *command) {
@@ -5881,6 +6050,10 @@ static void execute_map_event(AppState *state, uint8_t event_id) {
 
   if (state == NULL || event_id == 0u || event_id > (uint8_t)GLOOM_EVENT_COUNT) {
     return;
+  }
+
+  if (event_id == (uint8_t)GLOOM_LEVEL_EXIT_EVENT_ID) {
+    start_level_exit_transition(state);
   }
 
   if (event_id < 19u && state->triggered_events[event_id]) {
@@ -7163,17 +7336,106 @@ static void draw_bar(SDL_Renderer *renderer, int x, int y, int width, int height
   SDL_RenderDrawRect(renderer, &bg);
 }
 
-static void render(SDL_Renderer *renderer, const AppState *state, const GridOffsetSet *grid_offsets,
-                   const WallTextureSet *wall_textures, const FlatTextureSet *flat_textures,
-                   const ObjectVisualSet *object_visuals, const WeaponVisualSet *weapon_visuals,
-                   const HudFont *hud_font, int render_width, int render_height) {
-  SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
-  SDL_RenderClear(renderer);
-
+static void render_scene_contents(SDL_Renderer *renderer, const AppState *state, const GridOffsetSet *grid_offsets,
+                                  const WallTextureSet *wall_textures, const FlatTextureSet *flat_textures,
+                                  const ObjectVisualSet *object_visuals, const WeaponVisualSet *weapon_visuals,
+                                  const HudFont *hud_font, int render_width, int render_height) {
   render_wall_debug(renderer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals, 0, 0,
                     render_width, render_height);
   render_player_weapon(renderer, state, weapon_visuals, 0, 0, render_width, render_height);
   render_player_weapon_status(renderer, state, hud_font, 0, 0, render_width, render_height);
+}
+
+static bool render_pixelate_texture(SDL_Renderer *renderer, SDL_Texture *texture, int render_width, int render_height,
+                                    int pixsize) {
+  int block = pixsize;
+  int y = 0;
+
+  if (renderer == NULL || texture == NULL || render_width <= 0 || render_height <= 0) {
+    return false;
+  }
+
+  if (block < 1) {
+    block = 1;
+  }
+
+  if (block <= 1) {
+    SDL_Rect dst = {0, 0, render_width, render_height};
+    return SDL_RenderCopy(renderer, texture, NULL, &dst) == 0;
+  }
+
+  for (y = 0; y < render_height; y += block) {
+    int x = 0;
+    int h = block;
+
+    if (y + h > render_height) {
+      h = render_height - y;
+    }
+
+    for (x = 0; x < render_width; x += block) {
+      int w = block;
+      SDL_Rect src;
+      SDL_Rect dst;
+
+      if (x + w > render_width) {
+        w = render_width - x;
+      }
+
+      src.x = x + (w / 2);
+      src.y = y + (h / 2);
+      src.w = 1;
+      src.h = 1;
+      dst.x = x;
+      dst.y = y;
+      dst.w = w;
+      dst.h = h;
+
+      if (SDL_RenderCopy(renderer, texture, &src, &dst) != 0) {
+        return false;
+      }
+    }
+  }
+
+  return true;
+}
+
+static void render(SDL_Renderer *renderer, const AppState *state, const GridOffsetSet *grid_offsets,
+                   const WallTextureSet *wall_textures, const FlatTextureSet *flat_textures,
+                   const ObjectVisualSet *object_visuals, const WeaponVisualSet *weapon_visuals,
+                   const HudFont *hud_font, int render_width, int render_height) {
+  int pixsize = state != NULL ? state->player_pixsize : 0;
+
+  SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+  SDL_RenderClear(renderer);
+
+  if (pixsize > 1) {
+    SDL_Texture *pixel_texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET,
+                                                   render_width, render_height);
+
+    if (pixel_texture == NULL) {
+      fprintf(stderr, "Cannot render pixelate transition: SDL target texture creation failed: %s\n", SDL_GetError());
+    } else {
+      (void)SDL_SetTextureScaleMode(pixel_texture, SDL_ScaleModeNearest);
+      if (SDL_SetRenderTarget(renderer, pixel_texture) != 0) {
+        fprintf(stderr, "Cannot render pixelate transition: SDL_SetRenderTarget failed: %s\n", SDL_GetError());
+      } else {
+        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+        SDL_RenderClear(renderer);
+        render_scene_contents(renderer, state, grid_offsets, wall_textures, flat_textures, object_visuals,
+                              weapon_visuals, hud_font, render_width, render_height);
+        (void)SDL_SetRenderTarget(renderer, NULL);
+        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+        SDL_RenderClear(renderer);
+        if (!render_pixelate_texture(renderer, pixel_texture, render_width, render_height, pixsize)) {
+          fprintf(stderr, "Cannot render pixelate transition: SDL_RenderCopy failed: %s\n", SDL_GetError());
+        }
+      }
+      SDL_DestroyTexture(pixel_texture);
+    }
+  } else {
+    render_scene_contents(renderer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals,
+                          hud_font, render_width, render_height);
+  }
 
   SDL_RenderPresent(renderer);
 }
@@ -7784,6 +8046,213 @@ static int run_pickup_selftest(void) {
   return 0;
 }
 
+static int run_teleport_selftest(void) {
+  AppState state;
+  GloomTeleportCommand command;
+  char next_map_path[1024] = {0};
+  int i = 0;
+
+  memset(&state, 0, sizeof(state));
+  memset(&command, 0, sizeof(command));
+
+  state.camera_x = 10.0f;
+  state.camera_z = 20.0f;
+  state.player_rot_fixed = amiga_rotation_to_fixed(1);
+  command.event_id = 7u;
+  command.x = 1234;
+  command.z = 2345;
+  command.rotation = 64;
+
+  start_pending_teleport(&state, &command);
+  if (!state.teleport_active || state.player_pixsizeadd != 2 || state.player_pixsize != 0 || state.finished != 0) {
+    fprintf(stderr, "Teleport selftest failed: exec_teleport did not start ob_pixsizeadd=2 teleport pixel-out\n");
+    return 1;
+  }
+
+  for (i = 0; i < 28; ++i) {
+    (void)update_player_pixsize_transition(&state);
+  }
+  if (state.camera_x != 10.0f || state.camera_z != 20.0f || state.player_pixsizeadd != 2) {
+    fprintf(stderr, "Teleport selftest failed: player moved before ob_pixsize reached 24\n");
+    return 1;
+  }
+
+  (void)update_player_pixsize_transition(&state);
+  if (state.camera_x != 1234.0f || state.camera_z != 2345.0f ||
+      state.player_rot_fixed != amiga_rotation_to_fixed(64) || state.player_pixsizeadd != -2) {
+    fprintf(stderr, "Teleport selftest failed: playertimers did not move/rotate player and reverse pixel size at 24\n");
+    return 1;
+  }
+
+  for (i = 0; i < 29; ++i) {
+    (void)update_player_pixsize_transition(&state);
+  }
+  if (state.teleport_active || state.player_pixsizeadd != 0 || state.player_pixsize != 0) {
+    fprintf(stderr, "Teleport selftest failed: teleport pixel-in did not clear at ob_pixsize zero\n");
+    return 1;
+  }
+
+  memset(&state, 0, sizeof(state));
+  command.control_word = 1;
+  start_pending_teleport(&state, &command);
+  if (state.teleport_active || state.player_pixsizeadd != 0) {
+    fprintf(stderr, "Teleport selftest failed: lock teleport started without ported locklogic\n");
+    return 1;
+  }
+
+  memset(&state, 0, sizeof(state));
+  start_level_exit_transition(&state);
+  if (!state.teleport_active || state.finished2 != GLOOM_LEVEL_COMPLETE_FINISHED || state.player_pixsizeadd != 1) {
+    fprintf(stderr, "Teleport selftest failed: event 24 did not start finished2=3 pixel-out\n");
+    return 1;
+  }
+  for (i = 0; i < 58; ++i) {
+    (void)update_player_pixsize_transition(&state);
+  }
+  if (state.finished != GLOOM_LEVEL_COMPLETE_FINISHED || !state.level_transition_reported) {
+    fprintf(stderr, "Teleport selftest failed: playertimers did not promote finished2=3 to finished=3\n");
+    return 1;
+  }
+
+  if (!resolve_next_script_play_map("amiga/maps/map1_1", next_map_path, sizeof(next_map_path)) ||
+      strcmp(next_map_path, "amiga/maps/map1_2") != 0) {
+    fprintf(stderr, "Teleport selftest failed: levelover/scriptplay did not resolve map1_1 to script play_map1_2\n");
+    return 1;
+  }
+
+  printf("Teleport selftest passed\n");
+  return 0;
+}
+
+static bool load_runtime_level(const char *map_path, AppState *state, WallTextureSet *wall_textures,
+                               FlatTextureSet *flat_textures, ObjectVisualSet *object_visuals,
+                               GloomZone **previous_zones, GloomZone **render_zones, bool preserve_player,
+                               int16_t preserved_hitpoints, uint8_t preserved_weapon, uint8_t preserved_reload,
+                               bool barrel_projectile_origin, uint8_t violence_mode, char *resolved_map_path,
+                               size_t resolved_map_path_size) {
+  AppState next_state;
+  WallTextureSet next_wall_textures;
+  FlatTextureSet next_flat_textures;
+  ObjectVisualSet next_object_visuals;
+  GloomZone *next_previous_zones = NULL;
+  GloomZone *next_render_zones = NULL;
+  char map_path_buffer[1024] = {0};
+  const char *resolved = map_path;
+  char error[256] = {0};
+
+  if (map_path == NULL || state == NULL || wall_textures == NULL || flat_textures == NULL || object_visuals == NULL ||
+      previous_zones == NULL || render_zones == NULL) {
+    return false;
+  }
+
+  memset(&next_state, 0, sizeof(next_state));
+  memset(&next_wall_textures, 0, sizeof(next_wall_textures));
+  memset(&next_flat_textures, 0, sizeof(next_flat_textures));
+  memset(&next_object_visuals, 0, sizeof(next_object_visuals));
+
+  if (resolve_runtime_file_path(map_path, map_path_buffer, sizeof(map_path_buffer))) {
+    resolved = map_path_buffer;
+  }
+
+  next_state.barrel_projectile_origin = barrel_projectile_origin;
+  if (!gloom_map_load(resolved, &next_state.map, error, sizeof(error))) {
+    fprintf(stderr, "Map parse failed for %s: %s\n", resolved, error[0] ? error : "unknown error");
+    return false;
+  }
+
+  if (!load_map_wall_textures(&next_state.map, &next_wall_textures)) {
+    fprintf(stderr, "No map texture screens decoded from map texture names for %s\n", resolved);
+    gloom_map_free(&next_state.map);
+    return false;
+  }
+
+  if (!validate_map_wall_texture_references(&next_state.map, &next_wall_textures)) {
+    free_wall_texture_set(&next_wall_textures);
+    gloom_map_free(&next_state.map);
+    return false;
+  }
+
+  if (!load_flat_texture_set_for_map(resolved, &next_flat_textures)) {
+    free_wall_texture_set(&next_wall_textures);
+    gloom_map_free(&next_state.map);
+    return false;
+  }
+
+  if (!load_player_collision_radius(&next_state.player_radius)) {
+    free_flat_texture_set(&next_flat_textures);
+    free_wall_texture_set(&next_wall_textures);
+    gloom_map_free(&next_state.map);
+    return false;
+  }
+
+  if (!load_object_visual_set_for_map(&next_state.map, &next_object_visuals)) {
+    free_flat_texture_set(&next_flat_textures);
+    free_wall_texture_set(&next_wall_textures);
+    gloom_map_free(&next_state.map);
+    return false;
+  }
+
+  compute_map_bounds(&next_state);
+  if (!initialize_camera_from_map_spawn(&next_state)) {
+    fprintf(stderr, "No player spawn found in map event data for %s\n", resolved);
+    free_object_visual_set(&next_object_visuals);
+    free_flat_texture_set(&next_flat_textures);
+    free_wall_texture_set(&next_wall_textures);
+    gloom_map_free(&next_state.map);
+    return false;
+  }
+
+  if (preserve_player) {
+    next_state.player_hitpoints = preserved_hitpoints > 0 ? preserved_hitpoints : GLOOM_PLAYER_INITIAL_HEALTH;
+    next_state.player_weapon = preserved_weapon;
+    next_state.player_reload = preserved_reload > 0u ? preserved_reload : (uint8_t)GLOOM_PLAYER_INITIAL_RELOAD;
+  }
+  next_state.violence_mode = violence_mode;
+  initialize_runtime_objects(&next_state);
+
+  if (next_state.map.zone_count > 0u) {
+    next_previous_zones = (GloomZone *)malloc(next_state.map.zone_count * sizeof(*next_previous_zones));
+    next_render_zones = (GloomZone *)malloc(next_state.map.zone_count * sizeof(*next_render_zones));
+    if (next_previous_zones == NULL || next_render_zones == NULL) {
+      fprintf(stderr, "Out of memory while preparing render interpolation zone buffers for %s\n", resolved);
+      free(next_previous_zones);
+      free(next_render_zones);
+      free_object_visual_set(&next_object_visuals);
+      free_flat_texture_set(&next_flat_textures);
+      free_wall_texture_set(&next_wall_textures);
+      gloom_map_free(&next_state.map);
+      return false;
+    }
+    memcpy(next_previous_zones, next_state.map.zones, next_state.map.zone_count * sizeof(*next_previous_zones));
+    memcpy(next_render_zones, next_state.map.zones, next_state.map.zone_count * sizeof(*next_render_zones));
+  }
+
+  free(*previous_zones);
+  free(*render_zones);
+  free_object_visual_set(object_visuals);
+  free_flat_texture_set(flat_textures);
+  free_wall_texture_set(wall_textures);
+  gloom_map_free(&state->map);
+
+  *state = next_state;
+  *wall_textures = next_wall_textures;
+  *flat_textures = next_flat_textures;
+  *object_visuals = next_object_visuals;
+  *previous_zones = next_previous_zones;
+  *render_zones = next_render_zones;
+
+  if (resolved_map_path != NULL && resolved_map_path_size > 0u) {
+    (void)snprintf(resolved_map_path, resolved_map_path_size, "%s", resolved);
+  }
+
+  printf("Loaded %s\n", resolved);
+  printf("zones=%zu animations=%zu grid_bytes=%zu ppnt_bytes=%zu event_commands=%u object_spawns=%zu\n",
+         state->map.zone_count, state->map.animation_count, state->map.grid_blob_size, state->map.ppnt_blob_size,
+         total_event_commands(&state->map), state->map.object_spawn_count);
+  printf("Camera spawn: x=%.0f z=%.0f angle=%.3f\n", state->camera_x, state->camera_z, state->camera_angle);
+  return true;
+}
+
 int main(int argc, char **argv) {
   const char *map_path = "amiga/maps/map1_1";
   const char *resolved_map_path = map_path;
@@ -7811,6 +8280,7 @@ int main(int argc, char **argv) {
   bool classic_viewport = false;
   bool barrel_projectile_origin = true;
   uint8_t violence_mode = GLOOM_VIOLENCE_MEATY_MESSY;
+  bool level_transition_pending = false;
   AppState state;
   AppState previous_state;
 
@@ -7860,6 +8330,10 @@ int main(int argc, char **argv) {
 
   if (argc > 1 && strcmp(argv[1], "--pickup-selftest") == 0) {
     return run_pickup_selftest();
+  }
+
+  if (argc > 1 && strcmp(argv[1], "--teleport-selftest") == 0) {
+    return run_teleport_selftest();
   }
 
   if (argc > 1) {
@@ -8054,9 +8528,9 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+  renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_TARGETTEXTURE);
   if (renderer == NULL) {
-    renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+    renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE | SDL_RENDERER_TARGETTEXTURE);
   }
   if (renderer == NULL) {
     fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
@@ -8127,6 +8601,10 @@ int main(int argc, char **argv) {
         previous_state.map.zones = previous_zones;
       }
       update(&state, keyboard, &object_visuals);
+      if (state.finished == GLOOM_LEVEL_COMPLETE_FINISHED) {
+        level_transition_pending = true;
+        break;
+      }
       accumulator -= dt;
     }
 
@@ -8149,6 +8627,36 @@ int main(int argc, char **argv) {
     render_state = interpolate_render_state(&previous_state, &state, render_alpha, render_zones, state.map.zone_count);
     render(renderer, &render_state, &grid_offsets, &wall_textures, &flat_textures, &object_visuals, &weapon_visuals,
            &hud_font, render_width, render_height);
+
+    if (level_transition_pending) {
+      char next_map_path[1024] = {0};
+      int16_t preserved_hitpoints = state.player_hitpoints;
+      uint8_t preserved_weapon = state.player_weapon;
+      uint8_t preserved_reload = state.player_reload;
+
+      level_transition_pending = false;
+      if (!resolve_next_script_play_map(resolved_map_path, next_map_path, sizeof(next_map_path))) {
+        fprintf(stderr, "Cannot complete levelover: misc/script has no next play_ map after %s\n", resolved_map_path);
+        running = false;
+        continue;
+      }
+
+      if (!load_runtime_level(next_map_path, &state, &wall_textures, &flat_textures, &object_visuals,
+                              &previous_zones, &render_zones, true, preserved_hitpoints, preserved_weapon,
+                              preserved_reload, barrel_projectile_origin, violence_mode, map_path_buffer,
+                              sizeof(map_path_buffer))) {
+        fprintf(stderr, "Cannot complete levelover: failed to load next script map %s\n", next_map_path);
+        running = false;
+        continue;
+      }
+
+      resolved_map_path = map_path_buffer;
+      previous_state = state;
+      if (previous_zones != NULL) {
+        previous_state.map.zones = previous_zones;
+      }
+      accumulator = 0.0;
+    }
   }
 
   free(previous_zones);
