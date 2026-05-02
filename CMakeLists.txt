@@ -32,6 +32,7 @@ add_executable(gloom_pc
 
 set_target_properties(gloom_pc PROPERTIES
   VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_DIR:gloom_pc>"
+  VS_DPI_AWARE OFF
 )
 
 add_custom_command(TARGET gloom_pc POST_BUILD

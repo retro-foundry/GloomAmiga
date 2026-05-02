@@ -17,6 +17,8 @@ enum {
   BASE_WIDTH = 320,
   BASE_HEIGHT = 224,
   WIDESCREEN_WIDTH = 400,
+  DEFAULT_WINDOW_WIDTH = 1280,
+  DEFAULT_WINDOW_HEIGHT = 720,
   GLOOM_AMIGA_GAME_TICK_HZ = 25,
   FIXED_TICK_HZ = 60,
   GLOOM_MAX_ACTIVE_DOORS = 16,
@@ -7716,44 +7718,6 @@ static void render(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const
   SDL_RenderPresent(renderer);
 }
 
-static void update_render_dimensions(SDL_Renderer *renderer, bool classic_viewport, int render_scale, int *render_width,
-                                     int *render_height) {
-  int target_width = BASE_WIDTH;
-  int target_height = BASE_HEIGHT;
-
-  if (renderer == NULL || render_width == NULL || render_height == NULL) {
-    return;
-  }
-
-  if (render_scale < 1) {
-    render_scale = 1;
-  }
-  target_height = BASE_HEIGHT * render_scale;
-  target_width = BASE_WIDTH * render_scale;
-
-  if (!classic_viewport) {
-    int output_width = 0;
-    int output_height = 0;
-
-    if (SDL_GetRendererOutputSize(renderer, &output_width, &output_height) == 0 && output_width > 0 &&
-        output_height > 0) {
-      int64_t scaled_width = ((int64_t)output_width * (int64_t)target_height) + (output_height / 2);
-      target_width = (int)(scaled_width / output_height);
-      if (target_width < 1) {
-        target_width = 1;
-      }
-    } else {
-      target_width = WIDESCREEN_WIDTH * render_scale;
-    }
-  }
-
-  if (*render_width != target_width || *render_height != target_height) {
-    *render_width = target_width;
-    *render_height = target_height;
-    (void)SDL_RenderSetLogicalSize(renderer, target_width, target_height);
-  }
-}
-
 static int16_t interpolate_int16(int16_t previous, int16_t current, float alpha) {
   return clamp_int16(round_float_to_int32((float)previous + (((float)current - (float)previous) * alpha)));
 }
@@ -8858,10 +8822,13 @@ int main(int argc, char **argv) {
   const double dt = 1.0 / (double)FIXED_TICK_HZ;
   bool running = true;
   int mouse_dx_accum = 0;
-  int render_width = WIDESCREEN_WIDTH;
-  int render_height = BASE_HEIGHT;
+  int render_width = DEFAULT_WINDOW_WIDTH;
+  int render_height = DEFAULT_WINDOW_HEIGHT;
   int render_scale = 1;
+  int window_width = DEFAULT_WINDOW_WIDTH;
+  int window_height = DEFAULT_WINDOW_HEIGHT;
   bool classic_viewport = false;
+  bool explicit_resolution = false;
   bool barrel_projectile_origin = true;
   uint8_t violence_mode = GLOOM_VIOLENCE_MEATY_MESSY;
   bool level_transition_pending = false;
@@ -8931,10 +8898,8 @@ int main(int argc, char **argv) {
     for (argi = 1; argi < argc; ++argi) {
       if (strcmp(argv[argi], "--classic") == 0) {
         classic_viewport = true;
-        render_width = BASE_WIDTH;
       } else if (strcmp(argv[argi], "--widescreen") == 0) {
         classic_viewport = false;
-        render_width = WIDESCREEN_WIDTH;
       } else if (strcmp(argv[argi], "--render-scale") == 0) {
         char *end = NULL;
         long parsed = 0;
@@ -8949,8 +8914,31 @@ int main(int argc, char **argv) {
           return 1;
         }
         render_scale = (int)parsed;
-        render_width = (classic_viewport ? BASE_WIDTH : WIDESCREEN_WIDTH) * render_scale;
-        render_height = BASE_HEIGHT * render_scale;
+      } else if (strcmp(argv[argi], "--window-size") == 0 || strcmp(argv[argi], "--resolution") == 0 ||
+                 strcmp(argv[argi], "--boot-resolution") == 0) {
+        char *end = NULL;
+        long parsed_width = 0;
+        long parsed_height = 0;
+
+        if (argi + 1 >= argc) {
+          fprintf(stderr, "%s requires WIDTHxHEIGHT, for example 1280x720\n", argv[argi]);
+          return 1;
+        }
+        parsed_width = strtol(argv[++argi], &end, 10);
+        if ((*end != 'x' && *end != 'X') || parsed_width < 320 || parsed_width > 7680) {
+          fprintf(stderr, "%s requires WIDTHxHEIGHT, width 320..7680\n", argv[argi - 1]);
+          return 1;
+        }
+        parsed_height = strtol(end + 1, &end, 10);
+        if (*end != '\0' || parsed_height < 200 || parsed_height > 4320) {
+          fprintf(stderr, "%s requires WIDTHxHEIGHT, height 200..4320\n", argv[argi - 1]);
+          return 1;
+        }
+        window_width = (int)parsed_width;
+        window_height = (int)parsed_height;
+        render_width = window_width;
+        render_height = window_height;
+        explicit_resolution = true;
       } else if (strcmp(argv[argi], "--barrel-projectiles") == 0) {
         barrel_projectile_origin = true;
       } else if (strcmp(argv[argi], "--player-projectiles") == 0 ||
@@ -8968,8 +8956,18 @@ int main(int argc, char **argv) {
     }
   }
 
-  render_width = (classic_viewport ? BASE_WIDTH : WIDESCREEN_WIDTH) * render_scale;
-  render_height = BASE_HEIGHT * render_scale;
+  if (!explicit_resolution && classic_viewport) {
+    render_width = BASE_WIDTH;
+    render_height = BASE_HEIGHT;
+    window_width = render_width;
+    window_height = render_height;
+  }
+  render_width *= render_scale;
+  render_height *= render_scale;
+  if (!explicit_resolution || render_scale > 1) {
+    window_width = render_width;
+    window_height = render_height;
+  }
 
   if (resolve_runtime_file_path(map_path, map_path_buffer, sizeof(map_path_buffer))) {
     resolved_map_path = map_path_buffer;
@@ -9131,8 +9129,8 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  window = SDL_CreateWindow("Gloom PC Port", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, render_width * 4,
-                            render_height * 4, SDL_WINDOW_RESIZABLE);
+  window = SDL_CreateWindow("Gloom PC Port", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, window_width,
+                            window_height, SDL_WINDOW_RESIZABLE);
   if (window == NULL) {
     fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
     audio_shutdown(&g_audio);
@@ -9172,7 +9170,6 @@ int main(int argc, char **argv) {
 
   (void)SDL_RenderSetIntegerScale(renderer, classic_viewport ? SDL_TRUE : SDL_FALSE);
   (void)SDL_RenderSetLogicalSize(renderer, render_width, render_height);
-  update_render_dimensions(renderer, classic_viewport, render_scale, &render_width, &render_height);
   if (!ensure_render_framebuffer(renderer, &framebuffer, render_width, render_height)) {
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
@@ -9259,11 +9256,6 @@ int main(int argc, char **argv) {
       title_timer = 0.0;
     }
 
-    update_render_dimensions(renderer, classic_viewport, render_scale, &render_width, &render_height);
-    if (!ensure_render_framebuffer(renderer, &framebuffer, render_width, render_height)) {
-      running = false;
-      continue;
-    }
     render_alpha = (float)(accumulator / dt);
     render_state = interpolate_render_state(&previous_state, &state, render_alpha, render_zones, state.map.zone_count);
     render(renderer, &framebuffer, &render_state, &grid_offsets, &wall_textures, &flat_textures, &object_visuals,
