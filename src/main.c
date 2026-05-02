@@ -51,6 +51,11 @@ enum {
   GLOOM_PLAYER_BOB_HEIGHT = 20,
   GLOOM_PLAYER_INITIAL_HEALTH = 25,
   GLOOM_PLAYER_RED_PAL_TIMER = 2,
+  GLOOM_PLAYER_DEATH_ROT_STEP = 4,
+  GLOOM_PLAYER_DEATH_EYE_STEP = 4,
+  GLOOM_PLAYER_DEATH_EYE_CLAMP = -32,
+  GLOOM_PLAYER_DEAD_DELAY = 63,
+  GLOOM_PLAYER_RESTART_INVINCIBLE_TICKS = 75,
   GLOOM_PLAYER_MEGA_OVERKILL = 875,
   GLOOM_MOUSE_LOOK_FIXED_PER_PIXEL = 0x2000,
   GLOOM_WEAPON_COUNT = 5,
@@ -95,6 +100,15 @@ enum {
   GLOOM_PLAYER_INITIAL_LIVES = 3,
   GLOOM_AUDIO_CHANNEL_COUNT = 4,
   GLOOM_PAULA_PAL_CLOCK_HZ = 3546895
+};
+
+enum {
+  GLOOM_PLAYER_DEATH_NONE = 0,
+  GLOOM_PLAYER_DEATH_FALLING,
+  GLOOM_PLAYER_DEATH_DEAD_DELAY,
+  GLOOM_PLAYER_DEATH_WAIT_RESTART,
+  GLOOM_PLAYER_DEATH_INVINCIBLE,
+  GLOOM_PLAYER_DEATH_GAME_OVER
 };
 
 enum {
@@ -303,9 +317,12 @@ typedef struct {
   int32_t player_rot_fixed;
   int32_t player_rotspeed;
   float player_bounce;
+  float player_eye_y;
   int16_t player_hitpoints;
   int16_t player_lives;
   bool player_dead;
+  uint8_t player_death_phase;
+  float player_death_timer;
   uint8_t player_weapon;
   uint8_t player_reload;
   uint8_t player_bouncy_bullets;
@@ -327,6 +344,9 @@ typedef struct {
   int16_t player_pixsize;
   int16_t player_pixsizeadd;
   float player_pixsize_accum;
+  int16_t player_respawn_x;
+  int16_t player_respawn_z;
+  int16_t player_respawn_rotation;
   int16_t teleport_x;
   int16_t teleport_z;
   int16_t teleport_rotation;
@@ -581,6 +601,9 @@ static float amiga_rotation_to_radians(int16_t rotation);
 static float player_rotation_fixed_to_radians(int32_t rotation_fixed);
 static void apply_mouse_look(AppState *state, int mouse_dx);
 static void update_player_camera_y(AppState *state);
+static bool player_can_take_damage(const AppState *state);
+static void start_player_death(AppState *state);
+static void update_player_death(AppState *state, const PlayerControls *controls);
 static void spawn_runtime_gore(AppState *state, const RuntimeChunk *chunk);
 static bool resolve_runtime_file_path(const char *input_path, char *out_path, size_t out_path_size);
 static bool find_wall_collision_radius(const AppState *state, float x, float z, int16_t radius,
@@ -713,18 +736,6 @@ static void player_redpal(AppState *state) {
   state->player_palette_timer = (float)GLOOM_PLAYER_RED_PAL_TIMER;
 }
 
-static void mark_player_dead(AppState *state) {
-  if (state == NULL || state->player_dead) {
-    return;
-  }
-
-  if (state->player_lives > 0) {
-    state->player_lives -= 1;
-  }
-  state->player_dead = true;
-  player_redpal(state);
-}
-
 static void compute_map_bounds(AppState *state) {
   size_t i = 0;
 
@@ -789,12 +800,18 @@ static bool initialize_camera_from_map_spawn(AppState *state) {
   initialize_wall_texture_remap(state);
   state->camera_x = (float)spawn->x;
   state->camera_z = (float)spawn->z;
+  state->player_respawn_x = spawn->x;
+  state->player_respawn_z = spawn->z;
+  state->player_respawn_rotation = spawn->rotation;
   state->player_rot_fixed = amiga_rotation_to_fixed(spawn->rotation);
   state->player_rotspeed = 0;
   state->player_bounce = 0;
+  state->player_eye_y = (float)GLOOM_PLAYER_EYE_Y;
   state->player_hitpoints = GLOOM_PLAYER_INITIAL_HEALTH;
   state->player_lives = GLOOM_PLAYER_INITIAL_LIVES;
   state->player_dead = false;
+  state->player_death_phase = GLOOM_PLAYER_DEATH_NONE;
+  state->player_death_timer = 0.0f;
   state->player_weapon = 0u;
   state->player_reload = (uint8_t)GLOOM_PLAYER_INITIAL_RELOAD;
   state->player_bouncy_bullets = 0u;
@@ -3638,7 +3655,169 @@ static void update_player_camera_y(AppState *state) {
 
   phase = (uint16_t)state->player_bounce & 255u;
   bob = SDL_sinf(((float)phase * 6.28318530718f) / 256.0f) * (float)GLOOM_PLAYER_BOB_HEIGHT;
-  state->camera_y = (float)GLOOM_PLAYER_EYE_Y + bob;
+  state->camera_y = state->player_eye_y + bob;
+}
+
+static bool player_can_take_damage(const AppState *state) {
+  return state != NULL && state->player_death_phase == GLOOM_PLAYER_DEATH_NONE && !state->player_dead &&
+         state->player_hitpoints > 0;
+}
+
+static bool player_death_blocks_controls(const AppState *state) {
+  if (state == NULL) {
+    return false;
+  }
+
+  return state->player_death_phase == GLOOM_PLAYER_DEATH_FALLING ||
+         state->player_death_phase == GLOOM_PLAYER_DEATH_DEAD_DELAY ||
+         state->player_death_phase == GLOOM_PLAYER_DEATH_WAIT_RESTART ||
+         state->player_death_phase == GLOOM_PLAYER_DEATH_GAME_OVER;
+}
+
+static void start_player_death(AppState *state) {
+  if (state == NULL || state->player_death_phase != GLOOM_PLAYER_DEATH_NONE) {
+    return;
+  }
+
+  /* amiga/gloom2.s: playerdie -> redpal, clears ob_hitpoints, switches to playerdeath. */
+  player_redpal(state);
+  state->player_hitpoints = 0;
+  state->player_dead = true;
+  state->player_death_phase = GLOOM_PLAYER_DEATH_FALLING;
+  state->player_death_timer = 0.0f;
+  state->player_rotspeed = 0;
+}
+
+static void damage_player_squash(AppState *state) {
+  if (!player_can_take_damage(state)) {
+    return;
+  }
+
+  /* amiga/gloom2.s: playerlogic unresolved adjustpos path subtracts 1 HP, then playerdie at zero. */
+  state->player_hitpoints -= 1;
+  if (state->player_hitpoints <= 0) {
+    start_player_death(state);
+  } else {
+    player_redpal(state);
+  }
+}
+
+static void restart_player_after_death(AppState *state) {
+  uint8_t saved_weapon = 0u;
+
+  if (state == NULL) {
+    return;
+  }
+
+  /* amiga/gloom2.s: waitrestart preserves ob_weapon while restoring player object defaults. */
+  saved_weapon = state->player_weapon;
+  state->camera_x = (float)state->player_respawn_x;
+  state->camera_z = (float)state->player_respawn_z;
+  state->player_rot_fixed = amiga_rotation_to_fixed(state->player_respawn_rotation);
+  state->camera_angle = player_rotation_fixed_to_radians(state->player_rot_fixed);
+  state->player_rotspeed = 0;
+  state->player_bounce = 0.0f;
+  state->player_eye_y = (float)GLOOM_PLAYER_EYE_Y;
+  state->player_hitpoints = GLOOM_PLAYER_INITIAL_HEALTH;
+  state->player_dead = false;
+  state->player_death_phase = GLOOM_PLAYER_DEATH_INVINCIBLE;
+  state->player_death_timer = (float)GLOOM_PLAYER_RESTART_INVINCIBLE_TICKS;
+  state->player_weapon = saved_weapon;
+  state->player_reload = (uint8_t)GLOOM_PLAYER_INITIAL_RELOAD;
+  state->player_bouncy_bullets = 0u;
+  state->player_reload_counter = 0.0f;
+  state->player_weapon_flash = 0.0f;
+  state->player_mega_timer = 0.0f;
+  state->player_invisible_timer = 0.0f;
+  state->player_thermo_timer = 0.0f;
+  state->player_hyper_timer = 0.0f;
+  state->player_pixsize = 0;
+  state->player_pixsizeadd = 0;
+  state->player_pixsize_accum = 0.0f;
+  state->player_last_fire = true;
+  update_player_camera_y(state);
+}
+
+static void advance_player_death_amiga_tick(AppState *state) {
+  if (state == NULL) {
+    return;
+  }
+
+  switch (state->player_death_phase) {
+    case GLOOM_PLAYER_DEATH_FALLING:
+      /* amiga/gloom2.s: playerdeath adds 4 to ob_rot and ob_eyey until ob_eyey reaches -32. */
+      state->player_rot_fixed =
+          wrap_player_rotation_fixed((int64_t)state->player_rot_fixed +
+                                     ((int64_t)GLOOM_PLAYER_DEATH_ROT_STEP << 16));
+      state->camera_angle = player_rotation_fixed_to_radians(state->player_rot_fixed);
+      state->player_eye_y += (float)GLOOM_PLAYER_DEATH_EYE_STEP;
+      if (state->player_eye_y >= (float)GLOOM_PLAYER_DEATH_EYE_CLAMP) {
+        state->player_eye_y = (float)GLOOM_PLAYER_DEATH_EYE_CLAMP;
+        state->player_death_phase = GLOOM_PLAYER_DEATH_DEAD_DELAY;
+        state->player_death_timer = (float)GLOOM_PLAYER_DEAD_DELAY;
+        if (state->player_lives > 0) {
+          state->player_lives -= 1;
+        }
+      }
+      break;
+
+    case GLOOM_PLAYER_DEATH_DEAD_DELAY:
+      state->player_death_timer -= 1.0f;
+      if (state->player_death_timer <= 0.0f) {
+        if (state->player_lives == 0) {
+          state->player_death_phase = GLOOM_PLAYER_DEATH_GAME_OVER;
+          state->finished = 2;
+        } else {
+          state->player_death_phase = GLOOM_PLAYER_DEATH_WAIT_RESTART;
+        }
+        state->player_death_timer = 0.0f;
+      }
+      break;
+
+    case GLOOM_PLAYER_DEATH_INVINCIBLE:
+      state->player_death_timer -= 1.0f;
+      if (state->player_death_timer <= 0.0f) {
+        state->player_death_phase = GLOOM_PLAYER_DEATH_NONE;
+        state->player_death_timer = 0.0f;
+      }
+      break;
+
+    default:
+      break;
+  }
+}
+
+static void update_player_death(AppState *state, const PlayerControls *controls) {
+  uint32_t tick_count = 0u;
+  uint32_t i = 0u;
+  bool fire_pressed = false;
+
+  if (state == NULL || state->player_death_phase == GLOOM_PLAYER_DEATH_NONE) {
+    return;
+  }
+
+  tick_count = elapsed_amiga_ticks_for_sim_tick(state->tick_count);
+  for (i = 0u; i < tick_count; ++i) {
+    advance_player_death_amiga_tick(state);
+  }
+
+  if (state->player_death_phase != GLOOM_PLAYER_DEATH_WAIT_RESTART) {
+    update_player_camera_y(state);
+    return;
+  }
+
+  fire_pressed = controls != NULL && controls->fire;
+  if (!fire_pressed) {
+    state->player_last_fire = false;
+    update_player_camera_y(state);
+    return;
+  }
+  if (state->player_last_fire) {
+    update_player_camera_y(state);
+    return;
+  }
+
+  restart_player_after_death(state);
 }
 
 static void update_player_movement(AppState *state, const PlayerControls *controls) {
@@ -3839,8 +4018,7 @@ static void runtime_spawn_soul(AppState *state, const RuntimeObjectState *object
 
 static void runtime_start_deathsuck(AppState *state, RuntimeObjectState *object, const ObjectCombatDefinition *combat,
                                     uint16_t object_index) {
-  if (state == NULL || object == NULL || combat == NULL || state->death_suck_active || state->player_dead ||
-      state->player_hitpoints <= 0) {
+  if (state == NULL || object == NULL || combat == NULL || state->death_suck_active || !player_can_take_damage(state)) {
     return;
   }
 
@@ -4167,7 +4345,7 @@ static bool runtime_object_collides_player(const AppState *state, const RuntimeO
 }
 
 static void damage_player_from_object(AppState *state, const RuntimeObjectState *object) {
-  if (state == NULL || object == NULL || object->damage <= 0 || state->player_dead || state->player_hitpoints <= 0) {
+  if (state == NULL || object == NULL || object->damage <= 0 || !player_can_take_damage(state)) {
     return;
   }
 
@@ -4177,7 +4355,7 @@ static void damage_player_from_object(AppState *state, const RuntimeObjectState 
   }
   player_redpal(state);
   if (state->player_hitpoints == 0) {
-    mark_player_dead(state);
+    start_player_death(state);
   }
 }
 
@@ -4719,7 +4897,7 @@ static void update_runtime_objects(AppState *state) {
     }
   }
 
-  if (state->player_dead || state->player_hitpoints <= 0) {
+  if (player_death_blocks_controls(state) || state->player_hitpoints <= 0) {
     return;
   }
 
@@ -4930,7 +5108,7 @@ static bool damage_projectile_enemy(AppState *state, const ObjectVisualSet *obje
 static bool damage_projectile_player(AppState *state, RuntimeProjectile *projectile, float prev_x, float prev_z) {
   float hit_radius = 0.0f;
 
-  if (state == NULL || projectile == NULL || state->player_dead || state->player_hitpoints <= 0) {
+  if (state == NULL || projectile == NULL || !player_can_take_damage(state)) {
     return false;
   }
 
@@ -4946,7 +5124,7 @@ static bool damage_projectile_player(AppState *state, RuntimeProjectile *project
   }
   player_redpal(state);
   if (state->player_hitpoints == 0) {
-    mark_player_dead(state);
+    start_player_death(state);
   }
   spawn_runtime_sparks(state, projectile->weapon_index, state->camera_x, (float)GLOOM_PLAYER_FIRE_Y, state->camera_z);
   return true;
@@ -5498,7 +5676,7 @@ static void update_pickups(AppState *state) {
   size_t i = 0u;
   size_t count = 0u;
 
-  if (state == NULL || state->player_dead || state->player_hitpoints <= 0) {
+  if (state == NULL || player_death_blocks_controls(state) || state->player_hitpoints <= 0) {
     return;
   }
 
@@ -5546,7 +5724,9 @@ static void update_pickups(AppState *state) {
 static void update_with_controls(AppState *state, const PlayerControls *controls, const ObjectVisualSet *object_visuals) {
   state->tick_count += 1;
   audio_vblank_tick();
-  update_player_power_timers(state);
+  if (!player_death_blocks_controls(state)) {
+    update_player_power_timers(state);
+  }
   update_wall_animations(state);
   update_rotpolys(state);
   update_doors(state);
@@ -5561,11 +5741,23 @@ static void update_with_controls(AppState *state, const PlayerControls *controls
     return;
   }
 
+  if (state->player_death_phase != GLOOM_PLAYER_DEATH_NONE) {
+    if (state->player_dead) {
+      settle_player_bounce(state, false);
+    }
+    update_player_death(state, controls);
+    if (player_death_blocks_controls(state)) {
+      return;
+    }
+  }
+
   {
     float corrected_x = state->camera_x;
     float corrected_z = state->camera_z;
 
     if (!resolve_player_wall_collision(state, &corrected_x, &corrected_z)) {
+      damage_player_squash(state);
+      update_player_camera_y(state);
       return;
     }
     state->camera_x = corrected_x;
@@ -5574,10 +5766,10 @@ static void update_with_controls(AppState *state, const PlayerControls *controls
 
   check_event_triggers(state);
 
-  if (state->player_dead || state->player_hitpoints <= 0) {
-    mark_player_dead(state);
+  if (state->player_hitpoints <= 0) {
+    start_player_death(state);
     settle_player_bounce(state, false);
-    update_player_camera_y(state);
+    update_player_death(state, controls);
     return;
   }
 
@@ -8466,6 +8658,127 @@ static int run_combat_selftest(void) {
   return 0;
 }
 
+static int run_player_death_selftest(void) {
+  AppState state;
+  RuntimeObjectState test_object;
+  PlayerControls controls;
+  int i = 0;
+
+  memset(&state, 0, sizeof(state));
+  memset(&test_object, 0, sizeof(test_object));
+  memset(&controls, 0, sizeof(controls));
+
+  state.player_hitpoints = 1;
+  state.player_lives = GLOOM_PLAYER_INITIAL_LIVES;
+  state.player_eye_y = (float)GLOOM_PLAYER_EYE_Y;
+  state.player_respawn_x = 100;
+  state.player_respawn_z = 200;
+  state.player_respawn_rotation = 64;
+  state.player_weapon = 3u;
+  state.player_reload = 2u;
+  state.player_rot_fixed = amiga_rotation_to_fixed(0);
+  state.camera_angle = player_rotation_fixed_to_radians(state.player_rot_fixed);
+  test_object.damage = 2;
+
+  damage_player_from_object(&state, &test_object);
+  if (!combat_selftest_expect(state.player_hitpoints == 0 && state.player_dead &&
+                                  state.player_death_phase == GLOOM_PLAYER_DEATH_FALLING &&
+                                  state.player_lives == GLOOM_PLAYER_INITIAL_LIVES &&
+                                  (int)state.player_palette_timer == GLOOM_PLAYER_RED_PAL_TIMER,
+                              "playerdie should start redpal/playerdeath without consuming a life immediately")) {
+    return 1;
+  }
+
+  for (i = 0; i < 20; ++i) {
+    advance_player_death_amiga_tick(&state);
+  }
+  if (!combat_selftest_expect(state.player_death_phase == GLOOM_PLAYER_DEATH_DEAD_DELAY &&
+                                  state.player_eye_y == (float)GLOOM_PLAYER_DEATH_EYE_CLAMP &&
+                                  state.player_lives == GLOOM_PLAYER_INITIAL_LIVES - 1 &&
+                                  state.player_death_timer == (float)GLOOM_PLAYER_DEAD_DELAY,
+                              "playerdeath should spin/fall to -32 before losing exactly one life")) {
+    return 1;
+  }
+
+  for (i = 0; i < GLOOM_PLAYER_DEAD_DELAY; ++i) {
+    advance_player_death_amiga_tick(&state);
+  }
+  if (!combat_selftest_expect(state.player_death_phase == GLOOM_PLAYER_DEATH_WAIT_RESTART,
+                              "playerdead should wait 63 ticks before waitrestart")) {
+    return 1;
+  }
+
+  state.player_last_fire = true;
+  controls.fire = true;
+  update_player_death(&state, &controls);
+  if (!combat_selftest_expect(state.player_death_phase == GLOOM_PLAYER_DEATH_WAIT_RESTART,
+                              "waitrestart should require a fresh fire press")) {
+    return 1;
+  }
+
+  controls.fire = false;
+  update_player_death(&state, &controls);
+  controls.fire = true;
+  update_player_death(&state, &controls);
+  if (!combat_selftest_expect(!state.player_dead && state.player_death_phase == GLOOM_PLAYER_DEATH_INVINCIBLE &&
+                                  state.player_hitpoints == GLOOM_PLAYER_INITIAL_HEALTH &&
+                                  state.player_lives == GLOOM_PLAYER_INITIAL_LIVES - 1 &&
+                                  state.player_weapon == 3u && state.camera_x == 100.0f && state.camera_z == 200.0f &&
+                                  state.player_rot_fixed == amiga_rotation_to_fixed(64),
+                              "waitrestart should respawn at p1x/p1z/prot, preserve weapon, and enter playerlogic0")) {
+    return 1;
+  }
+
+  damage_player_from_object(&state, &test_object);
+  if (!combat_selftest_expect(state.player_hitpoints == GLOOM_PLAYER_INITIAL_HEALTH &&
+                                  state.player_death_phase == GLOOM_PLAYER_DEATH_INVINCIBLE,
+                              "playerlogic0 invincibility should ignore damage for 75 ticks")) {
+    return 1;
+  }
+
+  for (i = 0; i < GLOOM_PLAYER_RESTART_INVINCIBLE_TICKS; ++i) {
+    advance_player_death_amiga_tick(&state);
+  }
+  if (!combat_selftest_expect(state.player_death_phase == GLOOM_PLAYER_DEATH_NONE,
+                              "playerlogic0 should restore normal collision after 75 ticks")) {
+    return 1;
+  }
+
+  state.player_hitpoints = 2;
+  damage_player_squash(&state);
+  if (!combat_selftest_expect(state.player_hitpoints == 1 &&
+                                  state.player_death_phase == GLOOM_PLAYER_DEATH_NONE &&
+                                  (int)state.player_palette_timer == GLOOM_PLAYER_RED_PAL_TIMER,
+                              "playerlogic unresolved adjustpos should injure without killing above zero HP")) {
+    return 1;
+  }
+  damage_player_squash(&state);
+  if (!combat_selftest_expect(state.player_hitpoints == 0 &&
+                                  state.player_death_phase == GLOOM_PLAYER_DEATH_FALLING,
+                              "playerlogic unresolved adjustpos should enter playerdie at zero HP")) {
+    return 1;
+  }
+
+  state.player_hitpoints = 1;
+  state.player_lives = 1;
+  state.player_dead = false;
+  state.player_death_phase = GLOOM_PLAYER_DEATH_NONE;
+  state.player_eye_y = (float)GLOOM_PLAYER_EYE_Y;
+  state.finished = 0;
+  damage_player_from_object(&state, &test_object);
+  for (i = 0; i < 20 + GLOOM_PLAYER_DEAD_DELAY; ++i) {
+    advance_player_death_amiga_tick(&state);
+  }
+  if (!combat_selftest_expect(state.player_lives == 0 && state.player_death_phase == GLOOM_PLAYER_DEATH_GAME_OVER &&
+                                  state.finished == 2,
+                              "playerdead should set finished=2 when the final one-player life is gone")) {
+    return 1;
+  }
+
+  printf("Player death selftest passed\n");
+  return 0;
+}
+
 static int run_sfx_selftest(void) {
   AudioSystem audio;
   size_t i = 0u;
@@ -9206,6 +9519,9 @@ static uint64_t replay_fingerprint_state(const AppState *state, ReplayResult *ou
   replay_hash_i32(&hash, state->player_hitpoints);
   replay_hash_i32(&hash, state->player_lives);
   replay_hash_i32(&hash, state->player_dead ? 1 : 0);
+  replay_hash_i32(&hash, (int32_t)state->player_death_phase);
+  replay_hash_i32(&hash, replay_quantize_float(state->player_death_timer));
+  replay_hash_i32(&hash, replay_quantize_float(state->player_eye_y));
   replay_hash_i32(&hash, (int32_t)state->player_weapon);
   replay_hash_i32(&hash, (int32_t)state->player_reload);
   replay_hash_i32(&hash, replay_quantize_float(state->player_reload_counter));
@@ -9671,6 +9987,10 @@ int main(int argc, char **argv) {
 
   if (argc > 1 && strcmp(argv[1], "--combat-selftest") == 0) {
     return run_combat_selftest();
+  }
+
+  if (argc > 1 && strcmp(argv[1], "--player-death-selftest") == 0) {
+    return run_player_death_selftest();
   }
 
   if (argc > 1 && strcmp(argv[1], "--sfx-selftest") == 0) {
