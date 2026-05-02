@@ -40,10 +40,15 @@ enum {
   GLOOM_PLAYER_BOUNCE_STEP = 20,
   GLOOM_PLAYER_UNBOUNCE_STEP = 30,
   GLOOM_PLAYER_BOB_HEIGHT = 20,
+  GLOOM_PLAYER_INITIAL_HEALTH = 25,
   GLOOM_MOUSE_LOOK_FIXED_PER_PIXEL = 0x2000,
   GLOOM_WEAPON_COUNT = 5,
   GLOOM_MAX_RUNTIME_PROJECTILES = 64,
   GLOOM_MAX_RUNTIME_SPARKS = 192,
+  GLOOM_MAX_RUNTIME_BLOOD = 128,
+  GLOOM_MAX_RUNTIME_CHUNKS = 256,
+  GLOOM_MAX_RUNTIME_GORE = 128,
+  GLOOM_MAX_RUNTIME_OBJECTS = 1024,
   GLOOM_PLAYER_INITIAL_RELOAD = 5,
   GLOOM_PLAYER_FIRE_Y = -60,
   GLOOM_PROJECTILE_RADIUS = 32,
@@ -103,6 +108,8 @@ typedef struct {
   bool active;
   uint8_t weapon_index;
   bool barrel_origin;
+  bool enemy;
+  bool homing;
   float x;
   float y;
   float z;
@@ -129,6 +136,66 @@ typedef struct {
 } RuntimeSpark;
 
 typedef struct {
+  bool active;
+  bool soul;
+  float x;
+  float y;
+  float z;
+  float vx;
+  float vy;
+  float vz;
+  uint16_t color_mask;
+} RuntimeBlood;
+
+typedef struct {
+  bool active;
+  int16_t object_type;
+  uint16_t frame_number;
+  uint16_t scale;
+  int16_t radius;
+  float x;
+  float y;
+  float z;
+  float vx;
+  float vy;
+  float vz;
+} RuntimeChunk;
+
+typedef struct {
+  bool active;
+  int16_t object_type;
+  uint16_t frame_number;
+  float x;
+  float z;
+} RuntimeGore;
+
+typedef struct {
+  bool active;
+  bool enemy;
+  float x;
+  float y;
+  float z;
+  float vx;
+  float vz;
+  int16_t rotation;
+  int16_t old_rotation;
+  int16_t rot_speed;
+  uint32_t frame_fixed;
+  int32_t frame_speed_fixed;
+  int16_t hitpoints;
+  int16_t damage;
+  int16_t radius;
+  float move_speed;
+  float delay;
+  float delay2;
+  float hurt_pause;
+  float pause_delay;
+  float bounce_phase;
+  uint8_t logic_state;
+  uint8_t old_logic_state;
+} RuntimeObjectState;
+
+typedef struct {
   uint64_t tick_count;
   GloomMap map;
   int16_t min_x;
@@ -142,6 +209,8 @@ typedef struct {
   int32_t player_rot_fixed;
   int32_t player_rotspeed;
   float player_bounce;
+  int16_t player_hitpoints;
+  bool player_dead;
   uint8_t player_weapon;
   uint8_t player_reload;
   float player_reload_counter;
@@ -152,6 +221,8 @@ typedef struct {
   uint32_t rng_state;
   bool triggered_events[GLOOM_EVENT_COUNT + 1];
   bool teleport_active;
+  uint8_t violence_mode;
+  uint16_t gore_write_index;
   uint8_t teleport_ticks;
   int16_t teleport_x;
   int16_t teleport_z;
@@ -160,6 +231,14 @@ typedef struct {
   RuntimeRotPoly rotpolys[GLOOM_MAX_ACTIVE_ROTPOLYS];
   RuntimeProjectile projectiles[GLOOM_MAX_RUNTIME_PROJECTILES];
   RuntimeSpark sparks[GLOOM_MAX_RUNTIME_SPARKS];
+  RuntimeBlood blood[GLOOM_MAX_RUNTIME_BLOOD];
+  RuntimeChunk chunks[GLOOM_MAX_RUNTIME_CHUNKS];
+  RuntimeGore gore[GLOOM_MAX_RUNTIME_GORE];
+  RuntimeObjectState objects[GLOOM_MAX_RUNTIME_OBJECTS];
+  float dragon_dead_delay;
+  bool dragon_finished_reported;
+  bool death_suck_active;
+  uint16_t death_sucker_index;
 } AppState;
 
 typedef struct {
@@ -198,8 +277,30 @@ enum {
   GLOOM_MAX_RENDER_ZONES = 2048,
   GLOOM_MAX_WALL_CANDIDATES = 2048,
   GLOOM_MAX_COLUMN_WALL_HITS = 128,
-  GLOOM_MAX_DEBUG_SPRITES = 128,
+  GLOOM_MAX_DEBUG_SPRITES = 512,
   GLOOM_OBJECT_TYPE_COUNT = 24
+};
+
+enum {
+  GLOOM_OBJECT_TYPE_DRAGON = 8,
+  GLOOM_OBJECT_TYPE_BALDY = 11,
+  GLOOM_OBJECT_TYPE_TERRA = 12,
+  GLOOM_OBJECT_TYPE_GHOUL = 13,
+  GLOOM_OBJECT_TYPE_PHANTOM = 14,
+  GLOOM_OBJECT_TYPE_DEMON = 15,
+  GLOOM_OBJECT_TYPE_LIZARD = 21,
+  GLOOM_OBJECT_TYPE_DEATHHEAD = 22,
+  GLOOM_OBJECT_TYPE_TROLL = 23
+};
+
+enum {
+  GLOOM_OBJECT_LOGIC_NORMAL = 0,
+  GLOOM_OBJECT_LOGIC_BALDYCHARGE = 1,
+  GLOOM_OBJECT_LOGIC_BALDYPUNCH = 2,
+  GLOOM_OBJECT_LOGIC_TERRAFIRE = 3,
+  GLOOM_OBJECT_LOGIC_DEMONPAUSE = 4,
+  GLOOM_OBJECT_LOGIC_DEATHCHARGE = 5,
+  GLOOM_OBJECT_LOGIC_DEATHSUCK = 6
 };
 
 typedef struct {
@@ -245,6 +346,7 @@ typedef struct {
   bool use_fixed_frame;
   uint16_t rotation_shift;
   uint16_t frame_count_per_rotation;
+  uint16_t collision_radius;
   size_t frame_count;
   char source_name[64];
   ObjectFrame *frames;
@@ -258,8 +360,9 @@ typedef struct {
   bool use_fixed_frame;
 } ObjectVisualDefinition;
 
-typedef struct {
+typedef struct ObjectVisualSet {
   ObjectVisual visuals[GLOOM_OBJECT_TYPE_COUNT];
+  ObjectVisual chunks[GLOOM_OBJECT_TYPE_COUNT];
 } ObjectVisualSet;
 
 typedef struct {
@@ -276,6 +379,39 @@ typedef struct {
   int16_t speed;
   uint16_t spark_frame_count;
 } WeaponDefinition;
+
+enum {
+  GLOOM_OBJECT_DIE_NONE = 0,
+  GLOOM_OBJECT_DIE_BLOWOBJECT = 1,
+  GLOOM_OBJECT_DIE_BLOWQUICK = 2,
+  GLOOM_OBJECT_DIE_BLOWDRAGON = 3,
+  GLOOM_OBJECT_DIE_BLOWDEATH = 4,
+  GLOOM_OBJECT_DIE_BLOWTERRA = 5
+};
+
+enum {
+  GLOOM_VIOLENCE_MEATY = 0,
+  GLOOM_VIOLENCE_MESSY = 1,
+  GLOOM_VIOLENCE_MEATY_MESSY = 2
+};
+
+typedef struct {
+  int16_t hitpoints;
+  int16_t damage;
+  float move_speed;
+  int16_t base_delay;
+  int16_t delay_range;
+  uint32_t initial_frame_fixed;
+  uint32_t frame_speed_fixed;
+  int16_t hurt_pause_ticks;
+  int16_t guts_y;
+  uint16_t blood_color_mask;
+  uint8_t death_routine;
+  uint8_t ranged_weapon;
+  int16_t ranged_damage;
+  float projectile_speed;
+  bool uses_fire1;
+} ObjectCombatDefinition;
 
 typedef struct {
   int16_t x;
@@ -320,10 +456,26 @@ static float amiga_rotation_to_radians(int16_t rotation);
 static float player_rotation_fixed_to_radians(int32_t rotation_fixed);
 static void apply_mouse_look(AppState *state, int mouse_dx);
 static void update_player_camera_y(AppState *state);
+static void spawn_runtime_gore(AppState *state, const RuntimeChunk *chunk);
 static bool resolve_runtime_file_path(const char *input_path, char *out_path, size_t out_path_size);
 static bool find_wall_collision_radius(const AppState *state, float x, float z, int16_t radius,
                                        uint16_t *out_penetration, size_t *out_zone_index);
+static bool resolve_wall_collision_radius(AppState *state, float *x, float *z, int16_t radius);
 static bool resolve_player_wall_collision(AppState *state, float *x, float *z);
+static void runtime_object_dir(int16_t rotation, float *out_x, float *out_z);
+static const ObjectVisualDefinition *object_visual_definitions(void);
+static int16_t object_type_initial_hitpoints(int16_t object_type);
+static int16_t object_type_damage(int16_t object_type);
+static float object_type_move_speed(int16_t object_type);
+static const ObjectCombatDefinition *object_type_combat_definition(int16_t object_type);
+static bool object_type_is_enemy(int16_t object_type);
+static void initialize_runtime_objects(AppState *state);
+static uint16_t runtime_random_word(AppState *state);
+static bool spawn_enemy_projectile_params(AppState *state, const RuntimeObjectState *object, uint8_t weapon_index,
+                                          int16_t hitpoints, int16_t damage, float speed, float y_offset);
+static bool spawn_enemy_projectile_params_ex(AppState *state, const RuntimeObjectState *object, uint8_t weapon_index,
+                                             int16_t hitpoints, int16_t damage, float speed, float y_offset,
+                                             bool homing);
 static void update_rotpolys(AppState *state);
 static void update_doors(AppState *state);
 static void check_event_triggers(AppState *state);
@@ -411,15 +563,77 @@ static bool initialize_camera_from_map_spawn(AppState *state) {
   state->player_rot_fixed = amiga_rotation_to_fixed(spawn->rotation);
   state->player_rotspeed = 0;
   state->player_bounce = 0;
+  state->player_hitpoints = GLOOM_PLAYER_INITIAL_HEALTH;
+  state->player_dead = false;
   state->player_weapon = 0u;
   state->player_reload = (uint8_t)GLOOM_PLAYER_INITIAL_RELOAD;
   state->player_reload_counter = 0.0f;
   state->player_weapon_flash = 0.0f;
   state->player_last_fire = false;
   state->rng_state = 0x47524F4Fu ^ ((uint32_t)(uint16_t)spawn->x << 16u) ^ (uint32_t)(uint16_t)spawn->z;
+  state->violence_mode = GLOOM_VIOLENCE_MEATY_MESSY;
   state->camera_angle = player_rotation_fixed_to_radians(state->player_rot_fixed);
   update_player_camera_y(state);
   return true;
+}
+
+static void initialize_runtime_objects(AppState *state) {
+  size_t i = 0u;
+  size_t count = 0u;
+  const ObjectVisualDefinition *visual_definitions = object_visual_definitions();
+
+  if (state == NULL) {
+    return;
+  }
+
+  memset(state->objects, 0, sizeof(state->objects));
+  count = state->map.object_spawn_count;
+  if (count > (size_t)GLOOM_MAX_RUNTIME_OBJECTS) {
+    count = (size_t)GLOOM_MAX_RUNTIME_OBJECTS;
+  }
+
+  for (i = 0u; i < count; ++i) {
+    const GloomObjectSpawn *spawn = &state->map.object_spawns[i];
+    RuntimeObjectState *object = &state->objects[i];
+    const ObjectCombatDefinition *combat = object_type_combat_definition(spawn->object_type);
+    int16_t hitpoints = object_type_initial_hitpoints(spawn->object_type);
+    uint16_t scale = 0x0200u;
+
+    if (hitpoints <= 0) {
+      continue;
+    }
+
+    if (spawn->object_type >= 0 && spawn->object_type < (int16_t)GLOOM_OBJECT_TYPE_COUNT) {
+      scale = visual_definitions[spawn->object_type].scale;
+    }
+
+    object->active = true;
+    object->enemy = object_type_is_enemy(spawn->object_type);
+    object->x = (float)spawn->x;
+    object->y = (float)spawn->y;
+    object->z = (float)spawn->z;
+    object->rotation = spawn->rotation;
+    object->old_rotation = spawn->rotation;
+    if (spawn->object_type == GLOOM_OBJECT_TYPE_DRAGON) {
+      object->rot_speed = -1;
+    } else if (spawn->object_type != GLOOM_OBJECT_TYPE_DEATHHEAD) {
+      object->rot_speed = 3;
+    }
+    if (combat != NULL) {
+      object->frame_fixed = combat->initial_frame_fixed;
+      object->frame_speed_fixed = (int32_t)combat->frame_speed_fixed;
+    }
+    object->hitpoints = hitpoints;
+    object->damage = object_type_damage(spawn->object_type);
+    object->radius = (int16_t)((uint32_t)48u * (uint32_t)scale / 0x0200u);
+    if (object->radius < 24) {
+      object->radius = 24;
+    }
+    object->move_speed = object_type_move_speed(spawn->object_type);
+    if (combat != NULL && combat->delay_range > 0u) {
+      object->delay = (float)combat->base_delay + (float)(runtime_random_word(state) % combat->delay_range);
+    }
+  }
 }
 
 static void sweep_file(const char *path, SweepStats *stats) {
@@ -1759,6 +1973,23 @@ static const ObjectVisualDefinition *object_visual_definitions(void) {
   return definitions;
 }
 
+static const char *object_chunk_asset_name(int16_t object_type) {
+  static const char *chunk_assets[GLOOM_OBJECT_TYPE_COUNT] = {
+      NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, "dragon2", NULL, "marine2", "baldy2",
+      "terra2", NULL, "phantom2", "demon2", NULL, NULL, NULL, NULL, NULL, "lizard2", NULL, "troll2",
+  };
+
+  if (object_type < 0 || object_type >= (int16_t)GLOOM_OBJECT_TYPE_COUNT) {
+    return NULL;
+  }
+
+  return chunk_assets[object_type];
+}
+
+static bool object_type_has_blowchunx(int16_t object_type) {
+  return object_chunk_asset_name(object_type) != NULL;
+}
+
 static const WeaponDefinition *weapon_definitions(void) {
   static const WeaponDefinition definitions[GLOOM_WEAPON_COUNT] = {
       {"bullet1.bin", "sparks1.bin", 1, 1, 32, 6}, {"bullet2.bin", "sparks2.bin", 5, 2, 36, 7},
@@ -1767,6 +1998,112 @@ static const WeaponDefinition *weapon_definitions(void) {
   };
 
   return definitions;
+}
+
+static const ObjectCombatDefinition *object_combat_definitions(void) {
+  static const ObjectCombatDefinition definitions[GLOOM_OBJECT_TYPE_COUNT] = {
+      {25, 1, 13.0f, 1, 1, 0, 0x6000u, 5, -64, 0x0f00u, GLOOM_OBJECT_DIE_NONE, 0, 0, 0.0f, false},
+      {25, 1, 13.0f, 1, 1, 0, 0x6000u, 5, -64, 0x0f00u, GLOOM_OBJECT_DIE_NONE, 0, 0, 0.0f, false},
+      {0, 0, 0.0f, 0, 0, 0x20000u, 0, 5, 0, 0x0f00u, GLOOM_OBJECT_DIE_NONE, 0, 0, 0.0f, false},
+      {0, 0, 0.0f, 0, 0, 0, 0, 0, 0, 0x0000u, GLOOM_OBJECT_DIE_NONE, 0, 0, 0.0f, false},
+      {0, 0, 0.0f, 0, 0, 0, 0, 5, 0, 0x0f00u, GLOOM_OBJECT_DIE_NONE, 0, 0, 0.0f, false},
+      {0, 0, 0.0f, 0, 0, 0, 0, 5, 0, 0x0f00u, GLOOM_OBJECT_DIE_NONE, 0, 0, 0.0f, false},
+      {0, 0, 0.0f, 0, 0, 0x10000u, 0, 5, 0, 0x0f00u, GLOOM_OBJECT_DIE_NONE, 0, 0, 0.0f, false},
+      {0, 0, 0.0f, 0, 0, 0x20000u, 0, 5, 0, 0x0f00u, GLOOM_OBJECT_DIE_NONE, 0, 0, 0.0f, false},
+      {250, 10, 12.0f, 16, 32, 0, 0x4000u, 5, -64, 0x0f00u, GLOOM_OBJECT_DIE_BLOWDRAGON, 0, 0, 0.0f, false},
+      {0, 0, 0.0f, 0, 0, 0x30000u, 0, 0, 0, 0x0f00u, GLOOM_OBJECT_DIE_NONE, 0, 0, 0.0f, false},
+      {5, 1, 6.0f, 16, 32, 0, 0x6000u, 5, -64, 0x0f00u, GLOOM_OBJECT_DIE_BLOWOBJECT, 0, 1, 20.0f, true},
+      {10, 2, 4.0f, 8, 16, 0, 0x4000u, 3, -64, 0x0f00u, GLOOM_OBJECT_DIE_BLOWOBJECT, 0, 0, 0.0f, false},
+      {35, 1, 2.0f, 32, 48, 0, 0x6000u, 0, -64, 0x0fffu, GLOOM_OBJECT_DIE_BLOWTERRA, 0, 0, 0.0f, false},
+      {5, 0, 8.0f, 32, 48, 0, 0, 5, -64, 0x80f0u, GLOOM_OBJECT_DIE_BLOWOBJECT, 0, 0, 0.0f, false},
+      {10, 3, 10.0f, 8, 16, 0, 0xa000u, 7, -64, 0x0ff0u, GLOOM_OBJECT_DIE_BLOWOBJECT, 0, 0, 0.0f, false},
+      {25, 5, 7.0f, 32, 4, 0, 0x7000u, 5, -72, 0x0f00u, GLOOM_OBJECT_DIE_BLOWOBJECT, 0, 0, 0.0f, false},
+      {0, 0, 0.0f, 0, 0, 0, 0, 0, 0, 0x0000u, GLOOM_OBJECT_DIE_NONE, 0, 0, 0.0f, false},
+      {0, 0, 0.0f, 0, 0, 0, 0, 0, 0, 0x0000u, GLOOM_OBJECT_DIE_NONE, 0, 0, 0.0f, false},
+      {0, 0, 0.0f, 0, 0, 0, 0, 0, 0, 0x0000u, GLOOM_OBJECT_DIE_NONE, 0, 0, 0.0f, false},
+      {0, 0, 0.0f, 0, 0, 0, 0, 0, 0, 0x0000u, GLOOM_OBJECT_DIE_NONE, 0, 0, 0.0f, false},
+      {0, 0, 0.0f, 0, 0, 0, 0, 0, 0, 0x0000u, GLOOM_OBJECT_DIE_NONE, 0, 0, 0.0f, false},
+      {10, 2, 6.0f, 8, 8, 0, 0x4000u, 2, -64, 0x0f0fu, GLOOM_OBJECT_DIE_BLOWOBJECT, 0, 0, 0.0f, false},
+      {35, 3, 12.0f, -8, 16, 0x8000u, 0x6000u, 10, -96, 0x0f00u, GLOOM_OBJECT_DIE_BLOWDEATH, 0, 0, 0.0f, false},
+      {18, 3, 6.0f, 8, 8, 0, 0x4000u, 2, -64, 0x0f00u, GLOOM_OBJECT_DIE_BLOWOBJECT, 0, 0, 0.0f, false},
+  };
+
+  return definitions;
+}
+
+static const ObjectCombatDefinition *object_type_combat_definition(int16_t object_type) {
+  if (object_type < 0 || object_type >= (int16_t)GLOOM_OBJECT_TYPE_COUNT) {
+    return NULL;
+  }
+
+  return &object_combat_definitions()[object_type];
+}
+
+static int16_t object_type_initial_hitpoints(int16_t object_type) {
+  if (object_type < 0 || object_type >= (int16_t)GLOOM_OBJECT_TYPE_COUNT) {
+    return 0;
+  }
+
+  return object_combat_definitions()[object_type].hitpoints;
+}
+
+static int16_t object_type_damage(int16_t object_type) {
+  if (object_type < 0 || object_type >= (int16_t)GLOOM_OBJECT_TYPE_COUNT) {
+    return 0;
+  }
+
+  return object_combat_definitions()[object_type].damage;
+}
+
+static float object_type_move_speed(int16_t object_type) {
+  if (object_type < 0 || object_type >= (int16_t)GLOOM_OBJECT_TYPE_COUNT) {
+    return 0.0f;
+  }
+
+  return object_combat_definitions()[object_type].move_speed;
+}
+
+static bool object_type_uses_monsterlogic(int16_t object_type) {
+  return object_type == 10;
+}
+
+static bool object_type_uses_baldy_family_logic(int16_t object_type) {
+  return object_type == GLOOM_OBJECT_TYPE_BALDY || object_type == GLOOM_OBJECT_TYPE_LIZARD ||
+         object_type == GLOOM_OBJECT_TYPE_TROLL;
+}
+
+static int16_t object_type_punch_rate(int16_t object_type) {
+  switch (object_type) {
+    case GLOOM_OBJECT_TYPE_BALDY:
+      return 4;
+    case GLOOM_OBJECT_TYPE_LIZARD:
+    case GLOOM_OBJECT_TYPE_TROLL:
+      return 3;
+    default:
+      return 0;
+  }
+}
+
+static bool object_type_uses_special_projectile_logic(int16_t object_type) {
+  return object_type == GLOOM_OBJECT_TYPE_TERRA || object_type == GLOOM_OBJECT_TYPE_GHOUL ||
+         object_type == GLOOM_OBJECT_TYPE_PHANTOM || object_type == GLOOM_OBJECT_TYPE_DEMON;
+}
+
+static bool object_type_is_enemy(int16_t object_type) {
+  return object_type_initial_hitpoints(object_type) > 0 && object_type != 0 && object_type != 1;
+}
+
+static const char *violence_mode_name(uint8_t violence_mode) {
+  switch (violence_mode) {
+    case GLOOM_VIOLENCE_MEATY:
+      return "MEATY";
+    case GLOOM_VIOLENCE_MESSY:
+      return "MESSY";
+    case GLOOM_VIOLENCE_MEATY_MESSY:
+      return "MEATY+MESSY";
+    default:
+      return "UNKNOWN";
+  }
 }
 
 static void free_object_visual(ObjectVisual *visual) {
@@ -1793,6 +2130,7 @@ static void free_object_visual_set(ObjectVisualSet *set) {
 
   for (i = 0u; i < GLOOM_OBJECT_TYPE_COUNT; ++i) {
     free_object_visual(&set->visuals[i]);
+    free_object_visual(&set->chunks[i]);
   }
 
   memset(set, 0, sizeof(*set));
@@ -1931,6 +2269,7 @@ static bool load_object_visual_from_asset(const char *asset_name, const ObjectVi
   out_visual->use_fixed_frame = definition->use_fixed_frame;
   out_visual->rotation_shift = rotation_shift;
   out_visual->frame_count_per_rotation = frames_per_rotation;
+  out_visual->collision_radius = max_w;
   out_visual->frame_count = frame_count;
   out_visual->frames = frames;
   (void)snprintf(out_visual->source_name, sizeof(out_visual->source_name), "%s", resolved_path);
@@ -1977,6 +2316,15 @@ static bool load_object_visual_set_for_map(const GloomMap *map, ObjectVisualSet 
     if (!load_object_visual_from_asset(asset_name, &definitions[i], &set->visuals[i])) {
       free_object_visual_set(set);
       return false;
+    }
+    if (object_type_is_enemy((int16_t)i) && object_chunk_asset_name((int16_t)i) != NULL) {
+      ObjectVisualDefinition chunk_definition = {object_chunk_asset_name((int16_t)i), false, definitions[i].scale, 0u,
+                                                 false};
+
+      if (!load_object_visual_from_asset(chunk_definition.asset_name, &chunk_definition, &set->chunks[i])) {
+        free_object_visual_set(set);
+        return false;
+      }
     }
     loaded_count += 1u;
   }
@@ -2047,9 +2395,8 @@ static uint32_t sample_object_frame_argb(const ObjectFrame *frame, float u, floa
   return frame->argb_pixels[(sy * frame->width) + sx];
 }
 
-static const ObjectFrame *select_object_visual_frame(const ObjectVisual *visual, const GloomObjectSpawn *spawn,
-                                                     const AppState *state) {
-  size_t frame_number = 0u;
+static const ObjectFrame *select_object_visual_frame_number(const ObjectVisual *visual, const GloomObjectSpawn *spawn,
+                                                            const AppState *state, size_t frame_number) {
   size_t rotation_count = 1u;
   size_t rotation_index = 0u;
   size_t frame_index = 0u;
@@ -2057,13 +2404,6 @@ static const ObjectFrame *select_object_visual_frame(const ObjectVisual *visual,
   if (visual == NULL || spawn == NULL || state == NULL || !visual->loaded || visual->frames == NULL ||
       visual->frame_count == 0u) {
     return NULL;
-  }
-
-  if (visual->use_fixed_frame) {
-    frame_number = visual->fixed_frame;
-  } else if (visual->frame_count_per_rotation > 0u) {
-    frame_number = (size_t)(sim_ticks_to_amiga_ticks(state->tick_count) / 8u) %
-                   (size_t)visual->frame_count_per_rotation;
   }
 
   if (visual->eight_rotations && visual->rotation_shift < 8u) {
@@ -2092,6 +2432,24 @@ static const ObjectFrame *select_object_visual_frame(const ObjectVisual *visual,
   }
 
   return &visual->frames[frame_index];
+}
+
+static const ObjectFrame *select_object_visual_frame(const ObjectVisual *visual, const GloomObjectSpawn *spawn,
+                                                     const AppState *state) {
+  size_t frame_number = 0u;
+
+  if (visual == NULL) {
+    return NULL;
+  }
+
+  if (visual->use_fixed_frame) {
+    frame_number = visual->fixed_frame;
+  } else if (visual->frame_count_per_rotation > 0u) {
+    frame_number = (size_t)(sim_ticks_to_amiga_ticks(state->tick_count) / 8u) %
+                   (size_t)visual->frame_count_per_rotation;
+  }
+
+  return select_object_visual_frame_number(visual, spawn, state, frame_number);
 }
 
 static void free_preview_asset(PreviewAsset *asset) {
@@ -2511,6 +2869,267 @@ static float runtime_spark_velocity(AppState *state) {
   return (float)(int16_t)runtime_random_word(state) / 2048.0f;
 }
 
+static float runtime_bloodspeed(AppState *state, uint8_t left_shift) {
+  return (float)(int16_t)runtime_random_word(state) / (float)(1u << (16u - left_shift));
+}
+
+static void spawn_runtime_bloodymess(AppState *state, const RuntimeObjectState *object,
+                                     const ObjectCombatDefinition *combat, uint16_t dbf_count, uint8_t velocity_shift) {
+  float origin_x = 0.0f;
+  float origin_y = 0.0f;
+  float origin_z = 0.0f;
+  uint16_t n = 0u;
+
+  if (state == NULL || object == NULL || combat == NULL) {
+    return;
+  }
+
+  origin_x = object->x + runtime_bloodspeed(state, 5u);
+  origin_y = (float)combat->guts_y + runtime_bloodspeed(state, 5u);
+  origin_z = object->z + runtime_bloodspeed(state, 5u);
+
+  for (n = 0u; n <= dbf_count; ++n) {
+    size_t i = 0u;
+
+    for (i = 0u; i < GLOOM_MAX_RUNTIME_BLOOD; ++i) {
+      RuntimeBlood *blood = &state->blood[i];
+
+      if (blood->active) {
+        continue;
+      }
+
+      memset(blood, 0, sizeof(*blood));
+      blood->active = true;
+      blood->x = origin_x;
+      blood->y = origin_y;
+      blood->z = origin_z;
+      blood->vx = runtime_bloodspeed(state, velocity_shift);
+      blood->vy = runtime_bloodspeed(state, velocity_shift);
+      blood->vz = runtime_bloodspeed(state, velocity_shift);
+      blood->color_mask = combat->blood_color_mask;
+      break;
+    }
+
+    if (i == GLOOM_MAX_RUNTIME_BLOOD) {
+      return;
+    }
+  }
+}
+
+static void runtime_hurtobject(AppState *state, RuntimeObjectState *object, const ObjectCombatDefinition *combat) {
+  if (state == NULL || object == NULL || combat == NULL) {
+    return;
+  }
+
+  spawn_runtime_bloodymess(state, object, combat, 23u, 2u);
+  if (combat->hurt_pause_ticks > 0) {
+    object->hurt_pause = (float)combat->hurt_pause_ticks;
+    object->frame_fixed = 4u << 16;
+  }
+}
+
+static void runtime_spawn_soul(AppState *state, const RuntimeObjectState *object, uint16_t object_index) {
+  float dir_x = 0.0f;
+  float dir_z = 0.0f;
+  float origin_x = 0.0f;
+  float origin_z = 0.0f;
+  int n = 0;
+
+  if (state == NULL || object == NULL) {
+    return;
+  }
+
+  runtime_object_dir((int16_t)((object->rotation + 128) & 255), &dir_x, &dir_z);
+  origin_x = state->camera_x + (-dir_x * 64.0f);
+  origin_z = state->camera_z + (dir_z * 64.0f);
+
+  for (n = 0; n <= 3; ++n) {
+    size_t i = 0u;
+
+    for (i = 0u; i < GLOOM_MAX_RUNTIME_BLOOD; ++i) {
+      RuntimeBlood *blood = &state->blood[i];
+
+      if (blood->active) {
+        continue;
+      }
+
+      memset(blood, 0, sizeof(*blood));
+      blood->active = true;
+      blood->soul = true;
+      blood->x = origin_x + (float)((int16_t)(runtime_random_word(state) & 63u) - 32);
+      blood->y = 110.0f + (float)((int16_t)(runtime_random_word(state) & 63u) - 32);
+      blood->z = origin_z + (float)((int16_t)(runtime_random_word(state) & 63u) - 32);
+      blood->vx = -dir_x * 32.0f;
+      blood->vz = dir_z * 32.0f;
+      blood->vy = (float)object_index;
+      blood->color_mask = (runtime_random_word(state) & 1u) != 0u ? 0x00ffu : 0x00f0u;
+      break;
+    }
+
+    if (i == GLOOM_MAX_RUNTIME_BLOOD) {
+      return;
+    }
+  }
+}
+
+static void runtime_start_deathsuck(AppState *state, RuntimeObjectState *object, const ObjectCombatDefinition *combat,
+                                    uint16_t object_index) {
+  if (state == NULL || object == NULL || combat == NULL || state->death_suck_active || state->player_dead ||
+      state->player_hitpoints <= 0) {
+    return;
+  }
+
+  state->death_suck_active = true;
+  state->death_sucker_index = object_index;
+  object->old_rotation = object->rotation;
+  object->old_logic_state = object->logic_state;
+  object->logic_state = GLOOM_OBJECT_LOGIC_DEATHSUCK;
+  object->delay = 64.0f;
+}
+
+static void runtime_apply_object_hit(AppState *state, RuntimeObjectState *object, const ObjectCombatDefinition *combat,
+                                     int16_t object_type, uint16_t object_index) {
+  if (state == NULL || object == NULL || combat == NULL) {
+    return;
+  }
+
+  switch (object_type) {
+    case GLOOM_OBJECT_TYPE_DRAGON:
+      return;
+    case GLOOM_OBJECT_TYPE_GHOUL:
+      spawn_runtime_bloodymess(state, object, combat, 31u, 2u);
+      return;
+    case GLOOM_OBJECT_TYPE_DEATHHEAD:
+      runtime_start_deathsuck(state, object, combat, object_index);
+      return;
+    default:
+      runtime_hurtobject(state, object, combat);
+      return;
+  }
+}
+
+static void spawn_runtime_blowchunx(AppState *state, const RuntimeObjectState *object, const ObjectVisual *chunk_visual,
+                                    int16_t object_type) {
+  uint16_t frame_count = 0u;
+  int frame = 0;
+
+  if (state == NULL || object == NULL || chunk_visual == NULL || !chunk_visual->loaded ||
+      chunk_visual->frame_count_per_rotation == 0u) {
+    return;
+  }
+
+  frame_count = chunk_visual->frame_count_per_rotation;
+  for (frame = (int)frame_count - 1; frame >= 0; --frame) {
+    size_t i = 0u;
+
+    for (i = 0u; i < GLOOM_MAX_RUNTIME_CHUNKS; ++i) {
+      RuntimeChunk *chunk = &state->chunks[i];
+
+      if (chunk->active) {
+        continue;
+      }
+
+      memset(chunk, 0, sizeof(*chunk));
+      chunk->active = true;
+      chunk->object_type = object_type;
+      chunk->frame_number = (uint16_t)frame;
+      chunk->scale = chunk_visual->scale;
+      chunk->radius = (int16_t)chunk_visual->collision_radius;
+      chunk->x = object->x;
+      chunk->y = -64.0f;
+      chunk->z = object->z;
+      chunk->vx = runtime_bloodspeed(state, 4u);
+      chunk->vy = runtime_bloodspeed(state, 4u) - 4.0f;
+      chunk->vz = runtime_bloodspeed(state, 4u);
+      break;
+    }
+
+    if (i == GLOOM_MAX_RUNTIME_CHUNKS) {
+      fprintf(stderr, "Failed to port blowchunx fully: runtime chunk list is full while spawning object type %d\n",
+              object_type);
+      return;
+    }
+  }
+}
+
+static void runtime_blowobject(AppState *state, RuntimeObjectState *object, const ObjectCombatDefinition *combat,
+                               const ObjectVisualSet *object_visuals, int16_t object_type) {
+  const ObjectVisual *chunk_visual = NULL;
+
+  if (state == NULL || object == NULL || combat == NULL) {
+    return;
+  }
+
+  if (object_type == GLOOM_OBJECT_TYPE_DEATHHEAD && state->death_suck_active) {
+    state->death_suck_active = false;
+  }
+
+  spawn_runtime_bloodymess(state, object, combat, 31u, 4u);
+  if (object_type_has_blowchunx(object_type)) {
+    if (object_visuals == NULL || object_type < 0 || object_type >= (int16_t)GLOOM_OBJECT_TYPE_COUNT) {
+      fprintf(stderr, "Failed to port blowchunx: missing chunk visual set for object type %d\n", object_type);
+      return;
+    }
+
+    chunk_visual = &object_visuals->chunks[object_type];
+    if (!chunk_visual->loaded) {
+      fprintf(stderr, "Failed to port blowchunx: chunk asset '%s' for object type %d was not loaded\n",
+              object_chunk_asset_name(object_type), object_type);
+      return;
+    }
+
+    spawn_runtime_blowchunx(state, object, chunk_visual, object_type);
+  } else {
+    spawn_runtime_bloodymess(state, object, combat, 15u, 4u);
+  }
+  object->active = false;
+}
+
+static void runtime_blowdragon(AppState *state, RuntimeObjectState *object, const ObjectCombatDefinition *combat,
+                               const ObjectVisualSet *object_visuals, int16_t object_type) {
+  const ObjectVisual *chunk_visual = NULL;
+  int pass = 0;
+
+  if (state == NULL || object == NULL || combat == NULL) {
+    return;
+  }
+
+  spawn_runtime_bloodymess(state, object, combat, 63u, 4u);
+  if (object_visuals == NULL || object_type < 0 || object_type >= (int16_t)GLOOM_OBJECT_TYPE_COUNT) {
+    fprintf(stderr, "Failed to port blowdragon: missing chunk visual set for object type %d\n", object_type);
+    return;
+  }
+
+  chunk_visual = &object_visuals->chunks[object_type];
+  if (!chunk_visual->loaded) {
+    fprintf(stderr, "Failed to port blowdragon: chunk asset '%s' for object type %d was not loaded\n",
+            object_chunk_asset_name(object_type), object_type);
+    return;
+  }
+
+  for (pass = 0; pass < 4; ++pass) {
+    spawn_runtime_blowchunx(state, object, chunk_visual, object_type);
+  }
+  object->enemy = false;
+  object->active = false;
+  state->dragon_dead_delay = 127.0f;
+  state->dragon_finished_reported = false;
+}
+
+static int16_t radians_to_amiga_rotation(float radians) {
+  int32_t unit = 0;
+
+  while (radians < 0.0f) {
+    radians += 6.28318530718f;
+  }
+  while (radians >= 6.28318530718f) {
+    radians -= 6.28318530718f;
+  }
+
+  unit = round_float_to_int32((radians * 256.0f) / 6.28318530718f) & 255;
+  return (int16_t)unit;
+}
+
 static void spawn_runtime_sparks(AppState *state, uint8_t weapon_index, float x, float y, float z) {
   const WeaponDefinition *weapons = weapon_definitions();
   uint16_t frame_count = 0u;
@@ -2544,6 +3163,921 @@ static void spawn_runtime_sparks(AppState *state, uint8_t weapon_index, float x,
       spark->lifetime = 15.0f + (float)(runtime_random_word(state) & 15u);
       break;
     }
+  }
+}
+
+static void runtime_object_dir(int16_t rotation, float *out_x, float *out_z) {
+  float angle = amiga_rotation_to_radians(rotation);
+
+  if (out_x != NULL) {
+    *out_x = SDL_sinf(angle);
+  }
+  if (out_z != NULL) {
+    *out_z = SDL_cosf(angle);
+  }
+}
+
+static int16_t runtime_angle_to_player(const AppState *state, const RuntimeObjectState *object) {
+  if (state == NULL || object == NULL) {
+    return 0;
+  }
+
+  return radians_to_amiga_rotation(SDL_atan2f(state->camera_x - object->x, state->camera_z - object->z));
+}
+
+static bool runtime_object_checkvecs(AppState *state, RuntimeObjectState *object, float move) {
+  float dir_x = 0.0f;
+  float dir_z = 0.0f;
+  float new_x = 0.0f;
+  float new_z = 0.0f;
+  uint16_t penetration = 0u;
+  size_t zone_index = 0u;
+
+  if (state == NULL || object == NULL || move <= 0.0f) {
+    return false;
+  }
+
+  runtime_object_dir(object->rotation, &dir_x, &dir_z);
+  new_x = object->x + dir_x * move;
+  new_z = object->z + dir_z * move;
+  if (find_wall_collision_radius(state, new_x, new_z, object->radius, &penetration, &zone_index)) {
+    float old_x = object->x;
+    float old_z = object->z;
+
+    (void)penetration;
+    (void)zone_index;
+    if (!find_wall_collision_radius(state, old_x, old_z, object->radius, &penetration, &zone_index)) {
+      return false;
+    }
+    if (!resolve_wall_collision_radius(state, &old_x, &old_z, object->radius)) {
+      return false;
+    }
+    object->x = old_x;
+    object->z = old_z;
+    return false;
+  }
+
+  object->x = new_x;
+  object->z = new_z;
+  return true;
+}
+
+static bool runtime_object_monsterfix(AppState *state, RuntimeObjectState *object, float move) {
+  int16_t old_rotation = 0;
+  int16_t turn = 64;
+
+  if (state == NULL || object == NULL) {
+    return false;
+  }
+
+  old_rotation = object->old_rotation;
+  if ((int16_t)runtime_random_word(state) < 0) {
+    turn = -64;
+  }
+
+  object->rotation = (int16_t)((object->rotation + turn) & 255);
+  if (runtime_object_checkvecs(state, object, move)) {
+    return true;
+  }
+
+  object->rotation = (int16_t)((object->rotation + 128) & 255);
+  if (runtime_object_checkvecs(state, object, move)) {
+    return true;
+  }
+
+  object->rotation = (int16_t)((old_rotation + 128) & 255);
+  return runtime_object_checkvecs(state, object, move);
+}
+
+static void runtime_set_random_delay(AppState *state, RuntimeObjectState *object, const ObjectCombatDefinition *combat) {
+  if (state == NULL || object == NULL || combat == NULL) {
+    return;
+  }
+
+  object->delay = (float)combat->base_delay;
+  if (combat->delay_range > 0) {
+    object->delay += (float)(runtime_random_word(state) % (uint16_t)combat->delay_range);
+  }
+}
+
+static void runtime_advance_monster_frame(RuntimeObjectState *object, int32_t frame_speed_fixed, float step_scale) {
+  if (object == NULL) {
+    return;
+  }
+
+  object->frame_fixed =
+      (uint32_t)((int32_t)object->frame_fixed + (int32_t)((float)frame_speed_fixed * step_scale)) & 0x0003ffffu;
+}
+
+static bool runtime_object_collides_player(const AppState *state, const RuntimeObjectState *object) {
+  float dx = 0.0f;
+  float dz = 0.0f;
+  float radius = 0.0f;
+
+  if (state == NULL || object == NULL) {
+    return false;
+  }
+
+  radius = (float)(object->radius + state->player_radius);
+  dx = state->camera_x - object->x;
+  if (SDL_fabsf(dx) >= radius) {
+    return false;
+  }
+  dz = state->camera_z - object->z;
+  if (SDL_fabsf(dz) >= radius) {
+    return false;
+  }
+
+  return (dx * dx + dz * dz) < (radius * radius);
+}
+
+static void damage_player_from_object(AppState *state, const RuntimeObjectState *object) {
+  if (state == NULL || object == NULL || object->damage <= 0 || state->player_dead || state->player_hitpoints <= 0) {
+    return;
+  }
+
+  state->player_hitpoints -= object->damage;
+  if (state->player_hitpoints < 0) {
+    state->player_hitpoints = 0;
+  }
+  if (state->player_hitpoints == 0) {
+    state->player_dead = true;
+  }
+}
+
+static void runtime_baldy_family_to_normal(AppState *state, RuntimeObjectState *object,
+                                           const ObjectCombatDefinition *combat, float step_scale) {
+  float move = 0.0f;
+
+  if (state == NULL || object == NULL || combat == NULL) {
+    return;
+  }
+
+  object->logic_state = GLOOM_OBJECT_LOGIC_NORMAL;
+  object->move_speed = combat->move_speed;
+  object->frame_speed_fixed = (int32_t)combat->frame_speed_fixed;
+  runtime_set_random_delay(state, object, combat);
+  move = object->move_speed * step_scale;
+  (void)runtime_object_monsterfix(state, object, move);
+}
+
+static void runtime_baldy_family_enter_charge(RuntimeObjectState *object, const ObjectCombatDefinition *combat) {
+  if (object == NULL || combat == NULL) {
+    return;
+  }
+
+  object->rotation = (int16_t)(object->rotation & 255);
+  object->move_speed = combat->move_speed * 4.0f;
+  object->frame_speed_fixed = (int32_t)combat->frame_speed_fixed * 4;
+  object->logic_state = GLOOM_OBJECT_LOGIC_BALDYCHARGE;
+}
+
+static void update_baldy_family_object(AppState *state, RuntimeObjectState *object, const ObjectCombatDefinition *combat,
+                                       int16_t object_type, float step_scale) {
+  float move = 0.0f;
+
+  if (state == NULL || object == NULL || combat == NULL) {
+    return;
+  }
+
+  if (object->logic_state == GLOOM_OBJECT_LOGIC_BALDYPUNCH) {
+    if (!runtime_object_collides_player(state, object)) {
+      object->frame_fixed = 0u;
+      runtime_baldy_family_to_normal(state, object, combat, step_scale);
+      return;
+    }
+    if (object->delay > 0.0f) {
+      return;
+    }
+
+    object->delay = (float)object_type_punch_rate(object_type);
+    if ((object->frame_fixed >> 16u) == 0u) {
+      object->rotation = runtime_angle_to_player(state, object);
+      object->frame_fixed = 5u << 16;
+      damage_player_from_object(state, object);
+    } else {
+      object->frame_fixed = 0u;
+    }
+    return;
+  }
+
+  if (object->logic_state == GLOOM_OBJECT_LOGIC_BALDYCHARGE) {
+    int16_t target_rotation = 0;
+    int16_t diff = 0;
+
+    move = object->move_speed * step_scale;
+    if (!runtime_object_checkvecs(state, object, move)) {
+      runtime_baldy_family_to_normal(state, object, combat, step_scale);
+      return;
+    }
+
+    target_rotation = runtime_angle_to_player(state, object);
+    diff = (int16_t)(target_rotation - object->rotation);
+    if (diff > 32 || diff < -32) {
+      runtime_baldy_family_to_normal(state, object, combat, step_scale);
+      return;
+    }
+
+    if (runtime_object_collides_player(state, object)) {
+      object->logic_state = GLOOM_OBJECT_LOGIC_BALDYPUNCH;
+      object->delay = (float)object_type_punch_rate(object_type);
+      object->frame_fixed = 0u;
+      return;
+    }
+
+    runtime_advance_monster_frame(object, object->frame_speed_fixed, step_scale);
+    return;
+  }
+
+  if (object->delay <= 0.0f) {
+    object->rotation = runtime_angle_to_player(state, object);
+    runtime_baldy_family_enter_charge(object, combat);
+    return;
+  }
+
+  object->old_rotation = object->rotation;
+  move = object->move_speed * step_scale;
+  if (!runtime_object_checkvecs(state, object, move)) {
+    (void)runtime_object_monsterfix(state, object, move);
+  }
+  runtime_advance_monster_frame(object, object->frame_speed_fixed, step_scale);
+}
+
+static int16_t runtime_abs_rotation_delta(int16_t a, int16_t b) {
+  int16_t delta = (int16_t)((a & 255) - (b & 255));
+
+  if (delta < 0) {
+    delta = (int16_t)-delta;
+  }
+  return delta;
+}
+
+static void runtime_deathbounce(RuntimeObjectState *object, float step_scale) {
+  float angle = 0.0f;
+
+  if (object == NULL) {
+    return;
+  }
+
+  object->bounce_phase += 4.0f * step_scale;
+  while (object->bounce_phase >= 256.0f) {
+    object->bounce_phase -= 256.0f;
+  }
+  angle = amiga_rotation_to_radians((int16_t)round_float_to_int32(object->bounce_phase));
+  object->y = -48.0f + SDL_sinf(angle) * 64.0f;
+}
+
+static void runtime_deathanim(RuntimeObjectState *object, float step_scale) {
+  int32_t frame = 0;
+  int32_t speed = 0;
+
+  if (object == NULL) {
+    return;
+  }
+
+  frame = (int32_t)object->frame_fixed + (int32_t)((float)object->frame_speed_fixed * step_scale);
+  speed = object->frame_speed_fixed;
+  if (frame < 0x8000 || frame >= 0x28000) {
+    speed = -speed;
+    frame += speed;
+    object->frame_speed_fixed = speed;
+  }
+  object->frame_fixed = (uint32_t)frame;
+}
+
+static void update_deathhead_object(AppState *state, RuntimeObjectState *object, const ObjectCombatDefinition *combat,
+                                    float step_scale) {
+  float move = 0.0f;
+  int16_t target_rotation = 0;
+
+  if (state == NULL || object == NULL || combat == NULL) {
+    return;
+  }
+
+  runtime_deathbounce(object, step_scale);
+
+  if (object->logic_state == GLOOM_OBJECT_LOGIC_DEATHSUCK) {
+    runtime_deathanim(object, step_scale);
+    object->delay -= step_scale;
+    if (object->delay <= 0.0f) {
+      object->rotation = object->old_rotation;
+      object->logic_state = object->old_logic_state;
+      state->death_suck_active = false;
+      runtime_set_random_delay(state, object, combat);
+      return;
+    }
+
+    object->rotation = runtime_angle_to_player(state, object);
+    runtime_spawn_soul(state, object, state->death_sucker_index);
+    return;
+  }
+
+  if (object->logic_state == GLOOM_OBJECT_LOGIC_DEATHCHARGE) {
+    runtime_deathanim(object, step_scale);
+    target_rotation = runtime_angle_to_player(state, object);
+    if (runtime_abs_rotation_delta(target_rotation, object->rotation) >= 128) {
+      object->logic_state = GLOOM_OBJECT_LOGIC_NORMAL;
+      object->frame_fixed = 0x8000u;
+      runtime_set_random_delay(state, object, combat);
+      return;
+    }
+
+    move = object->move_speed * step_scale;
+    if (!runtime_object_checkvecs(state, object, move)) {
+      object->rotation = (int16_t)((object->rotation + 128) & 255);
+      object->logic_state = GLOOM_OBJECT_LOGIC_NORMAL;
+      object->frame_fixed = 0x8000u;
+      runtime_set_random_delay(state, object, combat);
+    }
+    return;
+  }
+
+  move = object->move_speed * step_scale;
+  if (!runtime_object_checkvecs(state, object, move)) {
+    object->rotation = (int16_t)((object->rotation + 128) & 255);
+    runtime_set_random_delay(state, object, combat);
+  } else {
+    target_rotation = runtime_angle_to_player(state, object);
+    if (runtime_abs_rotation_delta(object->rotation, target_rotation) < 16) {
+      object->rotation = target_rotation;
+      object->logic_state = GLOOM_OBJECT_LOGIC_DEATHCHARGE;
+      return;
+    }
+  }
+
+  object->rotation = (int16_t)((object->rotation + (int16_t)object->delay) & 255);
+}
+
+static void runtime_monstermove(AppState *state, RuntimeObjectState *object, const ObjectCombatDefinition *combat,
+                                float step_scale) {
+  float move = 0.0f;
+
+  if (state == NULL || object == NULL || combat == NULL) {
+    return;
+  }
+
+  object->old_rotation = object->rotation;
+  move = object->move_speed * step_scale;
+  if (!runtime_object_checkvecs(state, object, move)) {
+    (void)runtime_object_monsterfix(state, object, move);
+  }
+  runtime_advance_monster_frame(object, object->frame_speed_fixed, step_scale);
+}
+
+static void update_terra_object(AppState *state, RuntimeObjectState *object, const ObjectCombatDefinition *combat,
+                                float step_scale) {
+  if (state == NULL || object == NULL || combat == NULL) {
+    return;
+  }
+
+  if (object->logic_state == GLOOM_OBJECT_LOGIC_TERRAFIRE) {
+    object->delay -= step_scale;
+    if (object->delay > 0.0f) {
+      return;
+    }
+
+    object->delay = 12.0f;
+    object->rotation = runtime_angle_to_player(state, object);
+    (void)spawn_enemy_projectile_params(state, object, 3u, 1, 3, 16.0f, -60.0f);
+    object->delay2 -= 1.0f;
+    if (object->delay2 <= 0.0f) {
+      runtime_set_random_delay(state, object, combat);
+      object->logic_state = GLOOM_OBJECT_LOGIC_NORMAL;
+    }
+    return;
+  }
+
+  object->old_rotation = object->rotation;
+  object->delay -= step_scale;
+  if (object->delay <= 0.0f) {
+    object->frame_fixed = 0u;
+    object->delay = 1.0f;
+    object->delay2 = 5.0f;
+    object->logic_state = GLOOM_OBJECT_LOGIC_TERRAFIRE;
+    return;
+  }
+
+  runtime_monstermove(state, object, combat, step_scale);
+}
+
+static void update_ghoul_object(AppState *state, RuntimeObjectState *object, const ObjectCombatDefinition *combat,
+                                float step_scale) {
+  float dir_x = 0.0f;
+  float dir_z = 0.0f;
+
+  if (state == NULL || object == NULL || combat == NULL) {
+    return;
+  }
+
+  object->bounce_phase += 8.0f * step_scale;
+  while (object->bounce_phase >= 256.0f) {
+    object->bounce_phase -= 256.0f;
+  }
+  object->y = -32.0f + SDL_sinf(amiga_rotation_to_radians((int16_t)round_float_to_int32(object->bounce_phase))) * 32.0f;
+  object->rotation = runtime_angle_to_player(state, object);
+
+  object->delay -= step_scale;
+  if (object->delay <= 0.0f) {
+    object->frame_fixed = 1u << 16;
+    object->frame_speed_fixed = 0x2000;
+    (void)spawn_enemy_projectile_params(state, object, 1u, 1, 3, 20.0f, -64.0f);
+    runtime_set_random_delay(state, object, combat);
+  }
+
+  if (runtime_random_word(state) < (uint16_t)((uint16_t)object->move_speed << 8u)) {
+    runtime_object_dir(object->rotation, &dir_x, &dir_z);
+    object->vx = dir_x * object->move_speed;
+    object->vz = dir_z * object->move_speed;
+  }
+  object->x += object->vx * step_scale;
+  object->z += object->vz * step_scale;
+
+  if (object->frame_speed_fixed != 0) {
+    runtime_advance_monster_frame(object, object->frame_speed_fixed, step_scale);
+    if ((object->frame_fixed >> 16u) >= 3u) {
+      object->frame_fixed = 0u;
+      object->frame_speed_fixed = 0;
+    }
+  }
+}
+
+static void update_phantom_object(AppState *state, RuntimeObjectState *object, const ObjectCombatDefinition *combat,
+                                  float step_scale) {
+  if (state == NULL || object == NULL || combat == NULL) {
+    return;
+  }
+
+  object->old_rotation = object->rotation;
+  object->delay -= step_scale;
+  if (object->delay <= 0.0f) {
+    object->rotation = runtime_angle_to_player(state, object);
+    object->pause_delay = 7.0f;
+    object->frame_fixed = 5u << 16;
+    (void)spawn_enemy_projectile_params(state, object, 2u, 1, 3, 20.0f, -60.0f);
+    return;
+  }
+
+  runtime_monstermove(state, object, combat, step_scale);
+}
+
+static int16_t demon_wtable_scaled_damage(uint8_t weapon_index) {
+  const WeaponDefinition *weapons = weapon_definitions();
+
+  if (weapon_index >= (uint8_t)GLOOM_WEAPON_COUNT) {
+    return 0;
+  }
+  return (int16_t)(((int32_t)weapons[weapon_index].damage * 0xc000) >> 16);
+}
+
+static void update_demon_object(AppState *state, RuntimeObjectState *object, const ObjectCombatDefinition *combat,
+                                float step_scale) {
+  if (state == NULL || object == NULL || combat == NULL) {
+    return;
+  }
+
+  if (object->logic_state == GLOOM_OBJECT_LOGIC_DEMONPAUSE) {
+    const WeaponDefinition *weapons = weapon_definitions();
+    int delay_whole = (int)SDL_ceilf(object->delay);
+
+    object->frame_fixed = (delay_whole & 4) != 0 ? (5u << 16) : 0u;
+    if ((delay_whole & 7) == 7 && delay_whole != (int)object->delay2) {
+      uint8_t weapon_index = (uint8_t)((delay_whole >> 3) & 7);
+
+      if (weapon_index < (uint8_t)GLOOM_WEAPON_COUNT) {
+        (void)spawn_enemy_projectile_params(state, object, weapon_index, weapons[weapon_index].hitpoints,
+                                            demon_wtable_scaled_damage(weapon_index), (float)weapons[weapon_index].speed,
+                                            -90.0f);
+      }
+      object->delay2 = (float)delay_whole;
+    }
+
+    object->delay -= step_scale;
+    if (object->delay <= 0.0f) {
+      runtime_set_random_delay(state, object, combat);
+      object->logic_state = GLOOM_OBJECT_LOGIC_NORMAL;
+    }
+    return;
+  }
+
+  object->old_rotation = object->rotation;
+  object->delay -= step_scale;
+  if (object->delay <= 0.0f) {
+    object->rotation = runtime_angle_to_player(state, object);
+    object->delay = 39.0f;
+    object->delay2 = -1.0f;
+    object->logic_state = GLOOM_OBJECT_LOGIC_DEMONPAUSE;
+    return;
+  }
+
+  runtime_monstermove(state, object, combat, step_scale);
+}
+
+static void update_special_projectile_object(AppState *state, RuntimeObjectState *object,
+                                             const ObjectCombatDefinition *combat, int16_t object_type,
+                                             float step_scale) {
+  switch (object_type) {
+    case GLOOM_OBJECT_TYPE_TERRA:
+      update_terra_object(state, object, combat, step_scale);
+      return;
+    case GLOOM_OBJECT_TYPE_GHOUL:
+      update_ghoul_object(state, object, combat, step_scale);
+      return;
+    case GLOOM_OBJECT_TYPE_PHANTOM:
+      update_phantom_object(state, object, combat, step_scale);
+      return;
+    case GLOOM_OBJECT_TYPE_DEMON:
+      update_demon_object(state, object, combat, step_scale);
+      return;
+    default:
+      return;
+  }
+}
+
+static int16_t runtime_get_object_rot_speed(AppState *state, RuntimeObjectState *object) {
+  int16_t rot_speed = 0;
+
+  if (state == NULL || object == NULL) {
+    return 0;
+  }
+
+  rot_speed = object->rot_speed;
+  if (rot_speed == 0) {
+    rot_speed = (runtime_random_word(state) & 1u) != 0u ? 4 : -4;
+    object->rot_speed = rot_speed;
+  }
+  return rot_speed;
+}
+
+static void update_dragon_object(AppState *state, RuntimeObjectState *object, const ObjectCombatDefinition *combat,
+                                 float step_scale) {
+  float move = 0.0f;
+  int16_t target_rotation = 0;
+  int16_t near_threshold = 0;
+
+  if (state == NULL || object == NULL || combat == NULL) {
+    return;
+  }
+
+  runtime_advance_monster_frame(object, object->frame_speed_fixed, step_scale);
+
+  object->delay -= step_scale;
+  if (object->delay < 0.0f) {
+    int delay_whole = (int)SDL_floorf(object->delay);
+
+    if (delay_whole <= -128) {
+      object->delay = 47.0f;
+    } else if ((delay_whole & 7) == 0 && delay_whole != (int)object->delay2) {
+      (void)spawn_enemy_projectile_params_ex(state, object, 4u, 1, 3, 16.0f, -144.0f, true);
+      object->delay2 = (float)delay_whole;
+    }
+  }
+
+  move = object->move_speed * step_scale;
+  if (!runtime_object_checkvecs(state, object, move)) {
+    object->rotation = (int16_t)((object->rotation + runtime_get_object_rot_speed(state, object) * 4) & 255);
+    return;
+  }
+
+  target_rotation = runtime_angle_to_player(state, object);
+  near_threshold = object->rot_speed != 0 ? 6 : 24;
+  if (runtime_abs_rotation_delta(object->rotation, target_rotation) >= near_threshold) {
+    object->rotation = (int16_t)((object->rotation + runtime_get_object_rot_speed(state, object)) & 255);
+    return;
+  }
+
+  if (object->rot_speed != 0) {
+    object->rot_speed = 0;
+  }
+}
+
+static bool spawn_enemy_projectile(AppState *state, const RuntimeObjectState *object,
+                                   const ObjectCombatDefinition *combat) {
+  if (state == NULL || object == NULL || combat == NULL || combat->ranged_weapon >= (uint8_t)GLOOM_WEAPON_COUNT ||
+      combat->projectile_speed <= 0.0f) {
+    return false;
+  }
+
+  return spawn_enemy_projectile_params(state, object, combat->ranged_weapon, 1, combat->ranged_damage,
+                                       combat->projectile_speed, -60.0f);
+}
+
+static bool spawn_enemy_projectile_params(AppState *state, const RuntimeObjectState *object, uint8_t weapon_index,
+                                          int16_t hitpoints, int16_t damage, float speed, float y_offset) {
+  return spawn_enemy_projectile_params_ex(state, object, weapon_index, hitpoints, damage, speed, y_offset, false);
+}
+
+static bool spawn_enemy_projectile_params_ex(AppState *state, const RuntimeObjectState *object, uint8_t weapon_index,
+                                             int16_t hitpoints, int16_t damage, float speed, float y_offset,
+                                             bool homing) {
+  size_t i = 0u;
+  float dir_x = 0.0f;
+  float dir_z = 0.0f;
+
+  if (state == NULL || object == NULL || weapon_index >= (uint8_t)GLOOM_WEAPON_COUNT || hitpoints <= 0 ||
+      damage < 0 || speed <= 0.0f) {
+    return false;
+  }
+
+  runtime_object_dir(object->rotation, &dir_x, &dir_z);
+
+  for (i = 0u; i < GLOOM_MAX_RUNTIME_PROJECTILES; ++i) {
+    RuntimeProjectile *projectile = &state->projectiles[i];
+
+    if (projectile->active) {
+      continue;
+    }
+
+    memset(projectile, 0, sizeof(*projectile));
+    projectile->active = true;
+    projectile->weapon_index = weapon_index;
+    projectile->enemy = true;
+    projectile->homing = homing;
+    projectile->x = object->x;
+    projectile->y = object->y + y_offset;
+    projectile->z = object->z;
+    projectile->vx = dir_x * speed;
+    projectile->vz = dir_z * speed;
+    projectile->hitpoints = hitpoints;
+    projectile->damage = damage;
+    return true;
+  }
+
+  return false;
+}
+
+static void update_runtime_objects(AppState *state) {
+  float step_scale = fixed_step_amiga_scale();
+  size_t i = 0u;
+  size_t count = 0u;
+
+  if (state == NULL) {
+    return;
+  }
+
+  if (state->dragon_dead_delay > 0.0f) {
+    state->dragon_dead_delay -= step_scale;
+    if (state->dragon_dead_delay <= 0.0f && !state->dragon_finished_reported) {
+      fprintf(stderr, "Cannot complete dragondead: original finished=3 end flow is not ported\n");
+      state->dragon_finished_reported = true;
+      state->dragon_dead_delay = 0.0f;
+    }
+  }
+
+  if (state->player_dead || state->player_hitpoints <= 0) {
+    return;
+  }
+
+  count = state->map.object_spawn_count;
+  if (count > (size_t)GLOOM_MAX_RUNTIME_OBJECTS) {
+    count = (size_t)GLOOM_MAX_RUNTIME_OBJECTS;
+  }
+
+  for (i = 0u; i < count; ++i) {
+    const GloomObjectSpawn *spawn = &state->map.object_spawns[i];
+    RuntimeObjectState *object = &state->objects[i];
+    const ObjectCombatDefinition *combat = object_type_combat_definition(spawn->object_type);
+    bool uses_monsterlogic = object_type_uses_monsterlogic(spawn->object_type);
+    bool uses_baldy_family_logic = object_type_uses_baldy_family_logic(spawn->object_type);
+    bool uses_special_projectile_logic = object_type_uses_special_projectile_logic(spawn->object_type);
+
+    if (!object->active || !object->enemy) {
+      continue;
+    }
+
+    if (object->hurt_pause > 0.0f) {
+      object->hurt_pause -= step_scale;
+      if (object->hurt_pause <= 0.0f) {
+        object->hurt_pause = 0.0f;
+        object->frame_fixed = 0u;
+      }
+      continue;
+    }
+    if (object->pause_delay > 0.0f) {
+      object->pause_delay -= step_scale;
+      if (object->pause_delay > 0.0f) {
+        continue;
+      }
+      object->pause_delay = 0.0f;
+      if (combat != NULL && combat->delay_range > 0u) {
+        int16_t target_rotation = runtime_angle_to_player(state, object);
+        int16_t player_rotation = (int16_t)((state->player_rot_fixed >> 16) & 255);
+        int16_t diff = (int16_t)(player_rotation - target_rotation);
+
+        object->delay = (float)combat->base_delay + (float)(runtime_random_word(state) % combat->delay_range);
+        if (diff < 0) {
+          diff = (int16_t)-diff;
+        }
+        if (diff >= 64 && diff < 192) {
+          object->rotation = object->old_rotation;
+        }
+      }
+      continue;
+    }
+
+    if (spawn->object_type == GLOOM_OBJECT_TYPE_DRAGON && combat != NULL) {
+      update_dragon_object(state, object, combat, step_scale);
+      continue;
+    }
+
+    if (spawn->object_type == GLOOM_OBJECT_TYPE_DEATHHEAD && combat != NULL) {
+      update_deathhead_object(state, object, combat, step_scale);
+      continue;
+    }
+
+    if (uses_special_projectile_logic && combat != NULL) {
+      update_special_projectile_object(state, object, combat, spawn->object_type, step_scale);
+      continue;
+    }
+
+    if (object->delay > 0.0f) {
+      object->delay -= step_scale;
+      if (object->delay < 0.0f) {
+        object->delay = 0.0f;
+      }
+    }
+
+    if (uses_baldy_family_logic && combat != NULL) {
+      update_baldy_family_object(state, object, combat, spawn->object_type, step_scale);
+      continue;
+    }
+
+    if (uses_monsterlogic && combat != NULL && combat->uses_fire1 && object->hurt_pause <= 0.0f &&
+        object->delay <= 0.0f) {
+      int16_t aim_noise = (int16_t)((runtime_random_word(state) & 31u) - 16u);
+
+      object->old_rotation = object->rotation;
+      object->rotation = (int16_t)((runtime_angle_to_player(state, object) + aim_noise) & 255);
+      (void)spawn_enemy_projectile(state, object, combat);
+      object->pause_delay = 7.0f;
+      object->frame_fixed = 0u;
+      continue;
+    }
+
+    if (uses_monsterlogic && object->hurt_pause <= 0.0f) {
+      float move = object->move_speed * step_scale;
+
+      object->old_rotation = object->rotation;
+      if (!runtime_object_checkvecs(state, object, move)) {
+        (void)runtime_object_monsterfix(state, object, move);
+      }
+      if (combat != NULL) {
+        runtime_advance_monster_frame(object, object->frame_speed_fixed, step_scale);
+      }
+    }
+  }
+}
+
+static float distance_sq_point_to_segment(float px, float pz, float ax, float az, float bx, float bz) {
+  float abx = bx - ax;
+  float abz = bz - az;
+  float apx = px - ax;
+  float apz = pz - az;
+  float len_sq = abx * abx + abz * abz;
+  float t = 0.0f;
+  float dx = 0.0f;
+  float dz = 0.0f;
+
+  if (len_sq > 0.0001f) {
+    t = (apx * abx + apz * abz) / len_sq;
+    t = clampf(t, 0.0f, 1.0f);
+  }
+
+  dx = px - (ax + abx * t);
+  dz = pz - (az + abz * t);
+  return dx * dx + dz * dz;
+}
+
+static bool damage_projectile_enemy(AppState *state, const ObjectVisualSet *object_visuals, RuntimeProjectile *projectile,
+                                    float prev_x, float prev_z) {
+  size_t i = 0u;
+  size_t count = 0u;
+
+  if (state == NULL || projectile == NULL) {
+    return false;
+  }
+
+  count = state->map.object_spawn_count;
+  if (count > (size_t)GLOOM_MAX_RUNTIME_OBJECTS) {
+    count = (size_t)GLOOM_MAX_RUNTIME_OBJECTS;
+  }
+
+  for (i = 0u; i < count; ++i) {
+    const GloomObjectSpawn *spawn = &state->map.object_spawns[i];
+    RuntimeObjectState *object = &state->objects[i];
+    const ObjectVisual *visual = NULL;
+    const ObjectCombatDefinition *combat = NULL;
+    float radius = 48.0f;
+    float hit_radius = 0.0f;
+    float hit_radius_sq = 0.0f;
+    float enemy_x = 0.0f;
+    float enemy_z = 0.0f;
+    bool hit = false;
+
+    if (!object->active || !object->enemy) {
+      continue;
+    }
+
+    if (spawn->object_type < 0 || spawn->object_type >= (int16_t)GLOOM_OBJECT_TYPE_COUNT) {
+      continue;
+    }
+    combat = object_type_combat_definition(spawn->object_type);
+
+    if (object_visuals != NULL) {
+      visual = &object_visuals->visuals[spawn->object_type];
+      if (visual->loaded && visual->collision_radius > 0u) {
+        radius = ((float)visual->collision_radius * (float)visual->scale) / 512.0f;
+      }
+    }
+
+    enemy_x = object->x;
+    enemy_z = object->z;
+    hit_radius = radius + (float)GLOOM_PROJECTILE_RADIUS;
+    hit_radius_sq = hit_radius * hit_radius;
+
+    hit = distance_sq_point_to_segment(enemy_x, enemy_z, prev_x, prev_z, projectile->x, projectile->z) <= hit_radius_sq;
+    if (!hit && projectile->barrel_origin) {
+      hit = distance_sq_point_to_segment(enemy_x, enemy_z, projectile->player_origin_x, projectile->player_origin_z,
+                                         projectile->x, projectile->z) <= hit_radius_sq;
+    }
+
+    if (!hit) {
+      continue;
+    }
+
+    if (combat == NULL) {
+      return true;
+    }
+
+    object->hitpoints -= projectile->damage;
+    if (object->hitpoints <= 0) {
+      if (combat->death_routine == GLOOM_OBJECT_DIE_BLOWDRAGON) {
+        runtime_blowdragon(state, object, combat, object_visuals, spawn->object_type);
+      } else if (combat->death_routine == GLOOM_OBJECT_DIE_BLOWOBJECT ||
+                 combat->death_routine == GLOOM_OBJECT_DIE_BLOWQUICK ||
+                 combat->death_routine == GLOOM_OBJECT_DIE_BLOWDEATH ||
+                 combat->death_routine == GLOOM_OBJECT_DIE_BLOWTERRA) {
+        runtime_blowobject(state, object, combat, object_visuals, spawn->object_type);
+      } else {
+        fprintf(stderr, "Cannot kill object type %d: original death routine is not represented in the PC runtime\n",
+                spawn->object_type);
+      }
+    } else {
+      runtime_apply_object_hit(state, object, combat, spawn->object_type, (uint16_t)i);
+    }
+
+    return true;
+  }
+
+  return false;
+}
+
+static bool damage_projectile_player(AppState *state, RuntimeProjectile *projectile, float prev_x, float prev_z) {
+  float hit_radius = 0.0f;
+
+  if (state == NULL || projectile == NULL || state->player_dead || state->player_hitpoints <= 0) {
+    return false;
+  }
+
+  hit_radius = (float)state->player_radius + (float)GLOOM_PROJECTILE_RADIUS;
+  if (distance_sq_point_to_segment(state->camera_x, state->camera_z, prev_x, prev_z, projectile->x, projectile->z) >
+      hit_radius * hit_radius) {
+    return false;
+  }
+
+  state->player_hitpoints -= projectile->damage;
+  if (state->player_hitpoints < 0) {
+    state->player_hitpoints = 0;
+  }
+  if (state->player_hitpoints == 0) {
+    state->player_dead = true;
+  }
+  spawn_runtime_sparks(state, projectile->weapon_index, state->camera_x, (float)GLOOM_PLAYER_FIRE_Y, state->camera_z);
+  return true;
+}
+
+static void update_homing_projectile_velocity(AppState *state, RuntimeProjectile *projectile, float step_scale) {
+  float dx = 0.0f;
+  float dz = 0.0f;
+  float len = 0.0f;
+
+  if (state == NULL || projectile == NULL || !projectile->homing) {
+    return;
+  }
+
+  dx = state->camera_x - projectile->x;
+  dz = state->camera_z - projectile->z;
+  len = SDL_sqrtf(dx * dx + dz * dz);
+  if (len <= 0.0001f) {
+    return;
+  }
+
+  projectile->vx += (dx / len) * step_scale;
+  projectile->vz += (dz / len) * step_scale;
+  if (SDL_fabsf(projectile->vx) >= 32.0f) {
+    projectile->vx -= (dx / len) * step_scale;
+  }
+  if (SDL_fabsf(projectile->vz) >= 32.0f) {
+    projectile->vz -= (dz / len) * step_scale;
   }
 }
 
@@ -2597,7 +4131,7 @@ static bool spawn_player_projectile(AppState *state, uint8_t weapon_index) {
   return false;
 }
 
-static void update_projectiles(AppState *state) {
+static void update_projectiles(AppState *state, const ObjectVisualSet *object_visuals) {
   float step_scale = fixed_step_amiga_scale();
   size_t i = 0u;
 
@@ -2609,14 +4143,28 @@ static void update_projectiles(AppState *state) {
     RuntimeProjectile *projectile = &state->projectiles[i];
     uint16_t penetration = 0u;
     size_t zone_index = 0u;
+    float prev_x = 0.0f;
+    float prev_z = 0.0f;
 
     if (!projectile->active) {
       continue;
     }
 
+    prev_x = projectile->x;
+    prev_z = projectile->z;
     projectile->x += projectile->vx * step_scale;
     projectile->z += projectile->vz * step_scale;
     projectile->frame_phase += step_scale;
+
+    if (projectile->enemy && damage_projectile_player(state, projectile, prev_x, prev_z)) {
+      projectile->active = false;
+      continue;
+    }
+
+    if (!projectile->enemy && damage_projectile_enemy(state, object_visuals, projectile, prev_x, prev_z)) {
+      projectile->active = false;
+      continue;
+    }
 
     if (projectile->x < 0.0f || projectile->z < 0.0f || projectile->x > 32767.0f || projectile->z > 32767.0f) {
       projectile->active = false;
@@ -2629,7 +4177,10 @@ static void update_projectiles(AppState *state) {
       (void)zone_index;
       spawn_runtime_sparks(state, projectile->weapon_index, projectile->x, projectile->y, projectile->z);
       projectile->active = false;
+      continue;
     }
+
+    update_homing_projectile_velocity(state, projectile, step_scale);
   }
 }
 
@@ -2657,6 +4208,129 @@ static void update_sparks(AppState *state) {
     spark->x += spark->vx * step_scale;
     spark->y += spark->vy * step_scale;
     spark->z += spark->vz * step_scale;
+  }
+}
+
+static void update_blood(AppState *state) {
+  float step_scale = fixed_step_amiga_scale();
+  size_t i = 0u;
+
+  if (state == NULL) {
+    return;
+  }
+
+  for (i = 0u; i < GLOOM_MAX_RUNTIME_BLOOD; ++i) {
+    RuntimeBlood *blood = &state->blood[i];
+
+    if (!blood->active) {
+      continue;
+    }
+
+    if (blood->soul) {
+      uint16_t target_index = (uint16_t)blood->vy;
+      RuntimeObjectState *target = NULL;
+      float dx = 0.0f;
+      float dz = 0.0f;
+
+      if (!state->death_suck_active || target_index >= (uint16_t)GLOOM_MAX_RUNTIME_OBJECTS) {
+        blood->active = false;
+        continue;
+      }
+      target = &state->objects[target_index];
+      if (!target->active || target->logic_state != GLOOM_OBJECT_LOGIC_DEATHSUCK) {
+        blood->active = false;
+        continue;
+      }
+
+      blood->x += blood->vx * step_scale;
+      blood->z += blood->vz * step_scale;
+      dx = blood->x - target->x;
+      dz = blood->z - target->z;
+      if ((dx * dx + dz * dz) < (64.0f * 64.0f)) {
+        blood->active = false;
+      }
+      continue;
+    }
+
+    blood->vy += 0.5f * step_scale;
+    blood->y += blood->vy * step_scale;
+    if (blood->y >= 0.0f) {
+      blood->active = false;
+      continue;
+    }
+
+    blood->x += blood->vx * step_scale;
+    blood->z += blood->vz * step_scale;
+  }
+}
+
+static void spawn_runtime_gore(AppState *state, const RuntimeChunk *chunk) {
+  RuntimeGore *gore = NULL;
+  size_t i = 0u;
+
+  if (state == NULL || chunk == NULL || chunk->object_type < 0 ||
+      chunk->object_type >= (int16_t)GLOOM_OBJECT_TYPE_COUNT) {
+    return;
+  }
+
+  for (i = 0u; i < GLOOM_MAX_RUNTIME_GORE; ++i) {
+    if (!state->gore[i].active) {
+      gore = &state->gore[i];
+      break;
+    }
+  }
+
+  if (gore == NULL) {
+    gore = &state->gore[state->gore_write_index % (uint16_t)GLOOM_MAX_RUNTIME_GORE];
+    state->gore_write_index = (uint16_t)((state->gore_write_index + 1u) % (uint16_t)GLOOM_MAX_RUNTIME_GORE);
+  }
+
+  memset(gore, 0, sizeof(*gore));
+  gore->active = true;
+  gore->object_type = chunk->object_type;
+  gore->frame_number = chunk->frame_number;
+  gore->x = chunk->x;
+  gore->z = chunk->z;
+}
+
+static void update_chunks(AppState *state) {
+  float step_scale = fixed_step_amiga_scale();
+  size_t i = 0u;
+
+  if (state == NULL) {
+    return;
+  }
+
+  for (i = 0u; i < GLOOM_MAX_RUNTIME_CHUNKS; ++i) {
+    RuntimeChunk *chunk = &state->chunks[i];
+    float new_x = 0.0f;
+    float new_z = 0.0f;
+
+    if (!chunk->active) {
+      continue;
+    }
+
+    chunk->vy += 0.5f * step_scale;
+    chunk->y += chunk->vy * step_scale;
+    if (chunk->y >= 0.0f) {
+      if (state->violence_mode != GLOOM_VIOLENCE_MEATY) {
+        spawn_runtime_gore(state, chunk);
+      }
+      chunk->active = false;
+      continue;
+    }
+
+    new_x = chunk->x + chunk->vx * step_scale;
+    new_z = chunk->z + chunk->vz * step_scale;
+    if (state->violence_mode == GLOOM_VIOLENCE_MESSY && chunk->radius > 0 &&
+        !resolve_wall_collision_radius(state, &new_x, &new_z, chunk->radius)) {
+      chunk->vx = 0.0f;
+      chunk->vz = 0.0f;
+      continue;
+    }
+
+    chunk->x = new_x;
+    chunk->z = new_z;
   }
 }
 
@@ -2698,14 +4372,17 @@ static void update_player_weapon(AppState *state, const PlayerControls *controls
   state->player_last_fire = true;
 }
 
-static void update(AppState *state, const uint8_t *keyboard) {
+static void update(AppState *state, const uint8_t *keyboard, const ObjectVisualSet *object_visuals) {
   PlayerControls controls;
 
   state->tick_count += 1;
   update_rotpolys(state);
   update_doors(state);
-  update_projectiles(state);
+  update_runtime_objects(state);
+  update_projectiles(state, object_visuals);
   update_sparks(state);
+  update_blood(state);
+  update_chunks(state);
 
   if (state->teleport_active) {
     if (state->teleport_ticks > 0u) {
@@ -2736,6 +4413,13 @@ static void update(AppState *state, const uint8_t *keyboard) {
   }
 
   check_event_triggers(state);
+
+  if (state->player_dead || state->player_hitpoints <= 0) {
+    state->player_dead = true;
+    settle_player_bounce(state);
+    update_player_camera_y(state);
+    return;
+  }
 
   controls = read_modern_player_controls(keyboard);
   update_player_keyboard_rotation(state, &controls);
@@ -2899,6 +4583,17 @@ static uint32_t apply_amiga_depth_argb(uint32_t argb, float depth) {
   if (b < 0) b = 0;
 
   return ((uint32_t)alpha << 24u) | ((uint32_t)r << 16u) | ((uint32_t)g << 8u) | (uint32_t)b;
+}
+
+static uint32_t amiga_blood_argb(uint16_t color_mask, float depth) {
+  static const uint16_t blcols[16] = {0x0cccu, 0x0bbbu, 0x0aaau, 0x0999u, 0x0888u, 0x0777u, 0x0666u, 0x0555u,
+                                     0x0444u, 0x0333u, 0x0222u, 0x0111u, 0x0111u, 0x0111u, 0x0111u, 0x0111u};
+  uint16_t color = (uint16_t)(blcols[amiga_depth_dark_index(depth)] & color_mask & 0x0fffu);
+  uint8_t r = (uint8_t)(((color >> 8u) & 0x0fu) * 17u);
+  uint8_t g = (uint8_t)(((color >> 4u) & 0x0fu) * 17u);
+  uint8_t b = (uint8_t)((color & 0x0fu) * 17u);
+
+  return 0xff000000u | ((uint32_t)r << 16u) | ((uint32_t)g << 8u) | (uint32_t)b;
 }
 
 static bool clip_segment_halfspace(float *x1, float *z1, float *x2, float *z2, float a, float b) {
@@ -3243,10 +4938,10 @@ static bool find_player_wall_collision(const AppState *state, float x, float z, 
   return find_wall_collision_radius(state, x, z, state->player_radius, out_penetration, out_zone_index);
 }
 
-static bool resolve_player_wall_collision(AppState *state, float *x, float *z) {
+static bool resolve_wall_collision_radius(AppState *state, float *x, float *z, int16_t radius) {
   int attempt = 0;
 
-  if (state == NULL || x == NULL || z == NULL) {
+  if (state == NULL || x == NULL || z == NULL || radius <= 0) {
     return false;
   }
 
@@ -3257,7 +4952,7 @@ static bool resolve_player_wall_collision(AppState *state, float *x, float *z) {
     float push_x = 0.0f;
     float push_z = 0.0f;
 
-    if (!find_player_wall_collision(state, *x, *z, &penetration, &zone_index)) {
+    if (!find_wall_collision_radius(state, *x, *z, radius, &penetration, &zone_index)) {
       return true;
     }
 
@@ -3273,6 +4968,14 @@ static bool resolve_player_wall_collision(AppState *state, float *x, float *z) {
   }
 
   return false;
+}
+
+static bool resolve_player_wall_collision(AppState *state, float *x, float *z) {
+  if (state == NULL) {
+    return false;
+  }
+
+  return resolve_wall_collision_radius(state, x, z, state->player_radius);
 }
 
 static void recalculate_zone_vectors(GloomZone *zone) {
@@ -4072,10 +5775,12 @@ static void render_wall_debug(SDL_Renderer *renderer, const AppState *state, con
   if (state->map.object_spawn_count > 0u && object_visuals != NULL) {
     for (i = 0; i < state->map.object_spawn_count && sprite_write < GLOOM_MAX_DEBUG_SPRITES; ++i) {
       const GloomObjectSpawn *spawn = &state->map.object_spawns[i];
+      GloomObjectSpawn render_spawn;
       const ObjectVisual *visual = NULL;
       const ObjectFrame *frame = NULL;
-      float wx = (float)spawn->x;
-      float wz = (float)spawn->z;
+      const RuntimeObjectState *object = i < (size_t)GLOOM_MAX_RUNTIME_OBJECTS ? &state->objects[i] : NULL;
+      float wx = object != NULL && object->active ? object->x : (float)spawn->x;
+      float wz = object != NULL && object->active ? object->z : (float)spawn->z;
       float dx = wx - cam_x;
       float dz = wz - cam_z;
       float svx = dx * view_cos - dz * view_sin;
@@ -4090,6 +5795,10 @@ static void render_wall_debug(SDL_Renderer *renderer, const AppState *state, con
         continue;
       }
 
+      if (object != NULL && object->enemy && !object->active) {
+        continue;
+      }
+
       if (spawn->object_type < 0 || spawn->object_type >= (int16_t)GLOOM_OBJECT_TYPE_COUNT) {
         continue;
       }
@@ -4099,7 +5808,21 @@ static void render_wall_debug(SDL_Renderer *renderer, const AppState *state, con
         continue;
       }
 
-      frame = select_object_visual_frame(visual, spawn, state);
+      render_spawn = *spawn;
+      if (object != NULL && object->active) {
+        render_spawn.x = clamp_int16(round_float_to_int32(object->x));
+        render_spawn.y = clamp_int16(round_float_to_int32(object->y));
+        render_spawn.z = clamp_int16(round_float_to_int32(object->z));
+        render_spawn.rotation = object->rotation;
+      }
+
+      if (object != NULL && object->active && object->enemy) {
+        size_t frame_number = (size_t)(object->frame_fixed >> 16u);
+
+        frame = select_object_visual_frame_number(visual, &render_spawn, state, frame_number);
+      } else {
+        frame = select_object_visual_frame(visual, &render_spawn, state);
+      }
       if (frame == NULL || frame->width <= 0 || frame->height <= 0) {
         continue;
       }
@@ -4107,7 +5830,7 @@ static void render_wall_debug(SDL_Renderer *renderer, const AppState *state, con
       if (svz >= near_plane && svz < far_depth && SDL_fabsf(svx) <= svz * frustum_ratio * 1.1f) {
         DebugSprite *sp = &debug_sprites[sprite_write];
 
-        object_y = (float)spawn->y - camera_y;
+        object_y = (float)render_spawn.y - camera_y;
         scale = (float)visual->scale / 256.0f;
         top_view_y = object_y - ((float)frame->handle_y * scale);
         left_view_x = svx - ((float)frame->handle_x * scale);
@@ -4234,6 +5957,156 @@ static void render_wall_debug(SDL_Renderer *renderer, const AppState *state, con
         sprite_write += 1u;
       }
     }
+  }
+
+  if (object_visuals != NULL) {
+    for (i = 0u; i < GLOOM_MAX_RUNTIME_GORE && sprite_write < GLOOM_MAX_DEBUG_SPRITES; ++i) {
+      const RuntimeGore *gore = &state->gore[i];
+      const ObjectVisual *visual = NULL;
+      const ObjectFrame *frame = NULL;
+      float dx = 0.0f;
+      float dz = 0.0f;
+      float svx = 0.0f;
+      float svz = 0.0f;
+      float object_y = 0.0f;
+      float scale = 1.0f;
+      float top_view_y = 0.0f;
+      float left_view_x = 0.0f;
+      size_t frame_index = 0u;
+
+      if (!gore->active || gore->object_type < 0 || gore->object_type >= (int16_t)GLOOM_OBJECT_TYPE_COUNT) {
+        continue;
+      }
+
+      visual = &object_visuals->chunks[gore->object_type];
+      if (!visual->loaded || visual->frame_count == 0u) {
+        continue;
+      }
+
+      frame_index = (size_t)(gore->frame_number % (uint16_t)visual->frame_count);
+      frame = &visual->frames[frame_index];
+      if (frame->width <= 0 || frame->height <= 0) {
+        continue;
+      }
+
+      dx = gore->x - cam_x;
+      dz = gore->z - cam_z;
+      svx = dx * view_cos - dz * view_sin;
+      svz = dx * view_sin + dz * view_cos;
+      if (svz < near_plane || svz >= far_depth || SDL_fabsf(svx) > svz * frustum_ratio * 1.1f) {
+        continue;
+      }
+
+      object_y = -state->camera_y;
+      scale = 0x0200u / 256.0f;
+      top_view_y = object_y - ((float)frame->handle_y * scale);
+      left_view_x = svx - ((float)frame->handle_x * scale);
+
+      debug_sprites[sprite_write].screen_x = (float)x + (float)w * 0.5f + (left_view_x / svz) * focal;
+      debug_sprites[sprite_write].screen_y = (float)horizon_y + (top_view_y / svz) * focal;
+      debug_sprites[sprite_write].screen_w = ((float)frame->width * scale * focal) / svz;
+      debug_sprites[sprite_write].screen_h = ((float)frame->height * scale * focal) / svz;
+      debug_sprites[sprite_write].depth = svz;
+      debug_sprites[sprite_write].frame = frame;
+
+      if (debug_sprites[sprite_write].screen_w >= 1.0f && debug_sprites[sprite_write].screen_h >= 1.0f) {
+        sprite_write += 1u;
+      }
+    }
+
+    for (i = 0u; i < GLOOM_MAX_RUNTIME_CHUNKS && sprite_write < GLOOM_MAX_DEBUG_SPRITES; ++i) {
+      const RuntimeChunk *chunk = &state->chunks[i];
+      const ObjectVisual *visual = NULL;
+      const ObjectFrame *frame = NULL;
+      float dx = 0.0f;
+      float dz = 0.0f;
+      float svx = 0.0f;
+      float svz = 0.0f;
+      float object_y = 0.0f;
+      float scale = 1.0f;
+      float top_view_y = 0.0f;
+      float left_view_x = 0.0f;
+      size_t frame_index = 0u;
+
+      if (!chunk->active || chunk->object_type < 0 || chunk->object_type >= (int16_t)GLOOM_OBJECT_TYPE_COUNT) {
+        continue;
+      }
+
+      visual = &object_visuals->chunks[chunk->object_type];
+      if (!visual->loaded || visual->frame_count == 0u) {
+        continue;
+      }
+
+      frame_index = (size_t)(chunk->frame_number % (uint16_t)visual->frame_count);
+      frame = &visual->frames[frame_index];
+      if (frame->width <= 0 || frame->height <= 0) {
+        continue;
+      }
+
+      dx = chunk->x - cam_x;
+      dz = chunk->z - cam_z;
+      svx = dx * view_cos - dz * view_sin;
+      svz = dx * view_sin + dz * view_cos;
+      if (svz < near_plane || svz >= far_depth || SDL_fabsf(svx) > svz * frustum_ratio * 1.1f) {
+        continue;
+      }
+
+      object_y = chunk->y - state->camera_y;
+      scale = (float)chunk->scale / 256.0f;
+      top_view_y = object_y - ((float)frame->handle_y * scale);
+      left_view_x = svx - ((float)frame->handle_x * scale);
+
+      debug_sprites[sprite_write].screen_x = (float)x + (float)w * 0.5f + (left_view_x / svz) * focal;
+      debug_sprites[sprite_write].screen_y = (float)horizon_y + (top_view_y / svz) * focal;
+      debug_sprites[sprite_write].screen_w = ((float)frame->width * scale * focal) / svz;
+      debug_sprites[sprite_write].screen_h = ((float)frame->height * scale * focal) / svz;
+      debug_sprites[sprite_write].depth = svz;
+      debug_sprites[sprite_write].frame = frame;
+
+      if (debug_sprites[sprite_write].screen_w >= 1.0f && debug_sprites[sprite_write].screen_h >= 1.0f) {
+        sprite_write += 1u;
+      }
+    }
+  }
+
+  for (i = 0u; i < GLOOM_MAX_RUNTIME_BLOOD; ++i) {
+    const RuntimeBlood *blood = &state->blood[i];
+    float dx = 0.0f;
+    float dz = 0.0f;
+    float svx = 0.0f;
+    float svz = 0.0f;
+    float by = 0.0f;
+    int screen_x = 0;
+    int screen_y = 0;
+    uint32_t argb = 0;
+
+    if (!blood->active || blood->color_mask == 0u) {
+      continue;
+    }
+
+    dx = blood->x - cam_x;
+    dz = blood->z - cam_z;
+    svx = dx * view_cos - dz * view_sin;
+    svz = dx * view_sin + dz * view_cos;
+    if (svz <= 0.0f || svz >= far_depth) {
+      continue;
+    }
+
+    by = blood->y;
+    if (by > 0.0f) {
+      by = -by;
+    }
+    by -= state->camera_y;
+
+    screen_x = round_float_to_int32((float)x + (float)w * 0.5f + (svx / svz) * focal);
+    screen_y = round_float_to_int32((float)horizon_y + (by / svz) * focal);
+    if (screen_x < x || screen_x >= x + w || screen_y < y || screen_y >= y + h) {
+      continue;
+    }
+
+    argb = amiga_blood_argb(blood->color_mask, svz);
+    SDL_SetRenderDrawColor(renderer, (uint8_t)(argb >> 16u), (uint8_t)(argb >> 8u), (uint8_t)argb, 255);
+    SDL_RenderDrawPoint(renderer, screen_x, screen_y);
   }
 
   for (i = 0; i < (size_t)w; ++i) {
@@ -4724,11 +6597,265 @@ static AppState interpolate_render_state(const AppState *previous, const AppStat
         render_state.sparks[i].z = previous->sparks[i].z + ((current->sparks[i].z - previous->sparks[i].z) * alpha);
       }
     }
+
+    for (i = 0u; i < GLOOM_MAX_RUNTIME_BLOOD; ++i) {
+      if (previous->blood[i].active && current->blood[i].active &&
+          previous->blood[i].color_mask == current->blood[i].color_mask) {
+        render_state.blood[i].x = previous->blood[i].x + ((current->blood[i].x - previous->blood[i].x) * alpha);
+        render_state.blood[i].y = previous->blood[i].y + ((current->blood[i].y - previous->blood[i].y) * alpha);
+        render_state.blood[i].z = previous->blood[i].z + ((current->blood[i].z - previous->blood[i].z) * alpha);
+      }
+    }
+
+    for (i = 0u; i < GLOOM_MAX_RUNTIME_CHUNKS; ++i) {
+      if (previous->chunks[i].active && current->chunks[i].active &&
+          previous->chunks[i].object_type == current->chunks[i].object_type &&
+          previous->chunks[i].frame_number == current->chunks[i].frame_number) {
+        render_state.chunks[i].x = previous->chunks[i].x + ((current->chunks[i].x - previous->chunks[i].x) * alpha);
+        render_state.chunks[i].y = previous->chunks[i].y + ((current->chunks[i].y - previous->chunks[i].y) * alpha);
+        render_state.chunks[i].z = previous->chunks[i].z + ((current->chunks[i].z - previous->chunks[i].z) * alpha);
+      }
+    }
+
+    for (i = 0u; i < GLOOM_MAX_RUNTIME_OBJECTS; ++i) {
+      if (previous->objects[i].active && current->objects[i].active) {
+        render_state.objects[i].x =
+            previous->objects[i].x + ((current->objects[i].x - previous->objects[i].x) * alpha);
+        render_state.objects[i].y =
+            previous->objects[i].y + ((current->objects[i].y - previous->objects[i].y) * alpha);
+        render_state.objects[i].z =
+            previous->objects[i].z + ((current->objects[i].z - previous->objects[i].z) * alpha);
+      }
+    }
   }
 
   render_state.player_rot_fixed = current->player_rot_fixed;
   render_state.camera_angle = current->camera_angle;
   return render_state;
+}
+
+static bool combat_selftest_expect(bool condition, const char *message) {
+  if (!condition) {
+    fprintf(stderr, "Combat selftest failed: %s\n", message);
+    return false;
+  }
+  return true;
+}
+
+static size_t combat_selftest_active_projectile_count(const AppState *state) {
+  size_t count = 0u;
+  size_t i = 0u;
+
+  if (state == NULL) {
+    return 0u;
+  }
+
+  for (i = 0u; i < (size_t)GLOOM_MAX_RUNTIME_PROJECTILES; ++i) {
+    if (state->projectiles[i].active) {
+      count += 1u;
+    }
+  }
+  return count;
+}
+
+static const RuntimeProjectile *combat_selftest_last_projectile(const AppState *state) {
+  size_t i = 0u;
+
+  if (state == NULL) {
+    return NULL;
+  }
+
+  for (i = (size_t)GLOOM_MAX_RUNTIME_PROJECTILES; i > 0u; --i) {
+    const RuntimeProjectile *projectile = &state->projectiles[i - 1u];
+
+    if (projectile->active) {
+      return projectile;
+    }
+  }
+  return NULL;
+}
+
+static int run_combat_selftest(void) {
+  const WeaponDefinition *weapons = weapon_definitions();
+  const ObjectCombatDefinition *objects = object_combat_definitions();
+  const int16_t expected_weapon_hitpoints[GLOOM_WEAPON_COUNT] = {1, 5, 10, 15, 20};
+  const int16_t expected_weapon_damage[GLOOM_WEAPON_COUNT] = {1, 2, 2, 3, 5};
+  const int16_t expected_weapon_speed[GLOOM_WEAPON_COUNT] = {32, 36, 40, 40, 24};
+  AppState state;
+  RuntimeObjectState *deathhead = NULL;
+  const ObjectCombatDefinition *deathhead_combat = &objects[GLOOM_OBJECT_TYPE_DEATHHEAD];
+  size_t i = 0u;
+  size_t soul_count = 0u;
+  RuntimeObjectState test_object;
+  const RuntimeProjectile *projectile = NULL;
+
+  memset(&state, 0, sizeof(state));
+
+  for (i = 0u; i < (size_t)GLOOM_WEAPON_COUNT; ++i) {
+    char message[128];
+
+    (void)snprintf(message, sizeof(message), "wtable weapon %zu hitpoints", i + 1u);
+    if (!combat_selftest_expect(weapons[i].hitpoints == expected_weapon_hitpoints[i], message)) return 1;
+    (void)snprintf(message, sizeof(message), "wtable weapon %zu damage", i + 1u);
+    if (!combat_selftest_expect(weapons[i].damage == expected_weapon_damage[i], message)) return 1;
+    (void)snprintf(message, sizeof(message), "wtable weapon %zu speed", i + 1u);
+    if (!combat_selftest_expect(weapons[i].speed == expected_weapon_speed[i], message)) return 1;
+  }
+
+  if (!combat_selftest_expect(objects[GLOOM_OBJECT_TYPE_DRAGON].hitpoints == 250 &&
+                                  objects[GLOOM_OBJECT_TYPE_DRAGON].damage == 10,
+                              "objinfo dragon hp/damage")) {
+    return 1;
+  }
+  if (!combat_selftest_expect(objects[GLOOM_OBJECT_TYPE_TERRA].hitpoints == 35 &&
+                                  objects[GLOOM_OBJECT_TYPE_TERRA].damage == 1 &&
+                                  objects[GLOOM_OBJECT_TYPE_TERRA].death_routine == GLOOM_OBJECT_DIE_BLOWTERRA,
+                              "objinfo terra hp/damage/death routine")) {
+    return 1;
+  }
+  if (!combat_selftest_expect(objects[GLOOM_OBJECT_TYPE_DEATHHEAD].hitpoints == 35 &&
+                                  objects[GLOOM_OBJECT_TYPE_DEATHHEAD].damage == 3 &&
+                                  objects[GLOOM_OBJECT_TYPE_DEATHHEAD].death_routine == GLOOM_OBJECT_DIE_BLOWDEATH,
+                              "objinfo deathhead hp/damage/death routine")) {
+    return 1;
+  }
+  if (!combat_selftest_expect(demon_wtable_scaled_damage(0u) == 0 && demon_wtable_scaled_damage(1u) == 1 &&
+                                  demon_wtable_scaled_damage(2u) == 1 && demon_wtable_scaled_damage(3u) == 2 &&
+                                  demon_wtable_scaled_damage(4u) == 3,
+                              "demonpause 3/4 wtable damage scaling")) {
+    return 1;
+  }
+
+  state.player_hitpoints = GLOOM_PLAYER_INITIAL_HEALTH;
+  state.camera_x = 1024.0f;
+  state.camera_z = 1024.0f;
+  state.rng_state = 0x47524f4fu;
+  deathhead = &state.objects[7];
+  deathhead->active = true;
+  deathhead->enemy = true;
+  deathhead->x = 1152.0f;
+  deathhead->z = 1024.0f;
+  deathhead->rotation = 64;
+  deathhead->frame_fixed = deathhead_combat->initial_frame_fixed;
+  deathhead->frame_speed_fixed = (int32_t)deathhead_combat->frame_speed_fixed;
+  deathhead->move_speed = deathhead_combat->move_speed;
+
+  runtime_apply_object_hit(&state, deathhead, deathhead_combat, GLOOM_OBJECT_TYPE_DEATHHEAD, 7u);
+  if (!combat_selftest_expect(state.death_suck_active && state.death_sucker_index == 7u &&
+                                  deathhead->logic_state == GLOOM_OBJECT_LOGIC_DEATHSUCK &&
+                                  (int)deathhead->delay == 64,
+                              "hurtdeath starts deathsuck state")) {
+    return 1;
+  }
+
+  update_deathhead_object(&state, deathhead, deathhead_combat, 1.0f);
+  for (i = 0u; i < (size_t)GLOOM_MAX_RUNTIME_BLOOD; ++i) {
+    if (state.blood[i].active && state.blood[i].soul) {
+      soul_count += 1u;
+      if (!combat_selftest_expect(state.blood[i].color_mask == 0x00ffu || state.blood[i].color_mask == 0x00f0u,
+                                  "addsoul color mask")) {
+        return 1;
+      }
+    }
+  }
+  if (!combat_selftest_expect(soul_count == 4u, "deathsuck adds four soul particles per tick")) return 1;
+
+  deathhead->delay = 0.0f;
+  update_deathhead_object(&state, deathhead, deathhead_combat, 1.0f);
+  if (!combat_selftest_expect(!state.death_suck_active && deathhead->logic_state == GLOOM_OBJECT_LOGIC_NORMAL,
+                              "deathsuck restores old logic and clears global suck state")) {
+    return 1;
+  }
+
+  memset(&state.projectiles, 0, sizeof(state.projectiles));
+  state.camera_x = 128.0f;
+  state.camera_z = 512.0f;
+  memset(&test_object, 0, sizeof(test_object));
+  test_object.active = true;
+  test_object.enemy = true;
+  test_object.x = 128.0f;
+  test_object.z = 256.0f;
+  test_object.rotation = 0;
+  test_object.logic_state = GLOOM_OBJECT_LOGIC_TERRAFIRE;
+  test_object.delay = 0.0f;
+  test_object.delay2 = 5.0f;
+  update_terra_object(&state, &test_object, &objects[GLOOM_OBJECT_TYPE_TERRA], 1.0f);
+  projectile = combat_selftest_last_projectile(&state);
+  if (!combat_selftest_expect(combat_selftest_active_projectile_count(&state) == 1u && projectile != NULL &&
+                                  projectile->weapon_index == 3u && projectile->hitpoints == 1 &&
+                                  projectile->damage == 3 && (int)projectile->vx == 0 &&
+                                  (int)projectile->vz == 16,
+                              "terralogic2 fires one bullet4 with hits=1 damage=3 speed=16")) {
+    return 1;
+  }
+
+  memset(&state.projectiles, 0, sizeof(state.projectiles));
+  state.camera_x = 128.0f;
+  state.camera_z = 512.0f;
+  memset(&test_object, 0, sizeof(test_object));
+  test_object.active = true;
+  test_object.enemy = true;
+  test_object.x = 128.0f;
+  test_object.z = 256.0f;
+  test_object.rotation = 0;
+  test_object.delay = 0.0f;
+  update_phantom_object(&state, &test_object, &objects[GLOOM_OBJECT_TYPE_PHANTOM], 1.0f);
+  projectile = combat_selftest_last_projectile(&state);
+  if (!combat_selftest_expect(combat_selftest_active_projectile_count(&state) == 1u && projectile != NULL &&
+                                  projectile->weapon_index == 2u && projectile->hitpoints == 1 &&
+                                  projectile->damage == 3 && (int)projectile->vx == 0 &&
+                                  (int)projectile->vz == 20 && (int)test_object.pause_delay == 7 &&
+                                  (test_object.frame_fixed >> 16u) == 5u,
+                              "phantomlogic fires bullet3 and enters 7-tick pause frame 5")) {
+    return 1;
+  }
+
+  memset(&state.projectiles, 0, sizeof(state.projectiles));
+  state.camera_x = 128.0f;
+  state.camera_z = 512.0f;
+  memset(&test_object, 0, sizeof(test_object));
+  test_object.active = true;
+  test_object.enemy = true;
+  test_object.x = 128.0f;
+  test_object.z = 256.0f;
+  test_object.rotation = 0;
+  test_object.logic_state = GLOOM_OBJECT_LOGIC_DEMONPAUSE;
+  test_object.delay = 39.0f;
+  test_object.delay2 = -1.0f;
+  update_demon_object(&state, &test_object, &objects[GLOOM_OBJECT_TYPE_DEMON], 1.0f);
+  projectile = combat_selftest_last_projectile(&state);
+  if (!combat_selftest_expect(combat_selftest_active_projectile_count(&state) == 1u && projectile != NULL &&
+                                  projectile->weapon_index == 4u && projectile->hitpoints == 20 &&
+                                  projectile->damage == 3 && (int)projectile->vx == 0 &&
+                                  (int)projectile->vz == 24,
+                              "demonpause first shot uses wtable bullet5 with 3/4 damage")) {
+    return 1;
+  }
+
+  memset(&state.projectiles, 0, sizeof(state.projectiles));
+  state.camera_x = 128.0f;
+  state.camera_z = 512.0f;
+  memset(&test_object, 0, sizeof(test_object));
+  test_object.active = true;
+  test_object.enemy = true;
+  test_object.x = 128.0f;
+  test_object.z = 256.0f;
+  test_object.rotation = 0;
+  test_object.delay = -7.0f;
+  test_object.frame_speed_fixed = (int32_t)objects[GLOOM_OBJECT_TYPE_DRAGON].frame_speed_fixed;
+  test_object.move_speed = objects[GLOOM_OBJECT_TYPE_DRAGON].move_speed;
+  update_dragon_object(&state, &test_object, &objects[GLOOM_OBJECT_TYPE_DRAGON], 1.0f);
+  projectile = combat_selftest_last_projectile(&state);
+  if (!combat_selftest_expect(combat_selftest_active_projectile_count(&state) == 1u && projectile != NULL &&
+                                  projectile->weapon_index == 4u && projectile->hitpoints == 1 &&
+                                  projectile->damage == 3 && (int)projectile->vx == 0 &&
+                                  (int)projectile->vz == 16 && projectile->homing,
+                              "dragonfire emits homing bullet5 with hits=1 damage=3 speed=16")) {
+    return 1;
+  }
+
+  printf("Combat selftest passed\n");
+  return 0;
 }
 
 int main(int argc, char **argv) {
@@ -4757,6 +6884,7 @@ int main(int argc, char **argv) {
   int render_height = BASE_HEIGHT;
   bool classic_viewport = false;
   bool barrel_projectile_origin = true;
+  uint8_t violence_mode = GLOOM_VIOLENCE_MEATY_MESSY;
   AppState state;
   AppState previous_state;
 
@@ -4796,6 +6924,10 @@ int main(int argc, char **argv) {
     return stats.failed == 0 ? 0 : 1;
   }
 
+  if (argc > 1 && strcmp(argv[1], "--combat-selftest") == 0) {
+    return run_combat_selftest();
+  }
+
   if (argc > 1) {
     int argi = 0;
 
@@ -4811,6 +6943,12 @@ int main(int argc, char **argv) {
       } else if (strcmp(argv[argi], "--player-projectiles") == 0 ||
                  strcmp(argv[argi], "--legacy-projectiles") == 0) {
         barrel_projectile_origin = false;
+      } else if (strcmp(argv[argi], "--meaty") == 0) {
+        violence_mode = GLOOM_VIOLENCE_MEATY;
+      } else if (strcmp(argv[argi], "--messy") == 0) {
+        violence_mode = GLOOM_VIOLENCE_MESSY;
+      } else if (strcmp(argv[argi], "--meaty-messy") == 0 || strcmp(argv[argi], "--gore") == 0) {
+        violence_mode = GLOOM_VIOLENCE_MEATY_MESSY;
       } else {
         map_path = argv[argi];
       }
@@ -4897,8 +7035,11 @@ int main(int argc, char **argv) {
     gloom_map_free(&state.map);
     return 1;
   }
+  state.violence_mode = violence_mode;
+  initialize_runtime_objects(&state);
   printf("Camera spawn: x=%.0f z=%.0f angle=%.3f\n", state.camera_x, state.camera_z, state.camera_angle);
   printf("Projectile origin: %s\n", state.barrel_projectile_origin ? "barrel" : "player");
+  printf("Violence model: %s\n", violence_mode_name(state.violence_mode));
 
   if (!load_grid_offset_set(&grid_offsets)) {
     free_hud_font(&hud_font);
@@ -5032,14 +7173,20 @@ int main(int argc, char **argv) {
         memcpy(previous_zones, state.map.zones, state.map.zone_count * sizeof(*previous_zones));
         previous_state.map.zones = previous_zones;
       }
-      update(&state, keyboard);
+      update(&state, keyboard, &object_visuals);
       accumulator -= dt;
     }
 
     if (title_timer >= 1.0) {
       char title[160];
-      (void)snprintf(title, sizeof(title), "Gloom PC Port | x=%.0f z=%.0f angle=%.2f | zones=%zu", state.camera_x,
-                     state.camera_z, state.camera_angle, state.map.zone_count);
+      if (state.player_dead) {
+        (void)snprintf(title, sizeof(title), "Gloom PC Port | DEAD | x=%.0f z=%.0f angle=%.2f | zones=%zu",
+                       state.camera_x, state.camera_z, state.camera_angle, state.map.zone_count);
+      } else {
+        (void)snprintf(title, sizeof(title), "Gloom PC Port | HP=%d | x=%.0f z=%.0f angle=%.2f | zones=%zu",
+                       state.player_hitpoints, state.camera_x, state.camera_z, state.camera_angle,
+                       state.map.zone_count);
+      }
       SDL_SetWindowTitle(window, title);
       title_timer = 0.0;
     }
