@@ -47,6 +47,7 @@ enum {
   GLOOM_PLAYER_INITIAL_RELOAD = 5,
   GLOOM_PLAYER_FIRE_Y = -60,
   GLOOM_PROJECTILE_RADIUS = 32,
+  GLOOM_PROJECTILE_BARREL_FORWARD = (GLOOM_PROJECTILE_RADIUS * 5) / 2,
   GLOOM_HUD_FONT_PLANE_COUNT = 7,
   GLOOM_HUD_WEAPON_EMPTY_CHAR = 50,
   GLOOM_HUD_WEAPON_FIRST_CHAR = 49,
@@ -101,9 +102,12 @@ typedef struct {
 typedef struct {
   bool active;
   uint8_t weapon_index;
+  bool barrel_origin;
   float x;
   float y;
   float z;
+  float player_origin_x;
+  float player_origin_z;
   float vx;
   float vz;
   float frame_phase;
@@ -143,6 +147,7 @@ typedef struct {
   float player_reload_counter;
   float player_weapon_flash;
   bool player_last_fire;
+  bool barrel_projectile_origin;
   int16_t player_radius;
   uint32_t rng_state;
   bool triggered_events[GLOOM_EVENT_COUNT + 1];
@@ -2548,6 +2553,8 @@ static bool spawn_player_projectile(AppState *state, uint8_t weapon_index) {
   size_t i = 0u;
   float sin_a = 0.0f;
   float cos_a = 0.0f;
+  float start_x = 0.0f;
+  float start_z = 0.0f;
 
   if (state == NULL || weapon_index >= (uint8_t)GLOOM_WEAPON_COUNT) {
     return false;
@@ -2556,6 +2563,13 @@ static bool spawn_player_projectile(AppState *state, uint8_t weapon_index) {
   weapon = &weapons[weapon_index];
   sin_a = SDL_sinf(state->camera_angle);
   cos_a = SDL_cosf(state->camera_angle);
+  start_x = state->camera_x;
+  start_z = state->camera_z;
+
+  if (state->barrel_projectile_origin) {
+    start_x += sin_a * (float)GLOOM_PROJECTILE_BARREL_FORWARD;
+    start_z += cos_a * (float)GLOOM_PROJECTILE_BARREL_FORWARD;
+  }
 
   for (i = 0u; i < GLOOM_MAX_RUNTIME_PROJECTILES; ++i) {
     RuntimeProjectile *projectile = &state->projectiles[i];
@@ -2567,9 +2581,12 @@ static bool spawn_player_projectile(AppState *state, uint8_t weapon_index) {
     memset(projectile, 0, sizeof(*projectile));
     projectile->active = true;
     projectile->weapon_index = weapon_index;
-    projectile->x = state->camera_x;
+    projectile->barrel_origin = state->barrel_projectile_origin;
+    projectile->x = start_x;
     projectile->y = (float)GLOOM_PLAYER_FIRE_Y;
-    projectile->z = state->camera_z;
+    projectile->z = start_z;
+    projectile->player_origin_x = state->camera_x;
+    projectile->player_origin_z = state->camera_z;
     projectile->vx = sin_a * (float)weapon->speed;
     projectile->vz = cos_a * (float)weapon->speed;
     projectile->hitpoints = weapon->hitpoints;
@@ -4739,6 +4756,7 @@ int main(int argc, char **argv) {
   int render_width = WIDESCREEN_WIDTH;
   int render_height = BASE_HEIGHT;
   bool classic_viewport = false;
+  bool barrel_projectile_origin = true;
   AppState state;
   AppState previous_state;
 
@@ -4788,6 +4806,11 @@ int main(int argc, char **argv) {
       } else if (strcmp(argv[argi], "--widescreen") == 0) {
         classic_viewport = false;
         render_width = WIDESCREEN_WIDTH;
+      } else if (strcmp(argv[argi], "--barrel-projectiles") == 0) {
+        barrel_projectile_origin = true;
+      } else if (strcmp(argv[argi], "--player-projectiles") == 0 ||
+                 strcmp(argv[argi], "--legacy-projectiles") == 0) {
+        barrel_projectile_origin = false;
       } else {
         map_path = argv[argi];
       }
@@ -4800,6 +4823,7 @@ int main(int argc, char **argv) {
 
   memset(&state, 0, sizeof(state));
   memset(&previous_state, 0, sizeof(previous_state));
+  state.barrel_projectile_origin = barrel_projectile_origin;
 
   if (!gloom_map_load(resolved_map_path, &state.map, error, sizeof(error))) {
     fprintf(stderr, "Map parse failed: %s\n", error[0] ? error : "unknown error");
@@ -4874,6 +4898,7 @@ int main(int argc, char **argv) {
     return 1;
   }
   printf("Camera spawn: x=%.0f z=%.0f angle=%.3f\n", state.camera_x, state.camera_z, state.camera_angle);
+  printf("Projectile origin: %s\n", state.barrel_projectile_origin ? "barrel" : "player");
 
   if (!load_grid_offset_set(&grid_offsets)) {
     free_hud_font(&hud_font);
