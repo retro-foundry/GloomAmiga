@@ -40,7 +40,30 @@ enum {
   GLOOM_PLAYER_BOUNCE_STEP = 20,
   GLOOM_PLAYER_UNBOUNCE_STEP = 30,
   GLOOM_PLAYER_BOB_HEIGHT = 20,
-  GLOOM_MOUSE_LOOK_FIXED_PER_PIXEL = 0x2000
+  GLOOM_MOUSE_LOOK_FIXED_PER_PIXEL = 0x2000,
+  GLOOM_WEAPON_COUNT = 5,
+  GLOOM_MAX_RUNTIME_PROJECTILES = 64,
+  GLOOM_MAX_RUNTIME_SPARKS = 192,
+  GLOOM_PLAYER_INITIAL_RELOAD = 5,
+  GLOOM_PLAYER_FIRE_Y = -60,
+  GLOOM_PROJECTILE_RADIUS = 32,
+  GLOOM_HUD_FONT_PLANE_COUNT = 7,
+  GLOOM_HUD_WEAPON_EMPTY_CHAR = 50,
+  GLOOM_HUD_WEAPON_FIRST_CHAR = 49,
+  GLOOM_HUD_WEAPON_X = 44,
+  GLOOM_HUD_WEAPON_Y = 12,
+  GLOOM_HUD_WEAPON_SPACING = 10,
+  GLOOM_GUN_IDLE_FRAME = 0,
+  GLOOM_GUN_RECOIL_FRAME = 1,
+  GLOOM_GUN_MUZZLE_FIRST_FRAME = 2,
+  GLOOM_GUN_MUZZLE_FRAME_COUNT = 3,
+  GLOOM_GUN_FLASH_AMIGA_TICKS = 4,
+  GLOOM_GUN_LOWER_OFFSET = 30,
+  GLOOM_GUN_MUZZLE_LOWER_OFFSET = 0,
+  GLOOM_GUN_MUZZLE_SCALE_PERCENT = 170,
+  GLOOM_GUN_RECOIL_BACK_OFFSET = 7,
+  GLOOM_GUN_SIDE_BOB = 6,
+  GLOOM_GUN_SIDE_LIFT = 4
 };
 
 typedef struct {
@@ -76,6 +99,32 @@ typedef struct {
 } RuntimeRotPoly;
 
 typedef struct {
+  bool active;
+  uint8_t weapon_index;
+  float x;
+  float y;
+  float z;
+  float vx;
+  float vz;
+  float frame_phase;
+  int16_t hitpoints;
+  int16_t damage;
+} RuntimeProjectile;
+
+typedef struct {
+  bool active;
+  uint8_t weapon_index;
+  float x;
+  float y;
+  float z;
+  float vx;
+  float vy;
+  float vz;
+  float lifetime;
+  uint16_t frame_index;
+} RuntimeSpark;
+
+typedef struct {
   uint64_t tick_count;
   GloomMap map;
   int16_t min_x;
@@ -89,7 +138,13 @@ typedef struct {
   int32_t player_rot_fixed;
   int32_t player_rotspeed;
   float player_bounce;
+  uint8_t player_weapon;
+  uint8_t player_reload;
+  float player_reload_counter;
+  float player_weapon_flash;
+  bool player_last_fire;
   int16_t player_radius;
+  uint32_t rng_state;
   bool triggered_events[GLOOM_EVENT_COUNT + 1];
   bool teleport_active;
   uint8_t teleport_ticks;
@@ -98,6 +153,8 @@ typedef struct {
   int16_t teleport_rotation;
   RuntimeDoor doors[GLOOM_MAX_ACTIVE_DOORS];
   RuntimeRotPoly rotpolys[GLOOM_MAX_ACTIVE_ROTPOLYS];
+  RuntimeProjectile projectiles[GLOOM_MAX_RUNTIME_PROJECTILES];
+  RuntimeSpark sparks[GLOOM_MAX_RUNTIME_SPARKS];
 } AppState;
 
 typedef struct {
@@ -112,6 +169,19 @@ typedef struct {
   int width;
   int height;
 } PreviewAsset;
+
+typedef struct {
+  uint32_t *argb_pixels;
+  int width;
+  int height;
+} HudGlyph;
+
+typedef struct {
+  bool loaded;
+  char source_name[64];
+  size_t glyph_count;
+  HudGlyph *glyphs;
+} HudFont;
 
 enum {
   GLOOM_TEXTURE_SCREENS = 8,
@@ -188,6 +258,21 @@ typedef struct {
 } ObjectVisualSet;
 
 typedef struct {
+  ObjectVisual bullets[GLOOM_WEAPON_COUNT];
+  ObjectVisual sparks[GLOOM_WEAPON_COUNT];
+  ObjectVisual gun;
+} WeaponVisualSet;
+
+typedef struct {
+  const char *bullet_asset;
+  const char *spark_asset;
+  int16_t hitpoints;
+  int16_t damage;
+  int16_t speed;
+  uint16_t spark_frame_count;
+} WeaponDefinition;
+
+typedef struct {
   int16_t x;
   int16_t z;
 } GridOffset;
@@ -221,6 +306,7 @@ typedef struct {
   int16_t joyx;
   int16_t joyy;
   int16_t joys;
+  bool fire;
 } PlayerControls;
 
 static float clampf(float value, float lo, float hi);
@@ -230,6 +316,8 @@ static float player_rotation_fixed_to_radians(int32_t rotation_fixed);
 static void apply_mouse_look(AppState *state, int mouse_dx);
 static void update_player_camera_y(AppState *state);
 static bool resolve_runtime_file_path(const char *input_path, char *out_path, size_t out_path_size);
+static bool find_wall_collision_radius(const AppState *state, float x, float z, int16_t radius,
+                                       uint16_t *out_penetration, size_t *out_zone_index);
 static bool resolve_player_wall_collision(AppState *state, float *x, float *z);
 static void update_rotpolys(AppState *state);
 static void update_doors(AppState *state);
@@ -318,6 +406,12 @@ static bool initialize_camera_from_map_spawn(AppState *state) {
   state->player_rot_fixed = amiga_rotation_to_fixed(spawn->rotation);
   state->player_rotspeed = 0;
   state->player_bounce = 0;
+  state->player_weapon = 0u;
+  state->player_reload = (uint8_t)GLOOM_PLAYER_INITIAL_RELOAD;
+  state->player_reload_counter = 0.0f;
+  state->player_weapon_flash = 0.0f;
+  state->player_last_fire = false;
+  state->rng_state = 0x47524F4Fu ^ ((uint32_t)(uint16_t)spawn->x << 16u) ^ (uint32_t)(uint16_t)spawn->z;
   state->camera_angle = player_rotation_fixed_to_radians(state->player_rot_fixed);
   update_player_camera_y(state);
   return true;
@@ -716,6 +810,24 @@ static bool resolve_object_asset_path(const char *name, char *out_path, size_t o
   return false;
 }
 
+static bool resolve_hud_font_path(char *out_path, size_t out_path_size) {
+  const char *candidates[4] = {"amiga/misc/smallfont.bin", "amiga/prog/misc/smallfont.bin", "misc/smallfont.bin",
+                               "data/misc/smallfont.bin"};
+  size_t i = 0u;
+
+  if (out_path == NULL || out_path_size == 0u) {
+    return false;
+  }
+
+  for (i = 0u; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
+    if (resolve_runtime_file_path(candidates[i], out_path, out_path_size)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 static bool load_player_collision_radius(int16_t *out_radius) {
   const char *candidates[2] = {"amiga/objs/player", "amiga/prog/objs/player"};
   size_t i = 0u;
@@ -869,6 +981,189 @@ static void load_packed_palette(uint32_t palette[256], const uint8_t *data, size
     entry_offset += 2u;
     color_index += 1u;
   }
+}
+
+static void free_hud_font(HudFont *font) {
+  size_t i = 0u;
+
+  if (font == NULL) {
+    return;
+  }
+
+  for (i = 0u; i < font->glyph_count; ++i) {
+    free(font->glyphs[i].argb_pixels);
+  }
+
+  free(font->glyphs);
+  memset(font, 0, sizeof(*font));
+}
+
+static bool load_hud_font(HudFont *font) {
+  char resolved_path[1024] = {0};
+  uint8_t *data = NULL;
+  size_t data_size = 0u;
+  char error[256] = {0};
+  uint32_t palette_offset = 0u;
+  uint32_t first_glyph_offset = 0u;
+  size_t glyph_count = 0u;
+  HudGlyph *glyphs = NULL;
+  uint32_t palette[256];
+  size_t glyph_index = 0u;
+
+  if (font == NULL) {
+    return false;
+  }
+
+  free_hud_font(font);
+
+  if (!resolve_hud_font_path(resolved_path, sizeof(resolved_path))) {
+    fprintf(stderr, "Missing original HUD font amiga/misc/smallfont.bin\n");
+    return false;
+  }
+
+  if (!read_binary_blob(resolved_path, &data, &data_size)) {
+    fprintf(stderr, "Failed to read HUD font %s\n", resolved_path);
+    return false;
+  }
+
+  if (!gloom_decrunch_crm_buffer(&data, &data_size, error, sizeof(error))) {
+    fprintf(stderr, "Failed to decrunch HUD font %s: %s\n", resolved_path, error[0] ? error : "unknown error");
+    free(data);
+    return false;
+  }
+
+  if (data_size < 12u) {
+    fprintf(stderr, "HUD font %s is too small after decrunch (%zu bytes)\n", resolved_path, data_size);
+    free(data);
+    return false;
+  }
+
+  palette_offset = main_read_be32(data + 0u);
+  first_glyph_offset = main_read_be32(data + 4u);
+  if (first_glyph_offset < 8u || first_glyph_offset > palette_offset || palette_offset >= data_size ||
+      ((first_glyph_offset - 4u) % 4u) != 0u) {
+    fprintf(stderr, "HUD font %s has invalid shape table offsets\n", resolved_path);
+    free(data);
+    return false;
+  }
+
+  glyph_count = (size_t)(first_glyph_offset - 4u) / 4u;
+  if (glyph_count <= GLOOM_HUD_WEAPON_EMPTY_CHAR) {
+    fprintf(stderr, "HUD font %s is missing weapon status glyphs\n", resolved_path);
+    free(data);
+    return false;
+  }
+
+  glyphs = (HudGlyph *)calloc(glyph_count, sizeof(*glyphs));
+  if (glyphs == NULL) {
+    free(data);
+    return false;
+  }
+
+  set_default_texture_palette(palette);
+  load_packed_palette(palette, data, data_size, (size_t)palette_offset);
+
+  for (glyph_index = 0u; glyph_index < glyph_count; ++glyph_index) {
+    uint32_t glyph_offset = main_read_be32(data + 4u + glyph_index * 4u);
+    uint32_t glyph_limit = glyph_index + 1u < glyph_count ? main_read_be32(data + 4u + (glyph_index + 1u) * 4u)
+                                                          : palette_offset;
+    uint32_t mask_offset = 0u;
+    uint16_t blit_width_words = 0u;
+    uint16_t blit_size = 0u;
+    uint16_t blit_rows = 0u;
+    uint16_t blit_words = 0u;
+    size_t source_words = 0u;
+    size_t row_stride = 0u;
+    size_t source_size = 0u;
+    int pixel_width = 0;
+    int pixel_height = 0;
+    uint32_t *pixels = NULL;
+    int py = 0;
+
+    if (glyph_offset + 8u > glyph_limit || glyph_limit > palette_offset || glyph_limit > data_size) {
+      fprintf(stderr, "HUD font %s glyph %zu is out of bounds\n", resolved_path, glyph_index);
+      goto fail;
+    }
+
+    mask_offset = main_read_be32(data + glyph_offset + 0u);
+    blit_width_words = main_read_be16(data + glyph_offset + 4u);
+    blit_size = main_read_be16(data + glyph_offset + 6u);
+    blit_rows = (uint16_t)(blit_size >> 6u);
+    blit_words = (uint16_t)(blit_size & 0x3Fu);
+
+    if (blit_width_words == 0u || blit_words < 2u || blit_rows == 0u ||
+        (blit_rows % GLOOM_HUD_FONT_PLANE_COUNT) != 0u) {
+      fprintf(stderr, "HUD font %s glyph %zu has invalid blitter dimensions\n", resolved_path, glyph_index);
+      goto fail;
+    }
+
+    source_words = (size_t)blit_words - 1u;
+    row_stride = source_words * 2u;
+    source_size = (size_t)blit_rows * row_stride;
+    pixel_width = (int)(source_words * 16u);
+    pixel_height = (int)((size_t)blit_rows / (size_t)GLOOM_HUD_FONT_PLANE_COUNT);
+
+    if (glyph_offset + 8u + source_size > glyph_limit || mask_offset < 8u + source_size ||
+        glyph_offset + mask_offset + source_size > glyph_limit || pixel_width <= 0 || pixel_height <= 0) {
+      fprintf(stderr, "HUD font %s glyph %zu has invalid source/mask layout\n", resolved_path, glyph_index);
+      goto fail;
+    }
+
+    pixels = (uint32_t *)malloc((size_t)pixel_width * (size_t)pixel_height * sizeof(*pixels));
+    if (pixels == NULL) {
+      goto fail;
+    }
+
+    for (py = 0; py < pixel_height; ++py) {
+      int px = 0;
+
+      for (px = 0; px < pixel_width; ++px) {
+        uint8_t palette_index = 0u;
+        bool covered = false;
+        int plane = 0;
+        size_t word_offset = (size_t)(px / 16) * 2u;
+        unsigned bit_shift = (unsigned)(15 - (px % 16));
+
+        for (plane = 0; plane < GLOOM_HUD_FONT_PLANE_COUNT; ++plane) {
+          size_t row = (size_t)py * (size_t)GLOOM_HUD_FONT_PLANE_COUNT + (size_t)plane;
+          size_t src_offset = (size_t)glyph_offset + 8u + row * row_stride + word_offset;
+          size_t mask_src_offset = (size_t)glyph_offset + (size_t)mask_offset + row * row_stride + word_offset;
+          uint16_t src_word = main_read_be16(data + src_offset);
+          uint16_t mask_word = main_read_be16(data + mask_src_offset);
+
+          if (((src_word >> bit_shift) & 1u) != 0u) {
+            palette_index = (uint8_t)(palette_index | (uint8_t)(1u << (unsigned)plane));
+          }
+          if (((mask_word >> bit_shift) & 1u) != 0u) {
+            covered = true;
+          }
+        }
+
+        pixels[(size_t)py * (size_t)pixel_width + (size_t)px] = covered ? palette[palette_index] : 0x00000000u;
+      }
+    }
+
+    glyphs[glyph_index].argb_pixels = pixels;
+    glyphs[glyph_index].width = pixel_width;
+    glyphs[glyph_index].height = pixel_height;
+  }
+
+  font->loaded = true;
+  font->glyph_count = glyph_count;
+  font->glyphs = glyphs;
+  (void)snprintf(font->source_name, sizeof(font->source_name), "%s", resolved_path);
+
+  free(data);
+  printf("Loaded %zu HUD glyphs from original smallfont shape table\n", glyph_count);
+  return true;
+
+fail:
+  for (glyph_index = 0u; glyph_index < glyph_count; ++glyph_index) {
+    free(glyphs[glyph_index].argb_pixels);
+  }
+  free(glyphs);
+  free(data);
+  return false;
 }
 
 static bool load_wall_texture_screen(const char *path, const char *source_name, WallTextureScreen *out_screen) {
@@ -1459,6 +1754,16 @@ static const ObjectVisualDefinition *object_visual_definitions(void) {
   return definitions;
 }
 
+static const WeaponDefinition *weapon_definitions(void) {
+  static const WeaponDefinition definitions[GLOOM_WEAPON_COUNT] = {
+      {"bullet1.bin", "sparks1.bin", 1, 1, 32, 6}, {"bullet2.bin", "sparks2.bin", 5, 2, 36, 7},
+      {"bullet3.bin", "sparks3.bin", 10, 2, 40, 8}, {"bullet4.bin", "sparks4.bin", 15, 3, 40, 10},
+      {"bullet5.bin", "sparks5.bin", 20, 5, 24, 10},
+  };
+
+  return definitions;
+}
+
 static void free_object_visual(ObjectVisual *visual) {
   size_t i = 0u;
 
@@ -1672,6 +1977,53 @@ static bool load_object_visual_set_for_map(const GloomMap *map, ObjectVisualSet 
   }
 
   printf("Loaded %zu object visual bindings from real object assets\n", loaded_count);
+  return true;
+}
+
+static void free_weapon_visual_set(WeaponVisualSet *set) {
+  size_t i = 0u;
+
+  if (set == NULL) {
+    return;
+  }
+
+  for (i = 0u; i < GLOOM_WEAPON_COUNT; ++i) {
+    free_object_visual(&set->bullets[i]);
+    free_object_visual(&set->sparks[i]);
+  }
+  free_object_visual(&set->gun);
+
+  memset(set, 0, sizeof(*set));
+}
+
+static bool load_weapon_visual_set(WeaponVisualSet *set) {
+  const WeaponDefinition *weapons = weapon_definitions();
+  ObjectVisualDefinition bullet_definition = {NULL, false, 0x0200u, 0u, false};
+  ObjectVisualDefinition spark_definition = {NULL, false, 0x0200u, 0u, false};
+  ObjectVisualDefinition gun_definition = {"misc/gun.bin", false, 0x0100u, 0u, false};
+  size_t i = 0u;
+
+  if (set == NULL) {
+    return false;
+  }
+
+  free_weapon_visual_set(set);
+
+  for (i = 0u; i < GLOOM_WEAPON_COUNT; ++i) {
+    if (!load_object_visual_from_asset(weapons[i].bullet_asset, &bullet_definition, &set->bullets[i]) ||
+        !load_object_visual_from_asset(weapons[i].spark_asset, &spark_definition, &set->sparks[i])) {
+      free_weapon_visual_set(set);
+      return false;
+    }
+  }
+
+  if (!load_object_visual_from_asset(gun_definition.asset_name, &gun_definition, &set->gun)) {
+    free_weapon_visual_set(set);
+    return false;
+  }
+
+  printf("Loaded %u weapon projectile/spark visual pairs and on-screen gun from original payloads\n",
+         (unsigned)GLOOM_WEAPON_COUNT);
   return true;
 }
 
@@ -1948,6 +2300,8 @@ static PlayerControls read_modern_player_controls(const uint8_t *keyboard) {
   strafe = player_control_axis(keyboard[SDL_SCANCODE_A], keyboard[SDL_SCANCODE_D]);
   turn = player_control_axis(keyboard[SDL_SCANCODE_LEFT] || keyboard[SDL_SCANCODE_Q],
                              keyboard[SDL_SCANCODE_RIGHT] || keyboard[SDL_SCANCODE_E]);
+  controls.fire = keyboard[SDL_SCANCODE_SPACE] || keyboard[SDL_SCANCODE_LCTRL] || keyboard[SDL_SCANCODE_RCTRL] ||
+                  ((SDL_GetMouseState(NULL, NULL) & SDL_BUTTON(SDL_BUTTON_LEFT)) != 0u);
 
   if (strafe != 0) {
     controls.joyx = strafe;
@@ -2139,12 +2493,202 @@ static void update_player_movement(AppState *state, const PlayerControls *contro
   update_player_camera_y(state);
 }
 
+static uint16_t runtime_random_word(AppState *state) {
+  if (state == NULL) {
+    return 0u;
+  }
+
+  state->rng_state = state->rng_state * 1103515245u + 12345u;
+  return (uint16_t)(state->rng_state >> 16u);
+}
+
+static float runtime_spark_velocity(AppState *state) {
+  return (float)(int16_t)runtime_random_word(state) / 2048.0f;
+}
+
+static void spawn_runtime_sparks(AppState *state, uint8_t weapon_index, float x, float y, float z) {
+  const WeaponDefinition *weapons = weapon_definitions();
+  uint16_t frame_count = 0u;
+  uint16_t frame = 0u;
+
+  if (state == NULL || weapon_index >= (uint8_t)GLOOM_WEAPON_COUNT) {
+    return;
+  }
+
+  frame_count = weapons[weapon_index].spark_frame_count;
+  for (frame = 0u; frame < frame_count; ++frame) {
+    size_t i = 0u;
+
+    for (i = 0u; i < GLOOM_MAX_RUNTIME_SPARKS; ++i) {
+      RuntimeSpark *spark = &state->sparks[i];
+
+      if (spark->active) {
+        continue;
+      }
+
+      memset(spark, 0, sizeof(*spark));
+      spark->active = true;
+      spark->weapon_index = weapon_index;
+      spark->x = x;
+      spark->y = y;
+      spark->z = z;
+      spark->vx = runtime_spark_velocity(state);
+      spark->vy = runtime_spark_velocity(state);
+      spark->vz = runtime_spark_velocity(state);
+      spark->frame_index = frame;
+      spark->lifetime = 15.0f + (float)(runtime_random_word(state) & 15u);
+      break;
+    }
+  }
+}
+
+static bool spawn_player_projectile(AppState *state, uint8_t weapon_index) {
+  const WeaponDefinition *weapons = weapon_definitions();
+  const WeaponDefinition *weapon = NULL;
+  size_t i = 0u;
+  float sin_a = 0.0f;
+  float cos_a = 0.0f;
+
+  if (state == NULL || weapon_index >= (uint8_t)GLOOM_WEAPON_COUNT) {
+    return false;
+  }
+
+  weapon = &weapons[weapon_index];
+  sin_a = SDL_sinf(state->camera_angle);
+  cos_a = SDL_cosf(state->camera_angle);
+
+  for (i = 0u; i < GLOOM_MAX_RUNTIME_PROJECTILES; ++i) {
+    RuntimeProjectile *projectile = &state->projectiles[i];
+
+    if (projectile->active) {
+      continue;
+    }
+
+    memset(projectile, 0, sizeof(*projectile));
+    projectile->active = true;
+    projectile->weapon_index = weapon_index;
+    projectile->x = state->camera_x;
+    projectile->y = (float)GLOOM_PLAYER_FIRE_Y;
+    projectile->z = state->camera_z;
+    projectile->vx = sin_a * (float)weapon->speed;
+    projectile->vz = cos_a * (float)weapon->speed;
+    projectile->hitpoints = weapon->hitpoints;
+    projectile->damage = weapon->damage;
+    return true;
+  }
+
+  return false;
+}
+
+static void update_projectiles(AppState *state) {
+  float step_scale = fixed_step_amiga_scale();
+  size_t i = 0u;
+
+  if (state == NULL) {
+    return;
+  }
+
+  for (i = 0u; i < GLOOM_MAX_RUNTIME_PROJECTILES; ++i) {
+    RuntimeProjectile *projectile = &state->projectiles[i];
+    uint16_t penetration = 0u;
+    size_t zone_index = 0u;
+
+    if (!projectile->active) {
+      continue;
+    }
+
+    projectile->x += projectile->vx * step_scale;
+    projectile->z += projectile->vz * step_scale;
+    projectile->frame_phase += step_scale;
+
+    if (projectile->x < 0.0f || projectile->z < 0.0f || projectile->x > 32767.0f || projectile->z > 32767.0f) {
+      projectile->active = false;
+      continue;
+    }
+
+    if (find_wall_collision_radius(state, projectile->x, projectile->z, (int16_t)GLOOM_PROJECTILE_RADIUS,
+                                   &penetration, &zone_index)) {
+      (void)penetration;
+      (void)zone_index;
+      spawn_runtime_sparks(state, projectile->weapon_index, projectile->x, projectile->y, projectile->z);
+      projectile->active = false;
+    }
+  }
+}
+
+static void update_sparks(AppState *state) {
+  float step_scale = fixed_step_amiga_scale();
+  size_t i = 0u;
+
+  if (state == NULL) {
+    return;
+  }
+
+  for (i = 0u; i < GLOOM_MAX_RUNTIME_SPARKS; ++i) {
+    RuntimeSpark *spark = &state->sparks[i];
+
+    if (!spark->active) {
+      continue;
+    }
+
+    spark->lifetime -= step_scale;
+    if (spark->lifetime <= 0.0f) {
+      spark->active = false;
+      continue;
+    }
+
+    spark->x += spark->vx * step_scale;
+    spark->y += spark->vy * step_scale;
+    spark->z += spark->vz * step_scale;
+  }
+}
+
+static void update_player_weapon(AppState *state, const PlayerControls *controls) {
+  float step_scale = fixed_step_amiga_scale();
+  bool fire_pressed = false;
+
+  if (state == NULL) {
+    return;
+  }
+
+  if (state->player_weapon_flash > 0.0f) {
+    state->player_weapon_flash -= step_scale;
+    if (state->player_weapon_flash < 0.0f) {
+      state->player_weapon_flash = 0.0f;
+    }
+  }
+
+  if (state->player_reload_counter > 0.0f) {
+    state->player_reload_counter -= step_scale;
+    if (state->player_reload_counter < 0.0f) {
+      state->player_reload_counter = 0.0f;
+    }
+  }
+
+  fire_pressed = controls != NULL && controls->fire;
+  if (!fire_pressed) {
+    state->player_last_fire = false;
+    return;
+  }
+
+  if (!state->player_last_fire && state->player_reload_counter <= 0.0f) {
+    if (spawn_player_projectile(state, state->player_weapon)) {
+      state->player_reload_counter = (float)state->player_reload;
+      state->player_weapon_flash = (float)GLOOM_GUN_FLASH_AMIGA_TICKS;
+    }
+  }
+
+  state->player_last_fire = true;
+}
+
 static void update(AppState *state, const uint8_t *keyboard) {
   PlayerControls controls;
 
   state->tick_count += 1;
   update_rotpolys(state);
   update_doors(state);
+  update_projectiles(state);
+  update_sparks(state);
 
   if (state->teleport_active) {
     if (state->teleport_ticks > 0u) {
@@ -2179,6 +2723,7 @@ static void update(AppState *state, const uint8_t *keyboard) {
   controls = read_modern_player_controls(keyboard);
   update_player_keyboard_rotation(state, &controls);
   update_player_movement(state, &controls);
+  update_player_weapon(state, &controls);
 }
 
 static void world_to_screen(const AppState *state, int x, int z, int rx, int ry, int rw, int rh, int *sx, int *sy) {
@@ -2588,8 +3133,8 @@ static bool consider_collision_zone(const GloomMap *map, size_t zone_index, int1
   return true;
 }
 
-static bool find_player_wall_collision(const AppState *state, float x, float z, uint16_t *out_penetration,
-                                       size_t *out_zone_index) {
+static bool find_wall_collision_radius(const AppState *state, float x, float z, int16_t radius,
+                                       uint16_t *out_penetration, size_t *out_zone_index) {
   static const int offsets[9][2] = {{0, 0}, {-1, 0}, {1, 0}, {0, -1}, {0, 1},
                                    {-1, -1}, {1, -1}, {-1, 1}, {1, 1}};
   uint8_t seen[GLOOM_MAX_RENDER_ZONES] = {0};
@@ -2602,7 +3147,7 @@ static bool find_player_wall_collision(const AppState *state, float x, float z, 
   size_t offset_index = 0u;
   size_t rotpoly_index = 0u;
 
-  if (state == NULL || out_penetration == NULL || out_zone_index == NULL || state->player_radius <= 0 ||
+  if (state == NULL || out_penetration == NULL || out_zone_index == NULL || radius <= 0 ||
       !state->map.has_grid_cells || state->map.ppnt_blob == NULL || state->map.ppnt_blob_size < 2u ||
       state->map.zone_count > (size_t)GLOOM_MAX_RENDER_ZONES) {
     return false;
@@ -2663,13 +3208,22 @@ static bool find_player_wall_collision(const AppState *state, float x, float z, 
     }
   }
 
-  if ((int32_t)closest_distance - (int32_t)state->player_radius >= 0) {
+  if ((int32_t)closest_distance - (int32_t)radius >= 0) {
     return false;
   }
 
-  *out_penetration = (uint16_t)((int32_t)state->player_radius - (int32_t)closest_distance);
+  *out_penetration = (uint16_t)((int32_t)radius - (int32_t)closest_distance);
   *out_zone_index = closest_zone_index;
   return true;
+}
+
+static bool find_player_wall_collision(const AppState *state, float x, float z, uint16_t *out_penetration,
+                                       size_t *out_zone_index) {
+  if (state == NULL) {
+    return false;
+  }
+
+  return find_wall_collision_radius(state, x, z, state->player_radius, out_penetration, out_zone_index);
 }
 
 static bool resolve_player_wall_collision(AppState *state, float *x, float *z) {
@@ -3268,7 +3822,8 @@ static void render_flat_textures(SDL_Renderer *renderer, const AppState *state, 
 
 static void render_wall_debug(SDL_Renderer *renderer, const AppState *state, const GridOffsetSet *grid_offsets,
                               const WallTextureSet *wall_textures, const FlatTextureSet *flats,
-                              const ObjectVisualSet *object_visuals, int x, int y, int w, int h) {
+                              const ObjectVisualSet *object_visuals, const WeaponVisualSet *weapon_visuals, int x,
+                              int y, int w, int h) {
   typedef struct {
     float screen_x;
     float screen_y;
@@ -3554,6 +4109,116 @@ static void render_wall_debug(SDL_Renderer *renderer, const AppState *state, con
     }
   }
 
+  if (weapon_visuals != NULL) {
+    for (i = 0u; i < GLOOM_MAX_RUNTIME_PROJECTILES && sprite_write < GLOOM_MAX_DEBUG_SPRITES; ++i) {
+      const RuntimeProjectile *projectile = &state->projectiles[i];
+      const ObjectVisual *visual = NULL;
+      const ObjectFrame *frame = NULL;
+      float dx = 0.0f;
+      float dz = 0.0f;
+      float svx = 0.0f;
+      float svz = 0.0f;
+      float object_y = 0.0f;
+      float scale = 1.0f;
+      float top_view_y = 0.0f;
+      float left_view_x = 0.0f;
+      size_t frame_index = 0u;
+
+      if (!projectile->active || projectile->weapon_index >= (uint8_t)GLOOM_WEAPON_COUNT) {
+        continue;
+      }
+
+      visual = &weapon_visuals->bullets[projectile->weapon_index];
+      if (!visual->loaded || visual->frame_count == 0u) {
+        continue;
+      }
+
+      frame_index = (size_t)((uint16_t)projectile->frame_phase % (uint16_t)visual->frame_count);
+      frame = &visual->frames[frame_index];
+      if (frame->width <= 0 || frame->height <= 0) {
+        continue;
+      }
+
+      dx = projectile->x - cam_x;
+      dz = projectile->z - cam_z;
+      svx = dx * view_cos - dz * view_sin;
+      svz = dx * view_sin + dz * view_cos;
+      if (svz < near_plane || svz >= far_depth || SDL_fabsf(svx) > svz * frustum_ratio * 1.1f) {
+        continue;
+      }
+
+      object_y = projectile->y - state->camera_y;
+      scale = (float)visual->scale / 256.0f;
+      top_view_y = object_y - ((float)frame->handle_y * scale);
+      left_view_x = svx - ((float)frame->handle_x * scale);
+
+      debug_sprites[sprite_write].screen_x = (float)x + (float)w * 0.5f + (left_view_x / svz) * focal;
+      debug_sprites[sprite_write].screen_y = (float)horizon_y + (top_view_y / svz) * focal;
+      debug_sprites[sprite_write].screen_w = ((float)frame->width * scale * focal) / svz;
+      debug_sprites[sprite_write].screen_h = ((float)frame->height * scale * focal) / svz;
+      debug_sprites[sprite_write].depth = svz;
+      debug_sprites[sprite_write].frame = frame;
+
+      if (debug_sprites[sprite_write].screen_w >= 1.0f && debug_sprites[sprite_write].screen_h >= 1.0f) {
+        sprite_write += 1u;
+      }
+    }
+
+    for (i = 0u; i < GLOOM_MAX_RUNTIME_SPARKS && sprite_write < GLOOM_MAX_DEBUG_SPRITES; ++i) {
+      const RuntimeSpark *spark = &state->sparks[i];
+      const ObjectVisual *visual = NULL;
+      const ObjectFrame *frame = NULL;
+      float dx = 0.0f;
+      float dz = 0.0f;
+      float svx = 0.0f;
+      float svz = 0.0f;
+      float object_y = 0.0f;
+      float scale = 1.0f;
+      float top_view_y = 0.0f;
+      float left_view_x = 0.0f;
+      size_t frame_index = 0u;
+
+      if (!spark->active || spark->weapon_index >= (uint8_t)GLOOM_WEAPON_COUNT) {
+        continue;
+      }
+
+      visual = &weapon_visuals->sparks[spark->weapon_index];
+      if (!visual->loaded || visual->frame_count == 0u) {
+        continue;
+      }
+
+      frame_index = (size_t)(spark->frame_index % (uint16_t)visual->frame_count);
+      frame = &visual->frames[frame_index];
+      if (frame->width <= 0 || frame->height <= 0) {
+        continue;
+      }
+
+      dx = spark->x - cam_x;
+      dz = spark->z - cam_z;
+      svx = dx * view_cos - dz * view_sin;
+      svz = dx * view_sin + dz * view_cos;
+      if (svz < near_plane || svz >= far_depth || SDL_fabsf(svx) > svz * frustum_ratio * 1.1f) {
+        continue;
+      }
+
+      object_y = spark->y - state->camera_y;
+      scale = (float)visual->scale / 256.0f;
+      top_view_y = object_y - ((float)frame->handle_y * scale);
+      left_view_x = svx - ((float)frame->handle_x * scale);
+
+      debug_sprites[sprite_write].screen_x = (float)x + (float)w * 0.5f + (left_view_x / svz) * focal;
+      debug_sprites[sprite_write].screen_y = (float)horizon_y + (top_view_y / svz) * focal;
+      debug_sprites[sprite_write].screen_w = ((float)frame->width * scale * focal) / svz;
+      debug_sprites[sprite_write].screen_h = ((float)frame->height * scale * focal) / svz;
+      debug_sprites[sprite_write].depth = svz;
+      debug_sprites[sprite_write].frame = frame;
+
+      if (debug_sprites[sprite_write].screen_w >= 1.0f && debug_sprites[sprite_write].screen_h >= 1.0f) {
+        sprite_write += 1u;
+      }
+    }
+  }
+
   for (i = 0; i < (size_t)w; ++i) {
     sprite_depth_buffer[i] = depth_buffer[i];
   }
@@ -3649,6 +4314,188 @@ static void render_wall_debug(SDL_Renderer *renderer, const AppState *state, con
   free(depth_buffer);
 }
 
+static void render_object_frame_scaled(SDL_Renderer *renderer, const ObjectFrame *frame, float screen_x, float screen_y,
+                                       float scale) {
+  int x0 = 0;
+  int x1 = 0;
+  int y0 = 0;
+  int y1 = 0;
+  int draw_y = 0;
+
+  if (renderer == NULL || frame == NULL || frame->width <= 0 || frame->height <= 0 || frame->argb_pixels == NULL ||
+      scale <= 0.0f) {
+    return;
+  }
+
+  x0 = (int)screen_x;
+  y0 = (int)screen_y;
+  x1 = (int)(screen_x + ((float)frame->width * scale));
+  y1 = (int)(screen_y + ((float)frame->height * scale));
+
+  for (draw_y = y0; draw_y <= y1; ++draw_y) {
+    int draw_x = 0;
+    float tv = ((float)draw_y + 0.5f - screen_y) / ((float)frame->height * scale);
+
+    if (tv < 0.0f || tv > 1.0f) {
+      continue;
+    }
+
+    for (draw_x = x0; draw_x <= x1; ++draw_x) {
+      float tu = ((float)draw_x + 0.5f - screen_x) / ((float)frame->width * scale);
+      uint32_t argb = 0u;
+      uint8_t alpha = 0u;
+
+      if (tu < 0.0f || tu > 1.0f) {
+        continue;
+      }
+
+      argb = sample_object_frame_argb(frame, tu, tv);
+      alpha = (uint8_t)(argb >> 24);
+      if (alpha == 0u) {
+        continue;
+      }
+
+      SDL_SetRenderDrawColor(renderer, (uint8_t)(argb >> 16), (uint8_t)(argb >> 8), (uint8_t)argb, alpha);
+      SDL_RenderDrawPoint(renderer, draw_x, draw_y);
+    }
+  }
+}
+
+static size_t player_weapon_muzzle_frame_index(uint8_t weapon_index) {
+  uint32_t clamped_weapon = weapon_index;
+
+  if (clamped_weapon >= (uint32_t)GLOOM_WEAPON_COUNT) {
+    clamped_weapon = 0u;
+  }
+
+  return (size_t)GLOOM_GUN_MUZZLE_FIRST_FRAME +
+         (size_t)((clamped_weapon * (uint32_t)GLOOM_GUN_MUZZLE_FRAME_COUNT) / (uint32_t)GLOOM_WEAPON_COUNT);
+}
+
+static void render_player_weapon(SDL_Renderer *renderer, const AppState *state, const WeaponVisualSet *weapon_visuals,
+                                 int x, int y, int w, int h) {
+  const ObjectVisual *gun = NULL;
+  const ObjectFrame *base_frame = NULL;
+  const ObjectFrame *muzzle_frame = NULL;
+  size_t base_frame_index = GLOOM_GUN_IDLE_FRAME;
+  float viewport_scale = 1.0f;
+  float bounce_radians = 0.0f;
+  float side_phase = 0.0f;
+  float side_bob = 0.0f;
+  float anchor_x = 0.0f;
+  float anchor_y = 0.0f;
+  float body_draw_x = 0.0f;
+  float body_draw_y = 0.0f;
+
+  if (renderer == NULL || state == NULL || weapon_visuals == NULL || w <= 0 || h <= 0) {
+    return;
+  }
+
+  gun = &weapon_visuals->gun;
+  if (!gun->loaded || gun->frames == NULL || gun->frame_count == 0u) {
+    return;
+  }
+
+  if (state->player_weapon_flash > (float)(GLOOM_GUN_FLASH_AMIGA_TICKS / 2) &&
+      gun->frame_count > (size_t)GLOOM_GUN_RECOIL_FRAME) {
+    base_frame_index = GLOOM_GUN_RECOIL_FRAME;
+  }
+  if (base_frame_index >= gun->frame_count) {
+    base_frame_index = 0u;
+  }
+
+  viewport_scale = (float)h / (float)BASE_HEIGHT;
+  if (viewport_scale <= 0.0f) {
+    viewport_scale = 1.0f;
+  }
+
+  base_frame = &gun->frames[base_frame_index];
+  bounce_radians = ((float)((uint16_t)state->player_bounce & 511u) * 6.28318530718f) / 512.0f;
+  side_phase = SDL_sinf(bounce_radians);
+  side_bob = side_phase * (float)GLOOM_GUN_SIDE_BOB * viewport_scale;
+  anchor_x = (float)x + ((float)w * 0.5f);
+  anchor_y = (float)y + (float)h + ((float)GLOOM_GUN_LOWER_OFFSET * viewport_scale);
+  anchor_y -= SDL_fabsf(side_phase) * (float)GLOOM_GUN_SIDE_LIFT * viewport_scale;
+  if (base_frame_index == (size_t)GLOOM_GUN_RECOIL_FRAME) {
+    anchor_y += (float)GLOOM_GUN_RECOIL_BACK_OFFSET * viewport_scale;
+  }
+  anchor_x += side_bob;
+
+  if (state->player_weapon_flash > 0.0f &&
+      gun->frame_count >= (size_t)(GLOOM_GUN_MUZZLE_FIRST_FRAME + GLOOM_GUN_MUZZLE_FRAME_COUNT)) {
+    size_t muzzle_frame_index = player_weapon_muzzle_frame_index(state->player_weapon);
+    float muzzle_scale = viewport_scale * ((float)GLOOM_GUN_MUZZLE_SCALE_PERCENT / 100.0f);
+    float muzzle_anchor_y = (float)y + (float)h + ((float)GLOOM_GUN_MUZZLE_LOWER_OFFSET * viewport_scale);
+
+    if (muzzle_frame_index < gun->frame_count) {
+      float muzzle_draw_x = 0.0f;
+      float muzzle_draw_y = 0.0f;
+
+      muzzle_frame = &gun->frames[muzzle_frame_index];
+      muzzle_draw_x = (float)round_float_to_int32(anchor_x - ((float)muzzle_frame->handle_x * muzzle_scale));
+      muzzle_draw_y = (float)round_float_to_int32(muzzle_anchor_y - ((float)muzzle_frame->handle_y * muzzle_scale));
+      render_object_frame_scaled(renderer, muzzle_frame, muzzle_draw_x, muzzle_draw_y, muzzle_scale);
+    }
+  }
+
+  body_draw_x = (float)round_float_to_int32(anchor_x - ((float)base_frame->handle_x * viewport_scale));
+  body_draw_y = (float)round_float_to_int32(anchor_y - ((float)base_frame->handle_y * viewport_scale));
+  render_object_frame_scaled(renderer, base_frame, body_draw_x, body_draw_y, viewport_scale);
+}
+
+static void render_hud_glyph(SDL_Renderer *renderer, const HudGlyph *glyph, int x, int y) {
+  int py = 0;
+
+  if (renderer == NULL || glyph == NULL || glyph->argb_pixels == NULL || glyph->width <= 0 || glyph->height <= 0) {
+    return;
+  }
+
+  for (py = 0; py < glyph->height; ++py) {
+    int px = 0;
+
+    for (px = 0; px < glyph->width; ++px) {
+      uint32_t argb = glyph->argb_pixels[(size_t)py * (size_t)glyph->width + (size_t)px];
+      uint8_t alpha = (uint8_t)(argb >> 24);
+
+      if (alpha == 0u) {
+        continue;
+      }
+
+      SDL_SetRenderDrawColor(renderer, (uint8_t)(argb >> 16), (uint8_t)(argb >> 8), (uint8_t)argb, alpha);
+      SDL_RenderDrawPoint(renderer, x + px, y + py);
+    }
+  }
+}
+
+static void render_player_weapon_status(SDL_Renderer *renderer, const AppState *state, const HudFont *hud_font, int x,
+                                        int y, int w, int h) {
+  int slot = 0;
+  int weapon_char = 0;
+
+  (void)w;
+  (void)h;
+
+  if (renderer == NULL || state == NULL || hud_font == NULL || !hud_font->loaded || hud_font->glyphs == NULL ||
+      hud_font->glyph_count <= GLOOM_HUD_WEAPON_EMPTY_CHAR || state->player_weapon >= GLOOM_WEAPON_COUNT) {
+    return;
+  }
+
+  weapon_char = GLOOM_HUD_WEAPON_FIRST_CHAR - (int)state->player_weapon;
+  if (weapon_char < 0 || (size_t)weapon_char >= hud_font->glyph_count) {
+    return;
+  }
+
+  for (slot = 1; slot <= GLOOM_WEAPON_COUNT; ++slot) {
+    int glyph_index = slot < (int)state->player_reload ? GLOOM_HUD_WEAPON_EMPTY_CHAR : weapon_char;
+    int draw_x = x + GLOOM_HUD_WEAPON_X + ((slot - 1) * GLOOM_HUD_WEAPON_SPACING);
+    int draw_y = y + GLOOM_HUD_WEAPON_Y;
+
+    if (glyph_index >= 0 && (size_t)glyph_index < hud_font->glyph_count) {
+      render_hud_glyph(renderer, &hud_font->glyphs[glyph_index], draw_x, draw_y);
+    }
+  }
+}
+
 static void render_texture_preview(SDL_Renderer *renderer, const PreviewAsset *preview, int x, int y, int w, int h) {
   SDL_Rect panel = {x, y, w, h};
 
@@ -3705,12 +4552,15 @@ static void draw_bar(SDL_Renderer *renderer, int x, int y, int width, int height
 
 static void render(SDL_Renderer *renderer, const AppState *state, const GridOffsetSet *grid_offsets,
                    const WallTextureSet *wall_textures, const FlatTextureSet *flat_textures,
-                   const ObjectVisualSet *object_visuals, int render_width, int render_height) {
+                   const ObjectVisualSet *object_visuals, const WeaponVisualSet *weapon_visuals,
+                   const HudFont *hud_font, int render_width, int render_height) {
   SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
   SDL_RenderClear(renderer);
 
-  render_wall_debug(renderer, state, grid_offsets, wall_textures, flat_textures, object_visuals, 0, 0, render_width,
-                    render_height);
+  render_wall_debug(renderer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals, 0, 0,
+                    render_width, render_height);
+  render_player_weapon(renderer, state, weapon_visuals, 0, 0, render_width, render_height);
+  render_player_weapon_status(renderer, state, hud_font, 0, 0, render_width, render_height);
 
   SDL_RenderPresent(renderer);
 }
@@ -3833,6 +4683,32 @@ static AppState interpolate_render_state(const AppState *previous, const AppStat
     render_state.camera_y = previous->camera_y + ((current->camera_y - previous->camera_y) * alpha);
   }
 
+  {
+    size_t i = 0u;
+
+    for (i = 0u; i < GLOOM_MAX_RUNTIME_PROJECTILES; ++i) {
+      if (previous->projectiles[i].active && current->projectiles[i].active &&
+          previous->projectiles[i].weapon_index == current->projectiles[i].weapon_index) {
+        render_state.projectiles[i].x =
+            previous->projectiles[i].x + ((current->projectiles[i].x - previous->projectiles[i].x) * alpha);
+        render_state.projectiles[i].y =
+            previous->projectiles[i].y + ((current->projectiles[i].y - previous->projectiles[i].y) * alpha);
+        render_state.projectiles[i].z =
+            previous->projectiles[i].z + ((current->projectiles[i].z - previous->projectiles[i].z) * alpha);
+      }
+    }
+
+    for (i = 0u; i < GLOOM_MAX_RUNTIME_SPARKS; ++i) {
+      if (previous->sparks[i].active && current->sparks[i].active &&
+          previous->sparks[i].weapon_index == current->sparks[i].weapon_index &&
+          previous->sparks[i].frame_index == current->sparks[i].frame_index) {
+        render_state.sparks[i].x = previous->sparks[i].x + ((current->sparks[i].x - previous->sparks[i].x) * alpha);
+        render_state.sparks[i].y = previous->sparks[i].y + ((current->sparks[i].y - previous->sparks[i].y) * alpha);
+        render_state.sparks[i].z = previous->sparks[i].z + ((current->sparks[i].z - previous->sparks[i].z) * alpha);
+      }
+    }
+  }
+
   render_state.player_rot_fixed = current->player_rot_fixed;
   render_state.camera_angle = current->camera_angle;
   return render_state;
@@ -3849,6 +4725,8 @@ int main(int argc, char **argv) {
   WallTextureSet wall_textures;
   FlatTextureSet flat_textures;
   ObjectVisualSet object_visuals;
+  WeaponVisualSet weapon_visuals;
+  HudFont hud_font;
   GloomZone *previous_zones = NULL;
   GloomZone *render_zones = NULL;
   uint64_t perf_frequency = 0;
@@ -3868,6 +4746,8 @@ int main(int argc, char **argv) {
   memset(&wall_textures, 0, sizeof(wall_textures));
   memset(&flat_textures, 0, sizeof(flat_textures));
   memset(&object_visuals, 0, sizeof(object_visuals));
+  memset(&weapon_visuals, 0, sizeof(weapon_visuals));
+  memset(&hud_font, 0, sizeof(hud_font));
 
   if (argc > 1 && strcmp(argv[1], "--iff-info") == 0) {
     const char *iff_path = argc > 2 ? argv[2] : "amiga/combat.iff";
@@ -3964,10 +4844,29 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  if (!load_weapon_visual_set(&weapon_visuals)) {
+    free_object_visual_set(&object_visuals);
+    free_flat_texture_set(&flat_textures);
+    free_wall_texture_set(&wall_textures);
+    gloom_map_free(&state.map);
+    return 1;
+  }
+
+  if (!load_hud_font(&hud_font)) {
+    free_weapon_visual_set(&weapon_visuals);
+    free_object_visual_set(&object_visuals);
+    free_flat_texture_set(&flat_textures);
+    free_wall_texture_set(&wall_textures);
+    gloom_map_free(&state.map);
+    return 1;
+  }
+
   compute_map_bounds(&state);
 
   if (!initialize_camera_from_map_spawn(&state)) {
     fprintf(stderr, "No player spawn found in map event data\n");
+    free_hud_font(&hud_font);
+    free_weapon_visual_set(&weapon_visuals);
     free_object_visual_set(&object_visuals);
     free_flat_texture_set(&flat_textures);
     free_wall_texture_set(&wall_textures);
@@ -3977,6 +4876,8 @@ int main(int argc, char **argv) {
   printf("Camera spawn: x=%.0f z=%.0f angle=%.3f\n", state.camera_x, state.camera_z, state.camera_angle);
 
   if (!load_grid_offset_set(&grid_offsets)) {
+    free_hud_font(&hud_font);
+    free_weapon_visual_set(&weapon_visuals);
     free_object_visual_set(&object_visuals);
     free_flat_texture_set(&flat_textures);
     free_wall_texture_set(&wall_textures);
@@ -3991,6 +4892,8 @@ int main(int argc, char **argv) {
       fprintf(stderr, "Out of memory while preparing render interpolation zone buffers\n");
       free(previous_zones);
       free(render_zones);
+      free_hud_font(&hud_font);
+      free_weapon_visual_set(&weapon_visuals);
       free_grid_offset_set(&grid_offsets);
       free_object_visual_set(&object_visuals);
       free_flat_texture_set(&flat_textures);
@@ -4006,6 +4909,8 @@ int main(int argc, char **argv) {
     fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
     free(previous_zones);
     free(render_zones);
+    free_hud_font(&hud_font);
+    free_weapon_visual_set(&weapon_visuals);
     free_grid_offset_set(&grid_offsets);
     free_object_visual_set(&object_visuals);
     free_flat_texture_set(&flat_textures);
@@ -4021,6 +4926,8 @@ int main(int argc, char **argv) {
     SDL_Quit();
     free(previous_zones);
     free(render_zones);
+    free_hud_font(&hud_font);
+    free_weapon_visual_set(&weapon_visuals);
     free_grid_offset_set(&grid_offsets);
     free_object_visual_set(&object_visuals);
     free_flat_texture_set(&flat_textures);
@@ -4039,6 +4946,8 @@ int main(int argc, char **argv) {
     SDL_Quit();
     free(previous_zones);
     free(render_zones);
+    free_hud_font(&hud_font);
+    free_weapon_visual_set(&weapon_visuals);
     free_grid_offset_set(&grid_offsets);
     free_object_visual_set(&object_visuals);
     free_flat_texture_set(&flat_textures);
@@ -4113,12 +5022,14 @@ int main(int argc, char **argv) {
     update_render_dimensions(renderer, classic_viewport, &render_width, &render_height);
     render_alpha = (float)(accumulator / dt);
     render_state = interpolate_render_state(&previous_state, &state, render_alpha, render_zones, state.map.zone_count);
-    render(renderer, &render_state, &grid_offsets, &wall_textures, &flat_textures, &object_visuals, render_width,
-           render_height);
+    render(renderer, &render_state, &grid_offsets, &wall_textures, &flat_textures, &object_visuals, &weapon_visuals,
+           &hud_font, render_width, render_height);
   }
 
   free(previous_zones);
   free(render_zones);
+  free_hud_font(&hud_font);
+  free_weapon_visual_set(&weapon_visuals);
   free_grid_offset_set(&grid_offsets);
   free_object_visual_set(&object_visuals);
   free_flat_texture_set(&flat_textures);

@@ -45,6 +45,8 @@
 - Player control now uses the Amiga `rotplayer`/`moveplayer` constants for rotation acceleration, movement speed, and movement bob, while adding modern relative mouse look and WASD strafe/forward input on the same player state.
 - Widescreen rendering now adapts the viewport width to the renderer shape, scales projection focal from the Amiga large-window 106x80 chixel/`focshft=6` reference so FOV matches the original instead of the full 320-pixel display, and keeps `--classic` for regression checks.
 - The SDL runtime now runs gameplay on a fixed 60 Hz step with Amiga 25 Hz gameplay-tick motion/timer rates scaled for parity, renders uncapped, interpolates camera position/bob and live door/rotpoly zone geometry between logic steps, and applies mouse orientation every render frame.
+- Player firing now follows the Amiga `checkfire` one-shot/reload cadence, spawns live runtime projectiles from the original `wtable` weapon speeds/damage values, and draws bullets and wall-hit sparks from the real `bullet*.bin`/`sparks*.bin` payloads.
+- The Gloom Deluxe ADFs have been extracted under `build/adf_extract`; Disk 1 contains the missing real on-screen weapon payload `misc/gun.bin`, which is now copied into `amiga/misc/gun.bin`, decoded to `amiga/art/objects/misc__gun.bin`, and rendered as the player gun instead of inventing or scaling projectile art.
 
 ## In Progress
 - Deterministic parity harness and runtime object/combat behavior after the renderer/event vertical slice.
@@ -67,5 +69,5 @@
 
 ## Immediate Next Tasks
 1. Introduce deterministic input replay harness for parity testing.
-2. Wire projectile/spark runtime objects to the existing embedded bullet/spark payloads when combat logic comes online.
+2. Extend projectile collisions into full enemy/object damage once runtime monster logic is represented.
 3. Implement lock-style teleport event behavior once player lock/control state is represented.
