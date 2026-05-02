@@ -142,7 +142,7 @@ typedef struct {
   int queued_volume;
   int priority;
   int queued_priority;
-  uint8_t repeat_count;
+  uint8_t busy_passes;
   double position;
   double increment;
 } AudioChannel;
@@ -1130,18 +1130,20 @@ static void audio_callback(void *userdata, Uint8 *stream, int len) {
         continue;
       }
 
-      value = (float)sample->samples[sample_index] / 128.0f;
-      scaled = value * ((float)channel->volume / 64.0f);
-      if (channel_index == 1 || channel_index == 2) {
-        right += scaled;
-      } else {
-        left += scaled;
+      if (channel->busy_passes > 1u) {
+        value = (float)sample->samples[sample_index] / 128.0f;
+        scaled = value * ((float)channel->volume / 64.0f);
+        if (channel_index == 1 || channel_index == 2) {
+          right += scaled;
+        } else {
+          left += scaled;
+        }
       }
 
       channel->position += channel->increment;
       if (channel->position >= (double)sample->sample_count) {
-        if (channel->repeat_count > 1u) {
-          channel->repeat_count -= 1u;
+        if (channel->busy_passes > 1u) {
+          channel->busy_passes -= 1u;
           while (channel->position >= (double)sample->sample_count) {
             channel->position -= (double)sample->sample_count;
           }
@@ -1219,7 +1221,7 @@ static void audio_start_channel_locked(AudioSystem *audio, AudioChannel *channel
   channel->sfx_id = sfx_id;
   channel->volume = volume < 0 ? 0 : (volume > 64 ? 64 : volume);
   channel->priority = priority;
-  channel->repeat_count = 2u;
+  channel->busy_passes = 2u;
   channel->position = 0.0;
   channel->increment = sample->sample_rate / (double)audio->obtained.freq;
 }
@@ -3417,6 +3419,10 @@ static float wrap_player_bounce_phase(float phase) {
   return phase;
 }
 
+static void play_player_footstep_sfx(void) {
+  audio_play_sfx(GLOOM_SFX_FOOTSTEP, 16, 0);
+}
+
 static void apply_mouse_look(AppState *state, int mouse_dx) {
   if (state == NULL || mouse_dx == 0) {
     return;
@@ -3479,15 +3485,24 @@ static void update_player_keyboard_rotation(AppState *state, const PlayerControl
 }
 
 static void advance_player_bounce(AppState *state) {
+  uint16_t previous_phase = 0u;
+  uint16_t bounce_phase = 0u;
+
   if (state == NULL) {
     return;
   }
 
+  previous_phase = (uint16_t)state->player_bounce & 255u;
   state->player_bounce =
       wrap_player_bounce_phase(state->player_bounce + ((float)GLOOM_PLAYER_BOUNCE_STEP * fixed_step_amiga_scale()));
+  bounce_phase = (uint16_t)state->player_bounce & 255u;
+
+  if (previous_phase < 64u && bounce_phase >= 64u) {
+    play_player_footstep_sfx();
+  }
 }
 
-static void settle_player_bounce(AppState *state) {
+static void settle_player_bounce(AppState *state, bool play_footstep) {
   uint16_t bounce_phase = 0u;
 
   if (state == NULL || state->player_bounce == 0.0f) {
@@ -3500,6 +3515,9 @@ static void settle_player_bounce(AppState *state) {
 
   if ((bounce_phase & 127u) < (uint16_t)GLOOM_PLAYER_UNBOUNCE_STEP) {
     state->player_bounce = 0.0f;
+    if (play_footstep) {
+      play_player_footstep_sfx();
+    }
   }
 }
 
@@ -3528,7 +3546,7 @@ static void update_player_movement(AppState *state, const PlayerControls *contro
   }
 
   if (controls->joyy == 0 && (controls->joys == 0 || controls->joyx == 0)) {
-    settle_player_bounce(state);
+    settle_player_bounce(state, true);
     update_player_camera_y(state);
     return;
   }
@@ -5442,7 +5460,7 @@ static void update_with_controls(AppState *state, const PlayerControls *controls
 
   if (state->player_dead || state->player_hitpoints <= 0) {
     mark_player_dead(state);
-    settle_player_bounce(state);
+    settle_player_bounce(state, false);
     update_player_camera_y(state);
     return;
   }
@@ -8308,10 +8326,32 @@ static int run_sfx_selftest(void) {
 
   audio.obtained.freq = 48000;
   audio_start_channel_locked(&audio, &audio.channels[0], GLOOM_SFX_SHOOT, 32, 0);
-  if (!audio.channels[0].active || audio.channels[0].repeat_count != 2u) {
+  if (!audio.channels[0].active || audio.channels[0].busy_passes != 2u) {
     fprintf(stderr, "SFX selftest failed: playsfxnow channel lifetime does not match fx_status=-2\n");
     audio_free_sfx_bank(&audio);
     return 1;
+  }
+
+  {
+    AudioSystem repeat_audio;
+    int8_t fake_samples[2] = {64, 64};
+    float stream[8];
+
+    memset(&repeat_audio, 0, sizeof(repeat_audio));
+    memset(stream, 0, sizeof(stream));
+    repeat_audio.obtained.freq = 1;
+    repeat_audio.samples[GLOOM_SFX_SHOOT].loaded = true;
+    repeat_audio.samples[GLOOM_SFX_SHOOT].sample_count = 2u;
+    repeat_audio.samples[GLOOM_SFX_SHOOT].sample_rate = 1.0;
+    repeat_audio.samples[GLOOM_SFX_SHOOT].samples = fake_samples;
+    audio_start_channel_locked(&repeat_audio, &repeat_audio.channels[0], GLOOM_SFX_SHOOT, 64, 0);
+    audio_callback(&repeat_audio, (Uint8 *)stream, (int)sizeof(stream));
+    if (stream[0] <= 0.0f || stream[2] <= 0.0f || stream[4] != 0.0f || stream[6] != 0.0f ||
+        repeat_audio.channels[0].active) {
+      fprintf(stderr, "SFX selftest failed: fx_status=-2 busy tail audibly repeated the sample\n");
+      audio_free_sfx_bank(&audio);
+      return 1;
+    }
   }
 
   audio_free_sfx_bank(&audio);
