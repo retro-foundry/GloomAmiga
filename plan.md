@@ -73,10 +73,13 @@
 - Generic enemy deaths now load the original `ob_chunks` payloads from `amiga/objs/*2` and port `blowchunx` plus the default `mode=0` `chunklogic2` path: each chunk frame is spawned from `bloodspeed3`, starts at y=-64 with y velocity minus `#$40000`, receives `#$8000` gravity per Amiga tick, renders through `drawshape_1sc`, and is killed when it reaches the floor.
 - The original violence model switch is represented with `--meaty` for `mode=0` chunk vanish behavior and `--messy` for `mode=1` persistent `maxgore` plus wall-stop behavior. The PC runtime now defaults to an explicitly user-requested `MEATY+MESSY` mode (`--meaty-messy`/`--gore`) that keeps the freer MEATY chunk motion while also persisting chunks as MESSY ground gore.
 - Persistent gore size now follows the original render split: flying chunks use `drawshape_1sc` with the dying object's `ob_scale`, while floor gore uses `drawshape_q` at fixed `$200` scale.
+- SDL SFX playback now loads the original Paula one-shot assets from `amiga/sfxs/*.bin` using the `playsfxnow` period/word-length header format, mixes four Amiga-style priority channels with Paula channel panning, and hooks represented calls for `checkfire`, `splat`, `blowobject`, `blowterra`, `blowdragon`, `hurtngrunt`/`hurtterra`/`lizhurt`/`trollhurt`, `terralogic`, `terralogic2`, `ghoullogic`, `demonpause`, `dragonlogic`, door events, and teleports.
+- SDL SFX channel lifetime now matches the original `playsfxnow`/`sfxint` `fx_status=-2` behavior: a Paula channel remains busy for two sample completion interrupts before it is freed, preserving the original first-free channel allocation and stereo placement under rapid SFX.
+- Player pickups now port the represented `healthgot`, `weapongot`/`weapond0`, `thermogot`, `invisigot`, `invincgot`, `bouncygot`, `playertimers`, `weaponlogic`, and the player `shoot` mega/bouncy paths: token SFX plays from `playtsfx`, health adds 5 up to 25, repeated weapon pickups reduce `ob_reload` and then add 250 `ob_mega` ticks, thermo/invisibility add 1500 Amiga ticks, hyper starts at `#-$200` and advances on the Amiga tick scale, bouncy bullets cap at 3, consumed pickups disappear, weapon pickups bob/animate with the original `camrots` negative-up Y range without overwriting map-authored pickup placement, weapon projectile hitpoints/damage/speed stay tied to `wtable`, mega/ultra-mega fire the original two/three-shot spreads, and bouncy projectiles reflect from wall normals while their bounce count remains.
 
 ## In Progress
-- Broader runtime object/combat behavior after the renderer/event vertical slice, with projectile-to-enemy damage, generic `monsterlogic`/`fire1` enemy projectiles, generic `monsterlogic` movement, baldy/lizard/troll charge-and-punch melee, deathhead cruise/charge movement, special projectile monster routines, dragon movement/fire logic, and minimal player death state now in place.
-- `splat` sound, `blowterra` sound behavior, soul-suck audio/secondary rendering polish, and the `dragondead` `finished=3` end-game transition remain TODO until their original audio/runtime dependencies are ported directly.
+- Broader runtime object/combat behavior after the renderer/event vertical slice, with projectile-to-enemy damage, pickups/powerups, generic `monsterlogic`/`fire1` enemy projectiles, generic `monsterlogic` movement, baldy/lizard/troll charge-and-punch melee, deathhead cruise/charge movement, special projectile monster routines, dragon movement/fire logic, and minimal player death state now in place.
+- Remaining audio parity gaps include original music/module playback (`med1`/`med2`) and any gameplay SFX call sites whose owning gameplay routine is not represented yet; soul-suck secondary rendering polish and the `dragondead` `finished=3` end-game transition remain TODO until their original runtime dependencies are ported directly.
 - Deterministic parity harness for broader fixed-step player, door, projectile, and event behavior against Amiga-derived expectations.
 
 ## Milestones
@@ -97,7 +100,7 @@
 
 ## Immediate Next Tasks
 1. Introduce deterministic input replay harness for parity testing.
-2. Finish remaining combat/death parity directly from `gloom2.s`, especially `blowterra` sound behavior, `splat` sound, `dragondead` finished-state handling, and focused parity tests for projectile/object edge cases.
-3. Continue audio-backed death feedback once the original sound path is represented.
+2. Finish remaining combat/death parity directly from `gloom2.s`, especially `dragondead` finished-state handling and focused parity tests for projectile/object edge cases.
+3. Continue audio parity by porting remaining original SFX call sites and `med1`/`med2` music playback without substituting non-Amiga sounds.
 4. Expand focused combat parity tests for close barrel-origin hits, enemy removal, wall-hit priority, dragon death chunks, and special-monster projectile cadence.
 5. Implement lock-style teleport event behavior once player lock/control state is represented.

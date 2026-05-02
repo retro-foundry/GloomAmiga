@@ -41,6 +41,7 @@ enum {
   GLOOM_PLAYER_UNBOUNCE_STEP = 30,
   GLOOM_PLAYER_BOB_HEIGHT = 20,
   GLOOM_PLAYER_INITIAL_HEALTH = 25,
+  GLOOM_PLAYER_MEGA_OVERKILL = 875,
   GLOOM_MOUSE_LOOK_FIXED_PER_PIXEL = 0x2000,
   GLOOM_WEAPON_COUNT = 5,
   GLOOM_MAX_RUNTIME_PROJECTILES = 64,
@@ -53,6 +54,7 @@ enum {
   GLOOM_PLAYER_FIRE_Y = -60,
   GLOOM_PROJECTILE_RADIUS = 32,
   GLOOM_PROJECTILE_BARREL_FORWARD = (GLOOM_PROJECTILE_RADIUS * 5) / 2,
+  GLOOM_PICKUP_RADIUS = 48,
   GLOOM_HUD_FONT_PLANE_COUNT = 7,
   GLOOM_HUD_WEAPON_EMPTY_CHAR = 50,
   GLOOM_HUD_WEAPON_FIRST_CHAR = 49,
@@ -69,8 +71,76 @@ enum {
   GLOOM_GUN_MUZZLE_SCALE_PERCENT = 170,
   GLOOM_GUN_RECOIL_BACK_OFFSET = 7,
   GLOOM_GUN_SIDE_BOB = 6,
-  GLOOM_GUN_SIDE_LIFT = 4
+  GLOOM_GUN_SIDE_LIFT = 4,
+  GLOOM_AUDIO_CHANNEL_COUNT = 4,
+  GLOOM_PAULA_PAL_CLOCK_HZ = 3546895
 };
+
+enum {
+  GLOOM_SFX_SHOOT = 0,
+  GLOOM_SFX_SHOOT2,
+  GLOOM_SFX_SHOOT3,
+  GLOOM_SFX_SHOOT4,
+  GLOOM_SFX_SHOOT5,
+  GLOOM_SFX_GRUNT,
+  GLOOM_SFX_GRUNT2,
+  GLOOM_SFX_GRUNT3,
+  GLOOM_SFX_GRUNT4,
+  GLOOM_SFX_TOKEN,
+  GLOOM_SFX_DOOR,
+  GLOOM_SFX_FOOTSTEP,
+  GLOOM_SFX_DIE,
+  GLOOM_SFX_SPLAT,
+  GLOOM_SFX_TELEPORT,
+  GLOOM_SFX_GHOUL,
+  GLOOM_SFX_LIZARD,
+  GLOOM_SFX_LIZHIT,
+  GLOOM_SFX_TROLLMAD,
+  GLOOM_SFX_TROLLHIT,
+  GLOOM_SFX_ROBOT,
+  GLOOM_SFX_ROBODIE,
+  GLOOM_SFX_DRAGON,
+  GLOOM_SFX_COUNT
+};
+
+typedef struct {
+  const char *symbol;
+  const char *path;
+} SfxDefinition;
+
+typedef struct {
+  bool loaded;
+  char source_path[256];
+  uint16_t period;
+  uint16_t length_words;
+  uint32_t sample_count;
+  double sample_rate;
+  int8_t *samples;
+} SfxSample;
+
+typedef struct {
+  bool active;
+  bool queued;
+  uint8_t queued_ticks;
+  int sfx_id;
+  int queued_sfx_id;
+  int volume;
+  int queued_volume;
+  int priority;
+  int queued_priority;
+  uint8_t repeat_count;
+  double position;
+  double increment;
+} AudioChannel;
+
+typedef struct {
+  bool initialized;
+  SDL_AudioDeviceID device;
+  SDL_AudioSpec obtained;
+  SfxSample samples[GLOOM_SFX_COUNT];
+  AudioChannel channels[GLOOM_AUDIO_CHANNEL_COUNT];
+  uint8_t last_grunt;
+} AudioSystem;
 
 typedef struct {
   bool active;
@@ -110,6 +180,7 @@ typedef struct {
   bool barrel_origin;
   bool enemy;
   bool homing;
+  uint8_t bounce_count;
   float x;
   float y;
   float z;
@@ -191,6 +262,7 @@ typedef struct {
   float hurt_pause;
   float pause_delay;
   float bounce_phase;
+  float render_y_offset;
   uint8_t logic_state;
   uint8_t old_logic_state;
 } RuntimeObjectState;
@@ -213,8 +285,13 @@ typedef struct {
   bool player_dead;
   uint8_t player_weapon;
   uint8_t player_reload;
+  uint8_t player_bouncy_bullets;
   float player_reload_counter;
   float player_weapon_flash;
+  float player_mega_timer;
+  float player_invisible_timer;
+  float player_thermo_timer;
+  float player_hyper_timer;
   bool player_last_fire;
   bool barrel_projectile_origin;
   int16_t player_radius;
@@ -283,11 +360,18 @@ enum {
 
 enum {
   GLOOM_OBJECT_TYPE_DRAGON = 8,
+  GLOOM_OBJECT_TYPE_BOUNCY = 9,
+  GLOOM_OBJECT_TYPE_MARINE = 10,
   GLOOM_OBJECT_TYPE_BALDY = 11,
   GLOOM_OBJECT_TYPE_TERRA = 12,
   GLOOM_OBJECT_TYPE_GHOUL = 13,
   GLOOM_OBJECT_TYPE_PHANTOM = 14,
   GLOOM_OBJECT_TYPE_DEMON = 15,
+  GLOOM_OBJECT_TYPE_WEAPON1 = 16,
+  GLOOM_OBJECT_TYPE_WEAPON2 = 17,
+  GLOOM_OBJECT_TYPE_WEAPON3 = 18,
+  GLOOM_OBJECT_TYPE_WEAPON4 = 19,
+  GLOOM_OBJECT_TYPE_WEAPON5 = 20,
   GLOOM_OBJECT_TYPE_LIZARD = 21,
   GLOOM_OBJECT_TYPE_DEATHHEAD = 22,
   GLOOM_OBJECT_TYPE_TROLL = 23
@@ -469,6 +553,7 @@ static int16_t object_type_damage(int16_t object_type);
 static float object_type_move_speed(int16_t object_type);
 static const ObjectCombatDefinition *object_type_combat_definition(int16_t object_type);
 static bool object_type_is_enemy(int16_t object_type);
+static bool object_type_is_pickup(int16_t object_type);
 static void initialize_runtime_objects(AppState *state);
 static uint16_t runtime_random_word(AppState *state);
 static bool spawn_enemy_projectile_params(AppState *state, const RuntimeObjectState *object, uint8_t weapon_index,
@@ -476,9 +561,16 @@ static bool spawn_enemy_projectile_params(AppState *state, const RuntimeObjectSt
 static bool spawn_enemy_projectile_params_ex(AppState *state, const RuntimeObjectState *object, uint8_t weapon_index,
                                              int16_t hitpoints, int16_t damage, float speed, float y_offset,
                                              bool homing);
+static bool audio_load_sfx_bank(AudioSystem *audio);
+static bool audio_start(AudioSystem *audio);
+static void audio_shutdown(AudioSystem *audio);
+static void audio_play_sfx(int sfx_id, int volume, int priority);
+static void audio_vblank_tick(void);
 static void update_rotpolys(AppState *state);
 static void update_doors(AppState *state);
 static void check_event_triggers(AppState *state);
+
+static AudioSystem g_audio;
 
 static uint64_t sim_ticks_to_amiga_ticks(uint64_t ticks) {
   return (ticks * (uint64_t)GLOOM_AMIGA_GAME_TICK_HZ) / (uint64_t)FIXED_TICK_HZ;
@@ -567,8 +659,13 @@ static bool initialize_camera_from_map_spawn(AppState *state) {
   state->player_dead = false;
   state->player_weapon = 0u;
   state->player_reload = (uint8_t)GLOOM_PLAYER_INITIAL_RELOAD;
+  state->player_bouncy_bullets = 0u;
   state->player_reload_counter = 0.0f;
   state->player_weapon_flash = 0.0f;
+  state->player_mega_timer = 0.0f;
+  state->player_invisible_timer = 0.0f;
+  state->player_thermo_timer = 0.0f;
+  state->player_hyper_timer = 0.0f;
   state->player_last_fire = false;
   state->rng_state = 0x47524F4Fu ^ ((uint32_t)(uint16_t)spawn->x << 16u) ^ (uint32_t)(uint16_t)spawn->z;
   state->violence_mode = GLOOM_VIOLENCE_MEATY_MESSY;
@@ -596,10 +693,11 @@ static void initialize_runtime_objects(AppState *state) {
     const GloomObjectSpawn *spawn = &state->map.object_spawns[i];
     RuntimeObjectState *object = &state->objects[i];
     const ObjectCombatDefinition *combat = object_type_combat_definition(spawn->object_type);
+    bool is_pickup = object_type_is_pickup(spawn->object_type);
     int16_t hitpoints = object_type_initial_hitpoints(spawn->object_type);
     uint16_t scale = 0x0200u;
 
-    if (hitpoints <= 0) {
+    if (hitpoints <= 0 && !is_pickup) {
       continue;
     }
 
@@ -828,6 +926,320 @@ static bool file_exists_readable(const char *path) {
   }
   fclose(f);
   return true;
+}
+
+static const SfxDefinition *sfx_definitions(void) {
+  static const SfxDefinition definitions[GLOOM_SFX_COUNT] = {
+      {"shootsfx", "amiga/sfxs/shoot.bin"},       {"shootsfx2", "amiga/sfxs/shoot2.bin"},
+      {"shootsfx3", "amiga/sfxs/shoot3.bin"},     {"shootsfx4", "amiga/sfxs/shoot4.bin"},
+      {"shootsfx5", "amiga/sfxs/shoot5.bin"},     {"gruntsfx", "amiga/sfxs/grunt.bin"},
+      {"gruntsfx2", "amiga/sfxs/grunt2.bin"},     {"gruntsfx3", "amiga/sfxs/grunt3.bin"},
+      {"gruntsfx4", "amiga/sfxs/grunt4.bin"},     {"tokensfx", "amiga/sfxs/token.bin"},
+      {"doorsfx", "amiga/sfxs/door.bin"},         {"footstepsfx", "amiga/sfxs/footstep.bin"},
+      {"diesfx", "amiga/sfxs/die.bin"},           {"splatsfx", "amiga/sfxs/splat.bin"},
+      {"telesfx", "amiga/sfxs/teleport.bin"},     {"ghoulsfx", "amiga/sfxs/ghoul.bin"},
+      {"lizsfx", "amiga/sfxs/lizard.bin"},        {"lizhitsfx", "amiga/sfxs/lizhit.bin"},
+      {"trollsfx", "amiga/sfxs/trollmad.bin"},    {"trollhitsfx", "amiga/sfxs/trollhit.bin"},
+      {"robotsfx", "amiga/sfxs/robot.bin"},       {"robodiesfx", "amiga/sfxs/robodie.bin"},
+      {"dragonsfx", "amiga/sfxs/dragon.bin"},
+  };
+
+  return definitions;
+}
+
+static int weapon_sfx_id(uint8_t weapon_index) {
+  static const int ids[GLOOM_WEAPON_COUNT] = {
+      GLOOM_SFX_SHOOT3, GLOOM_SFX_SHOOT5, GLOOM_SFX_SHOOT, GLOOM_SFX_SHOOT4, GLOOM_SFX_SHOOT5,
+  };
+
+  if (weapon_index >= (uint8_t)GLOOM_WEAPON_COUNT) {
+    return -1;
+  }
+  return ids[weapon_index];
+}
+
+static void audio_free_sfx_bank(AudioSystem *audio) {
+  size_t i = 0u;
+
+  if (audio == NULL) {
+    return;
+  }
+
+  for (i = 0u; i < (size_t)GLOOM_SFX_COUNT; ++i) {
+    free(audio->samples[i].samples);
+    memset(&audio->samples[i], 0, sizeof(audio->samples[i]));
+  }
+}
+
+static bool audio_load_one_sfx(AudioSystem *audio, int sfx_id, const SfxDefinition *definition) {
+  uint8_t *data = NULL;
+  size_t size = 0u;
+  char resolved_path[1024] = {0};
+  uint16_t period = 0u;
+  uint16_t length_words = 0u;
+  size_t expected_size = 0u;
+
+  if (audio == NULL || definition == NULL || sfx_id < 0 || sfx_id >= GLOOM_SFX_COUNT) {
+    return false;
+  }
+
+  if (!resolve_runtime_file_path(definition->path, resolved_path, sizeof(resolved_path))) {
+    fprintf(stderr, "Cannot load original SFX %s: missing '%s'\n", definition->symbol, definition->path);
+    return false;
+  }
+
+  if (!read_binary_blob(resolved_path, &data, &size)) {
+    fprintf(stderr, "Cannot load original SFX %s: failed reading '%s'\n", definition->symbol, resolved_path);
+    return false;
+  }
+
+  if (size < 6u) {
+    fprintf(stderr, "Cannot load original SFX %s: '%s' is too short for Paula period/length/data\n",
+            definition->symbol, resolved_path);
+    free(data);
+    return false;
+  }
+
+  period = main_read_be16(data);
+  length_words = main_read_be16(data + 2u);
+  expected_size = 4u + (size_t)length_words * 2u;
+  if (period == 0u || length_words == 0u || expected_size != size) {
+    fprintf(stderr,
+            "Cannot load original SFX %s: '%s' header mismatch period=%u length_words=%u expected_bytes=%zu actual_bytes=%zu\n",
+            definition->symbol, resolved_path, (unsigned)period, (unsigned)length_words, expected_size, size);
+    free(data);
+    return false;
+  }
+
+  audio->samples[sfx_id].samples = (int8_t *)malloc((size_t)length_words * 2u);
+  if (audio->samples[sfx_id].samples == NULL) {
+    fprintf(stderr, "Out of memory while loading original SFX %s from '%s'\n", definition->symbol, resolved_path);
+    free(data);
+    return false;
+  }
+
+  memcpy(audio->samples[sfx_id].samples, data + 4u, (size_t)length_words * 2u);
+  (void)snprintf(audio->samples[sfx_id].source_path, sizeof(audio->samples[sfx_id].source_path), "%s", resolved_path);
+  audio->samples[sfx_id].period = period;
+  audio->samples[sfx_id].length_words = length_words;
+  audio->samples[sfx_id].sample_count = (uint32_t)((size_t)length_words * 2u);
+  audio->samples[sfx_id].sample_rate = (double)GLOOM_PAULA_PAL_CLOCK_HZ / (double)period;
+  audio->samples[sfx_id].loaded = true;
+  free(data);
+  return true;
+}
+
+static bool audio_load_sfx_bank(AudioSystem *audio) {
+  const SfxDefinition *definitions = sfx_definitions();
+  size_t i = 0u;
+
+  if (audio == NULL) {
+    return false;
+  }
+
+  audio_free_sfx_bank(audio);
+  for (i = 0u; i < (size_t)GLOOM_SFX_COUNT; ++i) {
+    if (!audio_load_one_sfx(audio, (int)i, &definitions[i])) {
+      audio_free_sfx_bank(audio);
+      return false;
+    }
+  }
+  return true;
+}
+
+static void audio_callback(void *userdata, Uint8 *stream, int len) {
+  AudioSystem *audio = (AudioSystem *)userdata;
+  float *out = (float *)stream;
+  int frames = len / (int)(sizeof(float) * 2u);
+  int frame = 0;
+
+  memset(stream, 0, (size_t)len);
+  if (audio == NULL) {
+    return;
+  }
+
+  for (frame = 0; frame < frames; ++frame) {
+    float left = 0.0f;
+    float right = 0.0f;
+    int channel_index = 0;
+
+    for (channel_index = 0; channel_index < GLOOM_AUDIO_CHANNEL_COUNT; ++channel_index) {
+      AudioChannel *channel = &audio->channels[channel_index];
+      const SfxSample *sample = NULL;
+      int sample_index = 0;
+      float value = 0.0f;
+      float scaled = 0.0f;
+
+      if (!channel->active || channel->sfx_id < 0 || channel->sfx_id >= GLOOM_SFX_COUNT) {
+        continue;
+      }
+
+      sample = &audio->samples[channel->sfx_id];
+      sample_index = (int)channel->position;
+      if (!sample->loaded || sample->samples == NULL || sample_index < 0 ||
+          sample_index >= (int)sample->sample_count) {
+        channel->active = false;
+        continue;
+      }
+
+      value = (float)sample->samples[sample_index] / 128.0f;
+      scaled = value * ((float)channel->volume / 64.0f);
+      if (channel_index == 1 || channel_index == 2) {
+        right += scaled;
+      } else {
+        left += scaled;
+      }
+
+      channel->position += channel->increment;
+      if (channel->position >= (double)sample->sample_count) {
+        if (channel->repeat_count > 1u) {
+          channel->repeat_count -= 1u;
+          while (channel->position >= (double)sample->sample_count) {
+            channel->position -= (double)sample->sample_count;
+          }
+        } else {
+          channel->active = false;
+        }
+      }
+    }
+
+    out[frame * 2] = clampf(left, -1.0f, 1.0f);
+    out[frame * 2 + 1] = clampf(right, -1.0f, 1.0f);
+  }
+}
+
+static bool audio_start(AudioSystem *audio) {
+  SDL_AudioSpec desired;
+
+  if (audio == NULL) {
+    return false;
+  }
+
+  memset(&desired, 0, sizeof(desired));
+  desired.freq = 48000;
+  desired.format = AUDIO_F32SYS;
+  desired.channels = 2;
+  desired.samples = 1024;
+  desired.callback = audio_callback;
+  desired.userdata = audio;
+
+  audio->device = SDL_OpenAudioDevice(NULL, 0, &desired, &audio->obtained, 0);
+  if (audio->device == 0u) {
+    fprintf(stderr, "SDL_OpenAudioDevice failed while porting Paula SFX: %s\n", SDL_GetError());
+    return false;
+  }
+
+  if (audio->obtained.format != AUDIO_F32SYS || audio->obtained.channels != 2) {
+    fprintf(stderr, "SDL_OpenAudioDevice returned unsupported format/channels for Paula SFX port\n");
+    SDL_CloseAudioDevice(audio->device);
+    audio->device = 0u;
+    return false;
+  }
+
+  audio->initialized = true;
+  SDL_PauseAudioDevice(audio->device, 0);
+  return true;
+}
+
+static void audio_shutdown(AudioSystem *audio) {
+  if (audio == NULL) {
+    return;
+  }
+
+  if (audio->device != 0u) {
+    SDL_CloseAudioDevice(audio->device);
+    audio->device = 0u;
+  }
+  audio->initialized = false;
+  audio_free_sfx_bank(audio);
+}
+
+static void audio_start_channel_locked(AudioSystem *audio, AudioChannel *channel, int sfx_id, int volume, int priority) {
+  const SfxSample *sample = NULL;
+
+  if (audio == NULL || channel == NULL || sfx_id < 0 || sfx_id >= GLOOM_SFX_COUNT) {
+    return;
+  }
+
+  sample = &audio->samples[sfx_id];
+  if (!sample->loaded || sample->samples == NULL || sample->sample_count == 0u) {
+    return;
+  }
+
+  memset(channel, 0, sizeof(*channel));
+  channel->active = true;
+  channel->sfx_id = sfx_id;
+  channel->volume = volume < 0 ? 0 : (volume > 64 ? 64 : volume);
+  channel->priority = priority;
+  channel->repeat_count = 2u;
+  channel->position = 0.0;
+  channel->increment = sample->sample_rate / (double)audio->obtained.freq;
+}
+
+static void audio_play_sfx(int sfx_id, int volume, int priority) {
+  AudioSystem *audio = &g_audio;
+  int i = 0;
+
+  if (!audio->initialized || audio->device == 0u || sfx_id < 0 || sfx_id >= GLOOM_SFX_COUNT) {
+    return;
+  }
+
+  SDL_LockAudioDevice(audio->device);
+  for (i = 0; i < GLOOM_AUDIO_CHANNEL_COUNT; ++i) {
+    AudioChannel *channel = &audio->channels[i];
+
+    if (!channel->active && !channel->queued) {
+      audio_start_channel_locked(audio, channel, sfx_id, volume, priority);
+      SDL_UnlockAudioDevice(audio->device);
+      return;
+    }
+  }
+
+  for (i = 0; i < GLOOM_AUDIO_CHANNEL_COUNT; ++i) {
+    AudioChannel *channel = &audio->channels[i];
+
+    if (priority > channel->priority) {
+      channel->active = false;
+      channel->queued = true;
+      channel->queued_ticks = 1u;
+      channel->queued_sfx_id = sfx_id;
+      channel->queued_volume = volume;
+      channel->queued_priority = priority;
+      SDL_UnlockAudioDevice(audio->device);
+      return;
+    }
+  }
+  SDL_UnlockAudioDevice(audio->device);
+}
+
+static void audio_vblank_tick(void) {
+  AudioSystem *audio = &g_audio;
+  int i = 0;
+
+  if (!audio->initialized || audio->device == 0u) {
+    return;
+  }
+
+  SDL_LockAudioDevice(audio->device);
+  for (i = 0; i < GLOOM_AUDIO_CHANNEL_COUNT; ++i) {
+    AudioChannel *channel = &audio->channels[i];
+
+    if (!channel->queued) {
+      continue;
+    }
+    if (channel->queued_ticks > 0u) {
+      channel->queued_ticks -= 1u;
+    }
+    if (channel->queued_ticks == 0u) {
+      int sfx_id = channel->queued_sfx_id;
+      int volume = channel->queued_volume;
+      int priority = channel->queued_priority;
+
+      channel->queued = false;
+      audio_start_channel_locked(audio, channel, sfx_id, volume, priority);
+    }
+  }
+  SDL_UnlockAudioDevice(audio->device);
 }
 
 static void trim_trailing_slashes(char *path) {
@@ -2089,6 +2501,26 @@ static bool object_type_uses_special_projectile_logic(int16_t object_type) {
          object_type == GLOOM_OBJECT_TYPE_PHANTOM || object_type == GLOOM_OBJECT_TYPE_DEMON;
 }
 
+static bool object_type_is_pickup(int16_t object_type) {
+  return (object_type >= 2 && object_type <= 7) || object_type == GLOOM_OBJECT_TYPE_BOUNCY ||
+         (object_type >= GLOOM_OBJECT_TYPE_WEAPON1 && object_type <= GLOOM_OBJECT_TYPE_WEAPON5);
+}
+
+static int16_t object_type_pickup_weapon(int16_t object_type) {
+  switch (object_type) {
+    case 3:
+      return 1;
+    case GLOOM_OBJECT_TYPE_WEAPON1:
+    case GLOOM_OBJECT_TYPE_WEAPON2:
+    case GLOOM_OBJECT_TYPE_WEAPON3:
+    case GLOOM_OBJECT_TYPE_WEAPON4:
+    case GLOOM_OBJECT_TYPE_WEAPON5:
+      return (int16_t)(object_type - GLOOM_OBJECT_TYPE_WEAPON1);
+    default:
+      return -1;
+  }
+}
+
 static bool object_type_is_enemy(int16_t object_type) {
   return object_type_initial_hitpoints(object_type) > 0 && object_type != 0 && object_type != 1;
 }
@@ -2928,6 +3360,40 @@ static void runtime_hurtobject(AppState *state, RuntimeObjectState *object, cons
   }
 }
 
+static void runtime_play_hurt_sfx(AppState *state, int16_t object_type) {
+  static const int grunt_sfx[4] = {GLOOM_SFX_GRUNT, GLOOM_SFX_GRUNT2, GLOOM_SFX_GRUNT3, GLOOM_SFX_GRUNT4};
+  uint16_t index = 0u;
+
+  if (state == NULL) {
+    return;
+  }
+
+  switch (object_type) {
+    case GLOOM_OBJECT_TYPE_TERRA:
+      audio_play_sfx(GLOOM_SFX_SHOOT2, 64, 2);
+      return;
+    case GLOOM_OBJECT_TYPE_LIZARD:
+      audio_play_sfx(GLOOM_SFX_LIZHIT, 64, 1);
+      return;
+    case GLOOM_OBJECT_TYPE_TROLL:
+      audio_play_sfx(GLOOM_SFX_TROLLHIT, 64, 1);
+      return;
+    case 10:
+    case GLOOM_OBJECT_TYPE_BALDY:
+    case GLOOM_OBJECT_TYPE_PHANTOM:
+    case GLOOM_OBJECT_TYPE_DEMON:
+      index = runtime_random_word(state) & 3u;
+      if (index == g_audio.last_grunt) {
+        index = (index + 1u) & 3u;
+      }
+      g_audio.last_grunt = (uint8_t)index;
+      audio_play_sfx(grunt_sfx[index], 64, 1);
+      return;
+    default:
+      return;
+  }
+}
+
 static void runtime_spawn_soul(AppState *state, const RuntimeObjectState *object, uint16_t object_index) {
   float dir_x = 0.0f;
   float dir_z = 0.0f;
@@ -3003,6 +3469,7 @@ static void runtime_apply_object_hit(AppState *state, RuntimeObjectState *object
       runtime_start_deathsuck(state, object, combat, object_index);
       return;
     default:
+      runtime_play_hurt_sfx(state, object_type);
       runtime_hurtobject(state, object, combat);
       return;
   }
@@ -3064,6 +3531,11 @@ static void runtime_blowobject(AppState *state, RuntimeObjectState *object, cons
     state->death_suck_active = false;
   }
 
+  if (combat->death_routine == GLOOM_OBJECT_DIE_BLOWTERRA) {
+    audio_play_sfx(GLOOM_SFX_ROBODIE, 64, 20);
+  } else {
+    audio_play_sfx(GLOOM_SFX_DIE, 64, 2);
+  }
   spawn_runtime_bloodymess(state, object, combat, 31u, 4u);
   if (object_type_has_blowchunx(object_type)) {
     if (object_visuals == NULL || object_type < 0 || object_type >= (int16_t)GLOOM_OBJECT_TYPE_COUNT) {
@@ -3094,6 +3566,10 @@ static void runtime_blowdragon(AppState *state, RuntimeObjectState *object, cons
     return;
   }
 
+  audio_play_sfx(GLOOM_SFX_DIE, 64, 50);
+  audio_play_sfx(GLOOM_SFX_DIE, 64, 50);
+  audio_play_sfx(GLOOM_SFX_ROBODIE, 64, 50);
+  audio_play_sfx(GLOOM_SFX_ROBODIE, 64, 50);
   spawn_runtime_bloodymess(state, object, combat, 63u, 4u);
   if (object_visuals == NULL || object_type < 0 || object_type >= (int16_t)GLOOM_OBJECT_TYPE_COUNT) {
     fprintf(stderr, "Failed to port blowdragon: missing chunk visual set for object type %d\n", object_type);
@@ -3391,6 +3867,19 @@ static void update_baldy_family_object(AppState *state, RuntimeObjectState *obje
 
   if (object->delay <= 0.0f) {
     object->rotation = runtime_angle_to_player(state, object);
+    if (object_type == GLOOM_OBJECT_TYPE_LIZARD) {
+      float dx = object->x - state->camera_x;
+      float dz = object->z - state->camera_z;
+      if (dx * dx + dz * dz < 256.0f * 256.0f) {
+        audio_play_sfx(GLOOM_SFX_LIZARD, 32, 5);
+      }
+    } else if (object_type == GLOOM_OBJECT_TYPE_TROLL) {
+      float dx = object->x - state->camera_x;
+      float dz = object->z - state->camera_z;
+      if (dx * dx + dz * dz < 320.0f * 320.0f) {
+        audio_play_sfx(GLOOM_SFX_TROLLMAD, 64, 5);
+      }
+    }
     runtime_baldy_family_enter_charge(object, combat);
     return;
   }
@@ -3539,6 +4028,7 @@ static void update_terra_object(AppState *state, RuntimeObjectState *object, con
     object->delay = 12.0f;
     object->rotation = runtime_angle_to_player(state, object);
     (void)spawn_enemy_projectile_params(state, object, 3u, 1, 3, 16.0f, -60.0f);
+    audio_play_sfx(GLOOM_SFX_SHOOT3, 32, 5);
     object->delay2 -= 1.0f;
     if (object->delay2 <= 0.0f) {
       runtime_set_random_delay(state, object, combat);
@@ -3557,6 +4047,9 @@ static void update_terra_object(AppState *state, RuntimeObjectState *object, con
     return;
   }
 
+  if ((((int)SDL_ceilf(object->delay)) & 31) == 0) {
+    audio_play_sfx(GLOOM_SFX_ROBOT, 64, 10);
+  }
   runtime_monstermove(state, object, combat, step_scale);
 }
 
@@ -3588,6 +4081,7 @@ static void update_ghoul_object(AppState *state, RuntimeObjectState *object, con
     runtime_object_dir(object->rotation, &dir_x, &dir_z);
     object->vx = dir_x * object->move_speed;
     object->vz = dir_z * object->move_speed;
+    audio_play_sfx(GLOOM_SFX_GHOUL, 32, -5);
   }
   object->x += object->vx * step_scale;
   object->z += object->vz * step_scale;
@@ -3647,6 +4141,7 @@ static void update_demon_object(AppState *state, RuntimeObjectState *object, con
         (void)spawn_enemy_projectile_params(state, object, weapon_index, weapons[weapon_index].hitpoints,
                                             demon_wtable_scaled_damage(weapon_index), (float)weapons[weapon_index].speed,
                                             -90.0f);
+        audio_play_sfx(weapon_sfx_id(weapon_index), 32, 0);
       }
       object->delay2 = (float)delay_whole;
     }
@@ -3747,6 +4242,7 @@ static void update_dragon_object(AppState *state, RuntimeObjectState *object, co
 
   if (object->rot_speed != 0) {
     object->rot_speed = 0;
+    audio_play_sfx(GLOOM_SFX_DRAGON, 64, 20);
   }
 }
 
@@ -4081,7 +4577,7 @@ static void update_homing_projectile_velocity(AppState *state, RuntimeProjectile
   }
 }
 
-static bool spawn_player_projectile(AppState *state, uint8_t weapon_index) {
+static bool spawn_player_projectile_at_angle(AppState *state, uint8_t weapon_index, float angle, bool play_sound) {
   const WeaponDefinition *weapons = weapon_definitions();
   const WeaponDefinition *weapon = NULL;
   size_t i = 0u;
@@ -4095,8 +4591,8 @@ static bool spawn_player_projectile(AppState *state, uint8_t weapon_index) {
   }
 
   weapon = &weapons[weapon_index];
-  sin_a = SDL_sinf(state->camera_angle);
-  cos_a = SDL_cosf(state->camera_angle);
+  sin_a = SDL_sinf(angle);
+  cos_a = SDL_cosf(angle);
   start_x = state->camera_x;
   start_z = state->camera_z;
 
@@ -4125,10 +4621,22 @@ static bool spawn_player_projectile(AppState *state, uint8_t weapon_index) {
     projectile->vz = cos_a * (float)weapon->speed;
     projectile->hitpoints = weapon->hitpoints;
     projectile->damage = weapon->damage;
+    projectile->bounce_count = state->player_bouncy_bullets;
+    if (play_sound) {
+      audio_play_sfx(weapon_sfx_id(weapon_index), 32, 0);
+    }
     return true;
   }
 
   return false;
+}
+
+static bool spawn_player_projectile(AppState *state, uint8_t weapon_index) {
+  if (state == NULL) {
+    return false;
+  }
+
+  return spawn_player_projectile_at_angle(state, weapon_index, state->camera_angle, true);
 }
 
 static void update_projectiles(AppState *state, const ObjectVisualSet *object_visuals) {
@@ -4174,7 +4682,29 @@ static void update_projectiles(AppState *state, const ObjectVisualSet *object_vi
     if (find_wall_collision_radius(state, projectile->x, projectile->z, (int16_t)GLOOM_PROJECTILE_RADIUS,
                                    &penetration, &zone_index)) {
       (void)penetration;
-      (void)zone_index;
+      if (projectile->bounce_count > 0u && zone_index < state->map.zone_count) {
+        const GloomZone *zone = &state->map.zones[zone_index];
+        float nx = -(float)zone->na;
+        float nz = (float)zone->nb;
+        float n_len = SDL_sqrtf(nx * nx + nz * nz);
+
+        projectile->bounce_count -= 1u;
+        projectile->x = prev_x;
+        projectile->z = prev_z;
+        if (n_len <= 0.0001f) {
+          fprintf(stderr, "Cannot port calcbounce for zone %zu: original wall normal is zero\n", zone_index);
+          projectile->active = false;
+          continue;
+        }
+        nx /= n_len;
+        nz /= n_len;
+        {
+          float dot = projectile->vx * nx + projectile->vz * nz;
+          projectile->vx -= 2.0f * dot * nx;
+          projectile->vz -= 2.0f * dot * nz;
+        }
+        continue;
+      }
       spawn_runtime_sparks(state, projectile->weapon_index, projectile->x, projectile->y, projectile->z);
       projectile->active = false;
       continue;
@@ -4314,6 +4844,7 @@ static void update_chunks(AppState *state) {
     chunk->y += chunk->vy * step_scale;
     if (chunk->y >= 0.0f) {
       if (state->violence_mode != GLOOM_VIOLENCE_MEATY) {
+        audio_play_sfx(GLOOM_SFX_SPLAT, 32, -1);
         spawn_runtime_gore(state, chunk);
       }
       chunk->active = false;
@@ -4363,7 +4894,30 @@ static void update_player_weapon(AppState *state, const PlayerControls *controls
   }
 
   if (!state->player_last_fire && state->player_reload_counter <= 0.0f) {
-    if (spawn_player_projectile(state, state->player_weapon)) {
+    bool fired = false;
+
+    if (state->player_mega_timer > 0.0f) {
+      int16_t base_rotation = radians_to_amiga_rotation(state->camera_angle);
+      float left_angle = 0.0f;
+      float right_angle = 0.0f;
+
+      if (state->player_mega_timer >= (float)GLOOM_PLAYER_MEGA_OVERKILL) {
+        left_angle = amiga_rotation_to_radians((int16_t)((base_rotation + 8) & 255));
+        right_angle = amiga_rotation_to_radians((int16_t)((base_rotation - 8) & 255));
+        fired = spawn_player_projectile_at_angle(state, state->player_weapon, left_angle, false);
+        fired = spawn_player_projectile_at_angle(state, state->player_weapon, right_angle, false) || fired;
+        fired = spawn_player_projectile_at_angle(state, state->player_weapon, state->camera_angle, true) || fired;
+      } else {
+        left_angle = amiga_rotation_to_radians((int16_t)((base_rotation + 4) & 255));
+        right_angle = amiga_rotation_to_radians((int16_t)((base_rotation - 4) & 255));
+        fired = spawn_player_projectile_at_angle(state, state->player_weapon, left_angle, false);
+        fired = spawn_player_projectile_at_angle(state, state->player_weapon, right_angle, true) || fired;
+      }
+    } else {
+      fired = spawn_player_projectile(state, state->player_weapon);
+    }
+
+    if (fired) {
       state->player_reload_counter = (float)state->player_reload;
       state->player_weapon_flash = (float)GLOOM_GUN_FLASH_AMIGA_TICKS;
     }
@@ -4372,10 +4926,176 @@ static void update_player_weapon(AppState *state, const PlayerControls *controls
   state->player_last_fire = true;
 }
 
+static void update_player_power_timers(AppState *state) {
+  float step_scale = fixed_step_amiga_scale();
+
+  if (state == NULL) {
+    return;
+  }
+
+  if (state->player_mega_timer > 0.0f) {
+    state->player_mega_timer -= step_scale;
+    if (state->player_mega_timer < 0.0f) {
+      state->player_mega_timer = 0.0f;
+    }
+  }
+  if (state->player_thermo_timer > 0.0f) {
+    state->player_thermo_timer -= step_scale;
+    if (state->player_thermo_timer < 0.0f) {
+      state->player_thermo_timer = 0.0f;
+    }
+  }
+  if (state->player_invisible_timer > 0.0f) {
+    state->player_invisible_timer -= step_scale;
+    if (state->player_invisible_timer < 0.0f) {
+      state->player_invisible_timer = 0.0f;
+    }
+  }
+  if (state->player_hyper_timer < 0) {
+    state->player_hyper_timer -= 4.0f * step_scale;
+    if (-state->player_hyper_timer >= 0x280) {
+      state->player_hyper_timer = (float)((750 << 2) + 0x280);
+    }
+  } else if (state->player_hyper_timer > 0) {
+    state->player_hyper_timer -= 4.0f * step_scale;
+    if (state->player_hyper_timer < 0) {
+      state->player_hyper_timer = 0.0f;
+    }
+  }
+}
+
+static bool apply_player_weapon_pickup(AppState *state, int16_t weapon_index) {
+  if (state == NULL || weapon_index < 0 || weapon_index >= GLOOM_WEAPON_COUNT) {
+    return false;
+  }
+
+  if ((uint8_t)weapon_index != state->player_weapon) {
+    state->player_weapon = (uint8_t)weapon_index;
+    state->player_reload = (uint8_t)GLOOM_PLAYER_INITIAL_RELOAD;
+    state->player_reload_counter = 0.0f;
+    return true;
+  }
+
+  if (state->player_reload > 0u) {
+    state->player_reload -= 1u;
+  }
+  if (state->player_reload == 0u) {
+    state->player_reload = 1u;
+    state->player_mega_timer += 250.0f;
+  }
+  return true;
+}
+
+static bool apply_player_pickup(AppState *state, RuntimeObjectState *object, int16_t object_type) {
+  bool consumed = true;
+
+  if (state == NULL || object == NULL) {
+    return false;
+  }
+
+  audio_play_sfx(GLOOM_SFX_TOKEN, 64, 0);
+  switch (object_type) {
+    case 2:
+      state->player_hitpoints += 5;
+      if (state->player_hitpoints > GLOOM_PLAYER_INITIAL_HEALTH) {
+        state->player_hitpoints = GLOOM_PLAYER_INITIAL_HEALTH;
+      }
+      break;
+    case 3:
+    case GLOOM_OBJECT_TYPE_WEAPON1:
+    case GLOOM_OBJECT_TYPE_WEAPON2:
+    case GLOOM_OBJECT_TYPE_WEAPON3:
+    case GLOOM_OBJECT_TYPE_WEAPON4:
+    case GLOOM_OBJECT_TYPE_WEAPON5:
+      consumed = apply_player_weapon_pickup(state, object_type_pickup_weapon(object_type));
+      break;
+    case 4:
+    case 5:
+      state->player_thermo_timer += 1500.0f;
+      break;
+    case 6:
+      state->player_invisible_timer += 1500.0f;
+      break;
+    case 7:
+      if (state->player_hyper_timer != 0.0f) {
+        consumed = false;
+      } else {
+        state->player_hyper_timer = -512.0f;
+      }
+      break;
+    case GLOOM_OBJECT_TYPE_BOUNCY:
+      if (state->player_bouncy_bullets >= 3u) {
+        consumed = false;
+      } else {
+        state->player_bouncy_bullets += 1u;
+      }
+      break;
+    default:
+      consumed = false;
+      break;
+  }
+
+  if (consumed) {
+    object->active = false;
+  }
+  return consumed;
+}
+
+static void update_pickups(AppState *state) {
+  size_t i = 0u;
+  size_t count = 0u;
+
+  if (state == NULL || state->player_dead || state->player_hitpoints <= 0) {
+    return;
+  }
+
+  count = state->map.object_spawn_count;
+  if (count > (size_t)GLOOM_MAX_RUNTIME_OBJECTS) {
+    count = (size_t)GLOOM_MAX_RUNTIME_OBJECTS;
+  }
+
+  for (i = 0u; i < count; ++i) {
+    const GloomObjectSpawn *spawn = &state->map.object_spawns[i];
+    RuntimeObjectState *object = &state->objects[i];
+    float dx = 0.0f;
+    float dz = 0.0f;
+    float radius = 0.0f;
+
+    if (!object->active || !object_type_is_pickup(spawn->object_type)) {
+      continue;
+    }
+
+    if (object_type_pickup_weapon(spawn->object_type) >= 0) {
+      object->bounce_phase += 8.0f * fixed_step_amiga_scale();
+      while (object->bounce_phase >= 128.0f) {
+        object->bounce_phase -= 128.0f;
+      }
+      object->render_y_offset =
+          -SDL_sinf(amiga_rotation_to_radians((int16_t)round_float_to_int32(object->bounce_phase))) * 128.0f;
+      runtime_advance_monster_frame(object, 0x8000, fixed_step_amiga_scale());
+    } else if (spawn->object_type == GLOOM_OBJECT_TYPE_BOUNCY) {
+      static const uint32_t frames[4] = {3u << 16, 4u << 16, 3u << 16, 5u << 16};
+      int frame_index = ((int)object->delay >> 1) & 3;
+
+      object->delay += fixed_step_amiga_scale();
+      object->frame_fixed = frames[frame_index];
+    }
+
+    dx = object->x - state->camera_x;
+    dz = object->z - state->camera_z;
+    radius = (float)state->player_radius + (float)object->radius;
+    if (dx * dx + dz * dz <= radius * radius) {
+      (void)apply_player_pickup(state, object, spawn->object_type);
+    }
+  }
+}
+
 static void update(AppState *state, const uint8_t *keyboard, const ObjectVisualSet *object_visuals) {
   PlayerControls controls;
 
   state->tick_count += 1;
+  audio_vblank_tick();
+  update_player_power_timers(state);
   update_rotpolys(state);
   update_doors(state);
   update_runtime_objects(state);
@@ -4424,6 +5144,7 @@ static void update(AppState *state, const uint8_t *keyboard, const ObjectVisualS
   controls = read_modern_player_controls(keyboard);
   update_player_keyboard_rotation(state, &controls);
   update_player_movement(state, &controls);
+  update_pickups(state);
   update_player_weapon(state, &controls);
 }
 
@@ -5060,6 +5781,7 @@ static void start_runtime_door(AppState *state, uint16_t zone_index) {
   door->base_z2 = zone->z2;
   door->frac = 0;
   door->frac_add = 0x0100;
+  audio_play_sfx(GLOOM_SFX_DOOR, 64, 0);
 }
 
 static void start_pending_teleport(AppState *state, const GloomTeleportCommand *command) {
@@ -5072,6 +5794,7 @@ static void start_pending_teleport(AppState *state, const GloomTeleportCommand *
   state->teleport_x = command->x;
   state->teleport_z = command->z;
   state->teleport_rotation = command->rotation;
+  audio_play_sfx(GLOOM_SFX_TELEPORT, 64, 0);
 }
 
 static void start_runtime_rotpoly(AppState *state, const GloomRotPolyCommand *command) {
@@ -5795,7 +6518,7 @@ static void render_wall_debug(SDL_Renderer *renderer, const AppState *state, con
         continue;
       }
 
-      if (object != NULL && object->enemy && !object->active) {
+      if (object != NULL && !object->active && (object->enemy || object_type_is_pickup(spawn->object_type))) {
         continue;
       }
 
@@ -5811,12 +6534,12 @@ static void render_wall_debug(SDL_Renderer *renderer, const AppState *state, con
       render_spawn = *spawn;
       if (object != NULL && object->active) {
         render_spawn.x = clamp_int16(round_float_to_int32(object->x));
-        render_spawn.y = clamp_int16(round_float_to_int32(object->y));
+        render_spawn.y = clamp_int16(round_float_to_int32(object->y + object->render_y_offset));
         render_spawn.z = clamp_int16(round_float_to_int32(object->z));
         render_spawn.rotation = object->rotation;
       }
 
-      if (object != NULL && object->active && object->enemy) {
+      if (object != NULL && object->active && (object->enemy || object_type_is_pickup(spawn->object_type))) {
         size_t frame_number = (size_t)(object->frame_fixed >> 16u);
 
         frame = select_object_visual_frame_number(visual, &render_spawn, state, frame_number);
@@ -6858,6 +7581,209 @@ static int run_combat_selftest(void) {
   return 0;
 }
 
+static int run_sfx_selftest(void) {
+  AudioSystem audio;
+  size_t i = 0u;
+
+  memset(&audio, 0, sizeof(audio));
+  if (!audio_load_sfx_bank(&audio)) {
+    return 1;
+  }
+
+  for (i = 0u; i < (size_t)GLOOM_SFX_COUNT; ++i) {
+    const SfxSample *sample = &audio.samples[i];
+
+    if (!sample->loaded || sample->period == 0u || sample->length_words == 0u ||
+        sample->sample_count != (uint32_t)sample->length_words * 2u || sample->sample_rate <= 0.0) {
+      fprintf(stderr, "SFX selftest failed: invalid decoded SFX index %zu\n", i);
+      audio_free_sfx_bank(&audio);
+      return 1;
+    }
+  }
+
+  audio.obtained.freq = 48000;
+  audio_start_channel_locked(&audio, &audio.channels[0], GLOOM_SFX_SHOOT, 32, 0);
+  if (!audio.channels[0].active || audio.channels[0].repeat_count != 2u) {
+    fprintf(stderr, "SFX selftest failed: playsfxnow channel lifetime does not match fx_status=-2\n");
+    audio_free_sfx_bank(&audio);
+    return 1;
+  }
+
+  audio_free_sfx_bank(&audio);
+  printf("SFX selftest passed: loaded %u original Paula samples\n", (unsigned)GLOOM_SFX_COUNT);
+  return 0;
+}
+
+static int run_pickup_selftest(void) {
+  const WeaponDefinition *weapons = weapon_definitions();
+  const SfxDefinition *sfx = sfx_definitions();
+  AppState state;
+  RuntimeObjectState pickup;
+  PlayerControls controls;
+  size_t i = 0u;
+  const RuntimeProjectile *projectile = NULL;
+
+  memset(&state, 0, sizeof(state));
+  memset(&pickup, 0, sizeof(pickup));
+  memset(&controls, 0, sizeof(controls));
+  pickup.active = true;
+
+  if (strcmp(sfx[GLOOM_SFX_TOKEN].symbol, "tokensfx") != 0 ||
+      strcmp(sfx[GLOOM_SFX_TOKEN].path, "amiga/sfxs/token.bin") != 0) {
+    fprintf(stderr, "Pickup selftest failed: playtsfx is not mapped to original tokensfx asset\n");
+    return 1;
+  }
+
+  state.player_hitpoints = 21;
+  if (!apply_player_pickup(&state, &pickup, 2) || state.player_hitpoints != 25 || pickup.active) {
+    fprintf(stderr, "Pickup selftest failed: healthgot did not add 5 and clamp to 25\n");
+    return 1;
+  }
+
+  memset(&pickup, 0, sizeof(pickup));
+  pickup.active = true;
+  state.player_weapon = 0u;
+  state.player_reload = (uint8_t)GLOOM_PLAYER_INITIAL_RELOAD;
+  if (!apply_player_pickup(&state, &pickup, GLOOM_OBJECT_TYPE_WEAPON3) || state.player_weapon != 2u ||
+      state.player_reload != (uint8_t)GLOOM_PLAYER_INITIAL_RELOAD || pickup.active) {
+    fprintf(stderr, "Pickup selftest failed: weapongot did not switch to original weapon index\n");
+    return 1;
+  }
+
+  memset(&pickup, 0, sizeof(pickup));
+  pickup.active = true;
+  state.player_weapon = 2u;
+  state.player_reload = 1u;
+  state.player_mega_timer = 0.0f;
+  if (!apply_player_pickup(&state, &pickup, GLOOM_OBJECT_TYPE_WEAPON3) || state.player_reload != 1u ||
+      (int)state.player_mega_timer != 250 || pickup.active) {
+    fprintf(stderr, "Pickup selftest failed: repeated weapon did not enter mega weapon boost path\n");
+    return 1;
+  }
+
+  memset(&pickup, 0, sizeof(pickup));
+  pickup.active = true;
+  if (!apply_player_pickup(&state, &pickup, 4) || (int)state.player_thermo_timer != 1500 || pickup.active) {
+    fprintf(stderr, "Pickup selftest failed: thermogot did not add 1500 ticks\n");
+    return 1;
+  }
+
+  memset(&pickup, 0, sizeof(pickup));
+  pickup.active = true;
+  if (!apply_player_pickup(&state, &pickup, 6) || (int)state.player_invisible_timer != 1500 || pickup.active) {
+    fprintf(stderr, "Pickup selftest failed: invisigot did not add 1500 ticks\n");
+    return 1;
+  }
+
+  memset(&pickup, 0, sizeof(pickup));
+  pickup.active = true;
+  state.player_hyper_timer = 0.0f;
+  if (!apply_player_pickup(&state, &pickup, 7) || (int)state.player_hyper_timer != -0x200 || pickup.active) {
+    fprintf(stderr, "Pickup selftest failed: invincgot did not start hyper timer\n");
+    return 1;
+  }
+
+  memset(&pickup, 0, sizeof(pickup));
+  pickup.active = true;
+  state.player_bouncy_bullets = 2u;
+  if (!apply_player_pickup(&state, &pickup, GLOOM_OBJECT_TYPE_BOUNCY) || state.player_bouncy_bullets != 3u ||
+      pickup.active) {
+    fprintf(stderr, "Pickup selftest failed: bouncygot did not increment to max 3\n");
+    return 1;
+  }
+
+  memset(&pickup, 0, sizeof(pickup));
+  pickup.active = true;
+  if (apply_player_pickup(&state, &pickup, GLOOM_OBJECT_TYPE_BOUNCY) || state.player_bouncy_bullets != 3u ||
+      !pickup.active) {
+    fprintf(stderr, "Pickup selftest failed: bouncygot consumed pickup past original max 3\n");
+    return 1;
+  }
+
+  memset(&pickup, 0, sizeof(pickup));
+  pickup.active = true;
+  state.map.object_spawn_count = 1u;
+  state.map.object_spawns = (GloomObjectSpawn *)calloc(1u, sizeof(*state.map.object_spawns));
+  if (state.map.object_spawns == NULL) {
+    fprintf(stderr, "Pickup selftest failed: out of memory preparing weaponlogic fixture\n");
+    return 1;
+  }
+  state.map.object_spawns[0].object_type = GLOOM_OBJECT_TYPE_WEAPON3;
+  state.map.object_spawns[0].y = -32;
+  state.objects[0] = pickup;
+  state.objects[0].y = -32.0f;
+  state.objects[0].radius = 24;
+  state.player_hitpoints = GLOOM_PLAYER_INITIAL_HEALTH;
+  state.camera_x = 4096.0f;
+  state.camera_z = 4096.0f;
+  update_pickups(&state);
+  if ((int)state.objects[0].y != -32 || state.objects[0].render_y_offset < -128.0f ||
+      state.objects[0].render_y_offset > 0.0f) {
+    fprintf(stderr, "Pickup selftest failed: weaponlogic bob changed map-authored pickup y or moved below floor\n");
+    free(state.map.object_spawns);
+    state.map.object_spawns = NULL;
+    state.map.object_spawn_count = 0u;
+    return 1;
+  }
+  free(state.map.object_spawns);
+  state.map.object_spawns = NULL;
+  state.map.object_spawn_count = 0u;
+
+  for (i = 0u; i < (size_t)GLOOM_WEAPON_COUNT; ++i) {
+    memset(state.projectiles, 0, sizeof(state.projectiles));
+    state.camera_angle = 0.0f;
+    state.player_bouncy_bullets = 2u;
+    if (!spawn_player_projectile(&state, (uint8_t)i)) {
+      fprintf(stderr, "Pickup selftest failed: weapon %zu did not spawn a projectile\n", i + 1u);
+      return 1;
+    }
+    projectile = combat_selftest_last_projectile(&state);
+    if (combat_selftest_active_projectile_count(&state) != 1u || projectile == NULL ||
+        projectile->weapon_index != (uint8_t)i || projectile->hitpoints != weapons[i].hitpoints ||
+        projectile->damage != weapons[i].damage || (int)projectile->vx != 0 ||
+        (int)projectile->vz != weapons[i].speed || projectile->bounce_count != 2u) {
+      fprintf(stderr, "Pickup selftest failed: weapon %zu projectile type/hits/damage/speed/bounce mismatch\n",
+              i + 1u);
+      return 1;
+    }
+  }
+
+  memset(state.projectiles, 0, sizeof(state.projectiles));
+  state.camera_angle = 0.0f;
+  state.player_weapon = 3u;
+  state.player_reload = (uint8_t)GLOOM_PLAYER_INITIAL_RELOAD;
+  state.player_reload_counter = 0.0f;
+  state.player_last_fire = false;
+  state.player_mega_timer = 250.0f;
+  state.player_bouncy_bullets = 0u;
+  controls.fire = true;
+  update_player_weapon(&state, &controls);
+  if (combat_selftest_active_projectile_count(&state) != 2u) {
+    fprintf(stderr, "Pickup selftest failed: mega weapon boost did not fire original two-shot spread\n");
+    return 1;
+  }
+
+  memset(state.projectiles, 0, sizeof(state.projectiles));
+  state.player_reload_counter = 0.0f;
+  state.player_last_fire = false;
+  state.player_mega_timer = (float)GLOOM_PLAYER_MEGA_OVERKILL;
+  update_player_weapon(&state, &controls);
+  if (combat_selftest_active_projectile_count(&state) != 3u) {
+    fprintf(stderr, "Pickup selftest failed: ultra mega overkill did not fire original three-shot spread\n");
+    return 1;
+  }
+
+  state.player_hyper_timer = -512.0f;
+  update_player_power_timers(&state);
+  if ((int)state.player_hyper_timer != -513) {
+    fprintf(stderr, "Pickup selftest failed: hyper timer is not scaled by Amiga tick rate\n");
+    return 1;
+  }
+
+  printf("Pickup selftest passed\n");
+  return 0;
+}
+
 int main(int argc, char **argv) {
   const char *map_path = "amiga/maps/map1_1";
   const char *resolved_map_path = map_path;
@@ -6926,6 +7852,14 @@ int main(int argc, char **argv) {
 
   if (argc > 1 && strcmp(argv[1], "--combat-selftest") == 0) {
     return run_combat_selftest();
+  }
+
+  if (argc > 1 && strcmp(argv[1], "--sfx-selftest") == 0) {
+    return run_sfx_selftest();
+  }
+
+  if (argc > 1 && strcmp(argv[1], "--pickup-selftest") == 0) {
+    return run_pickup_selftest();
   }
 
   if (argc > 1) {
@@ -7071,8 +8005,25 @@ int main(int argc, char **argv) {
     memcpy(render_zones, state.map.zones, state.map.zone_count * sizeof(*render_zones));
   }
 
-  if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
+  memset(&g_audio, 0, sizeof(g_audio));
+  if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_AUDIO) != 0) {
     fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
+    free(previous_zones);
+    free(render_zones);
+    free_hud_font(&hud_font);
+    free_weapon_visual_set(&weapon_visuals);
+    free_grid_offset_set(&grid_offsets);
+    free_object_visual_set(&object_visuals);
+    free_flat_texture_set(&flat_textures);
+    free_wall_texture_set(&wall_textures);
+    gloom_map_free(&state.map);
+    return 1;
+  }
+
+  if (!audio_load_sfx_bank(&g_audio) || !audio_start(&g_audio)) {
+    fprintf(stderr, "Failed to initialize SDL Paula SFX port from original amiga/sfxs assets\n");
+    audio_shutdown(&g_audio);
+    SDL_Quit();
     free(previous_zones);
     free(render_zones);
     free_hud_font(&hud_font);
@@ -7089,6 +8040,7 @@ int main(int argc, char **argv) {
                             render_height * 4, SDL_WINDOW_RESIZABLE);
   if (window == NULL) {
     fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
+    audio_shutdown(&g_audio);
     SDL_Quit();
     free(previous_zones);
     free(render_zones);
@@ -7109,6 +8061,7 @@ int main(int argc, char **argv) {
   if (renderer == NULL) {
     fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
     SDL_DestroyWindow(window);
+    audio_shutdown(&g_audio);
     SDL_Quit();
     free(previous_zones);
     free(render_zones);
@@ -7208,6 +8161,7 @@ int main(int argc, char **argv) {
   free_wall_texture_set(&wall_textures);
   SDL_DestroyRenderer(renderer);
   SDL_DestroyWindow(window);
+  audio_shutdown(&g_audio);
   SDL_Quit();
   gloom_map_free(&state.map);
 

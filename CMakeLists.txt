@@ -43,6 +43,7 @@ add_custom_command(TARGET gloom_pc POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:gloom_pc>/amiga/data/objs"
   COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:gloom_pc>/amiga/prog/objs"
   COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:gloom_pc>/amiga/misc"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:gloom_pc>/amiga/sfxs"
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
     "${CMAKE_SOURCE_DIR}/amiga/combat.iff"
     "${CMAKE_SOURCE_DIR}/amiga/bullet1.bin"
@@ -81,6 +82,9 @@ add_custom_command(TARGET gloom_pc POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_directory
     "${CMAKE_SOURCE_DIR}/amiga/misc"
     "$<TARGET_FILE_DIR:gloom_pc>/amiga/misc"
+  COMMAND ${CMAKE_COMMAND} -E copy_directory
+    "${CMAKE_SOURCE_DIR}/amiga/sfxs"
+    "$<TARGET_FILE_DIR:gloom_pc>/amiga/sfxs"
   COMMAND ${CMAKE_COMMAND} -E copy_directory
     "${CMAKE_SOURCE_DIR}/amiga/ggfx"
     "$<TARGET_FILE_DIR:gloom_pc>/amiga/ggfx"
