@@ -5453,9 +5453,8 @@ static void update_with_controls(AppState *state, const PlayerControls *controls
   update_player_weapon(state, controls);
 }
 
-static void update(AppState *state, const uint8_t *keyboard, const ObjectVisualSet *object_visuals) {
-  PlayerControls controls =
-      read_modern_player_controls(keyboard, (SDL_GetMouseState(NULL, NULL) & SDL_BUTTON(SDL_BUTTON_LEFT)) != 0u);
+static void update(AppState *state, const uint8_t *keyboard, bool mouse_fire, const ObjectVisualSet *object_visuals) {
+  PlayerControls controls = read_modern_player_controls(keyboard, mouse_fire);
 
   update_with_controls(state, &controls, object_visuals);
 }
@@ -8997,6 +8996,30 @@ static bool load_runtime_level(const char *map_path, AppState *state, WallTextur
   return true;
 }
 
+static bool set_runtime_mouse_capture(SDL_Window *window, bool captured) {
+  if (window == NULL) {
+    return false;
+  }
+
+  if (captured) {
+    if (SDL_SetRelativeMouseMode(SDL_TRUE) != 0) {
+      fprintf(stderr, "SDL_SetRelativeMouseMode(SDL_TRUE) failed: %s\n", SDL_GetError());
+      return false;
+    }
+    SDL_SetWindowGrab(window, SDL_TRUE);
+    (void)SDL_ShowCursor(SDL_DISABLE);
+  } else {
+    if (SDL_SetRelativeMouseMode(SDL_FALSE) != 0) {
+      fprintf(stderr, "SDL_SetRelativeMouseMode(SDL_FALSE) failed: %s\n", SDL_GetError());
+      return false;
+    }
+    SDL_SetWindowGrab(window, SDL_FALSE);
+    (void)SDL_ShowCursor(SDL_ENABLE);
+  }
+
+  return true;
+}
+
 int main(int argc, char **argv) {
   const char *map_path = "amiga/maps/map1_1";
   const char *resolved_map_path = map_path;
@@ -9019,6 +9042,8 @@ int main(int argc, char **argv) {
   double title_timer = 0.0;
   const double dt = 1.0 / (double)FIXED_TICK_HZ;
   bool running = true;
+  bool mouse_captured = true;
+  bool suppress_mouse_fire_until_button_up = false;
   int mouse_dx_accum = 0;
   int render_width = DEFAULT_WINDOW_WIDTH;
   int render_height = DEFAULT_WINDOW_HEIGHT;
@@ -9384,8 +9409,7 @@ int main(int argc, char **argv) {
     gloom_map_free(&state.map);
     return 1;
   }
-  (void)SDL_SetRelativeMouseMode(SDL_TRUE);
-  (void)SDL_ShowCursor(SDL_DISABLE);
+  mouse_captured = set_runtime_mouse_capture(window, true);
 
   previous_state = state;
   if (previous_zones != NULL) {
@@ -9414,25 +9438,45 @@ int main(int argc, char **argv) {
         running = false;
       }
       if (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE) {
-        running = false;
+        if (mouse_captured && set_runtime_mouse_capture(window, false)) {
+          mouse_captured = false;
+          mouse_dx_accum = 0;
+          suppress_mouse_fire_until_button_up = false;
+          SDL_FlushEvent(SDL_MOUSEMOTION);
+        }
       }
-      if (event.type == SDL_MOUSEMOTION) {
+      if (event.type == SDL_MOUSEBUTTONDOWN && event.button.clicks >= 2) {
+        if (!mouse_captured && set_runtime_mouse_capture(window, true)) {
+          mouse_captured = true;
+          mouse_dx_accum = 0;
+          suppress_mouse_fire_until_button_up = event.button.button == SDL_BUTTON_LEFT;
+          SDL_FlushEvent(SDL_MOUSEMOTION);
+        }
+      }
+      if (event.type == SDL_MOUSEBUTTONUP && event.button.button == SDL_BUTTON_LEFT) {
+        suppress_mouse_fire_until_button_up = false;
+      }
+      if (event.type == SDL_MOUSEMOTION && mouse_captured) {
         mouse_dx_accum += event.motion.xrel;
       }
     }
 
-    apply_mouse_look(&state, mouse_dx_accum);
+    if (mouse_captured) {
+      apply_mouse_look(&state, mouse_dx_accum);
+    }
     mouse_dx_accum = 0;
 
     while (accumulator >= dt) {
       const uint8_t *keyboard = SDL_GetKeyboardState(NULL);
+      bool mouse_fire = mouse_captured && !suppress_mouse_fire_until_button_up &&
+                        ((SDL_GetMouseState(NULL, NULL) & SDL_BUTTON(SDL_BUTTON_LEFT)) != 0u);
 
       previous_state = state;
       if (previous_zones != NULL) {
         memcpy(previous_zones, state.map.zones, state.map.zone_count * sizeof(*previous_zones));
         previous_state.map.zones = previous_zones;
       }
-      update(&state, keyboard, &object_visuals);
+      update(&state, keyboard, mouse_fire, &object_visuals);
       if (state.finished == GLOOM_LEVEL_COMPLETE_FINISHED) {
         level_transition_pending = true;
         break;
