@@ -44,6 +44,7 @@ enum {
   GLOOM_PLAYER_UNBOUNCE_STEP = 30,
   GLOOM_PLAYER_BOB_HEIGHT = 20,
   GLOOM_PLAYER_INITIAL_HEALTH = 25,
+  GLOOM_PLAYER_RED_PAL_TIMER = 2,
   GLOOM_PLAYER_MEGA_OVERKILL = 875,
   GLOOM_MOUSE_LOOK_FIXED_PER_PIXEL = 0x2000,
   GLOOM_WEAPON_COUNT = 5,
@@ -303,6 +304,7 @@ typedef struct {
   uint8_t player_bouncy_bullets;
   float player_reload_counter;
   float player_weapon_flash;
+  float player_palette_timer;
   float player_mega_timer;
   float player_invisible_timer;
   float player_thermo_timer;
@@ -617,6 +619,14 @@ static uint64_t sim_ticks_to_amiga_ticks(uint64_t ticks) {
   return (ticks * (uint64_t)GLOOM_AMIGA_GAME_TICK_HZ) / (uint64_t)FIXED_TICK_HZ;
 }
 
+static void player_redpal(AppState *state) {
+  if (state == NULL) {
+    return;
+  }
+
+  state->player_palette_timer = (float)GLOOM_PLAYER_RED_PAL_TIMER;
+}
+
 static void mark_player_dead(AppState *state) {
   if (state == NULL || state->player_dead) {
     return;
@@ -626,6 +636,7 @@ static void mark_player_dead(AppState *state) {
     state->player_lives -= 1;
   }
   state->player_dead = true;
+  player_redpal(state);
 }
 
 static void compute_map_bounds(AppState *state) {
@@ -702,6 +713,7 @@ static bool initialize_camera_from_map_spawn(AppState *state) {
   state->player_bouncy_bullets = 0u;
   state->player_reload_counter = 0.0f;
   state->player_weapon_flash = 0.0f;
+  state->player_palette_timer = 0.0f;
   state->player_mega_timer = 0.0f;
   state->player_invisible_timer = 0.0f;
   state->player_thermo_timer = 0.0f;
@@ -4068,6 +4080,7 @@ static void damage_player_from_object(AppState *state, const RuntimeObjectState 
   if (state->player_hitpoints < 0) {
     state->player_hitpoints = 0;
   }
+  player_redpal(state);
   if (state->player_hitpoints == 0) {
     mark_player_dead(state);
   }
@@ -4836,6 +4849,7 @@ static bool damage_projectile_player(AppState *state, RuntimeProjectile *project
   if (state->player_hitpoints < 0) {
     state->player_hitpoints = 0;
   }
+  player_redpal(state);
   if (state->player_hitpoints == 0) {
     mark_player_dead(state);
   }
@@ -5275,6 +5289,12 @@ static void update_player_power_timers(AppState *state) {
     state->player_mega_timer -= step_scale;
     if (state->player_mega_timer < 0.0f) {
       state->player_mega_timer = 0.0f;
+    }
+  }
+  if (state->player_palette_timer > 0.0f) {
+    state->player_palette_timer -= step_scale;
+    if (state->player_palette_timer < 0.0f) {
+      state->player_palette_timer = 0.0f;
     }
   }
   if (state->player_thermo_timer > 0.0f) {
@@ -6710,6 +6730,32 @@ static void framebuffer_put_argb(RenderFramebuffer *framebuffer, int x, int y, u
       0xFF000000u | (argb & 0x00FFFFFFu);
 }
 
+static void apply_player_red_palette(RenderFramebuffer *framebuffer, const AppState *state) {
+  int y = 0;
+
+  if (framebuffer == NULL || framebuffer->pixels == NULL || state == NULL || state->player_palette_timer <= 0.0f) {
+    return;
+  }
+
+  for (y = 0; y < framebuffer->height; ++y) {
+    uint32_t *row = framebuffer->pixels + ((size_t)y * (size_t)framebuffer->pitch_pixels);
+    int x = 0;
+
+    for (x = 0; x < framebuffer->width; ++x) {
+      uint32_t argb = row[x];
+      int r = (int)((argb >> 16) & 0xFFu);
+      int g = (int)((argb >> 8) & 0xFFu);
+      int b = (int)(argb & 0xFFu);
+      int red = (r + g + b + (16 * 17)) / 3;
+
+      if (red > 255) {
+        red = 255;
+      }
+      row[x] = 0xFF000000u | ((uint32_t)red << 16);
+    }
+  }
+}
+
 static float projection_focal_for_viewport(int w, int h) {
   float scale_x = (float)w / (float)GLOOM_AMIGA_VIEW_COLUMNS;
   float scale_y = (float)h / (float)GLOOM_AMIGA_VIEW_ROWS;
@@ -7914,6 +7960,7 @@ static void render(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const
   framebuffer_clear(framebuffer, 0xFF000000u);
   render_scene_contents(framebuffer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals,
                         hud_font, render_width, render_height);
+  apply_player_red_palette(framebuffer, state);
   end_render_framebuffer(framebuffer);
 
   SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
@@ -8170,6 +8217,30 @@ static int run_combat_selftest(void) {
                                   demon_wtable_scaled_damage(4u) == 3,
                               "demonpause 3/4 wtable damage scaling")) {
     return 1;
+  }
+
+  state.player_hitpoints = GLOOM_PLAYER_INITIAL_HEALTH;
+  memset(&test_object, 0, sizeof(test_object));
+  test_object.damage = 3;
+  damage_player_from_object(&state, &test_object);
+  if (!combat_selftest_expect(state.player_hitpoints == 22 &&
+                                  (int)state.player_palette_timer == GLOOM_PLAYER_RED_PAL_TIMER,
+                              "playerhit redpal timer")) {
+    return 1;
+  }
+  {
+    uint32_t pixel = 0xFF102030u;
+    RenderFramebuffer framebuffer;
+
+    memset(&framebuffer, 0, sizeof(framebuffer));
+    framebuffer.pixels = &pixel;
+    framebuffer.width = 1;
+    framebuffer.height = 1;
+    framebuffer.pitch_pixels = 1;
+    apply_player_red_palette(&framebuffer, &state);
+    if (!combat_selftest_expect(pixel == 0xFF7A0000u, "palettesr red flash transform")) {
+      return 1;
+    }
   }
 
   state.player_hitpoints = GLOOM_PLAYER_INITIAL_HEALTH;
