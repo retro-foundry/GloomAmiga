@@ -78,6 +78,7 @@ enum {
   GLOOM_HUD_LIVES_X = 218,
   GLOOM_HUD_LIVES_Y = 2,
   GLOOM_HUD_LIVES_SPACING = 8,
+  GLOOM_HUD_LIVES_RIGHT_ALIGN_COUNT = 6,
   GLOOM_HUD_HEALTH_X = 267,
   GLOOM_HUD_HEALTH_Y = 3,
   GLOOM_HUD_HEALTH_SPACING = 2,
@@ -88,7 +89,6 @@ enum {
   GLOOM_GUN_FLASH_AMIGA_TICKS = 4,
   GLOOM_GUN_LOWER_OFFSET = 30,
   GLOOM_GUN_MUZZLE_LOWER_OFFSET = 0,
-  GLOOM_GUN_MUZZLE_SCALE_PERCENT = 170,
   GLOOM_GUN_RECOIL_BACK_OFFSET = 7,
   GLOOM_GUN_SIDE_BOB = 6,
   GLOOM_GUN_SIDE_LIFT = 4,
@@ -6817,16 +6817,6 @@ static void framebuffer_clear(RenderFramebuffer *framebuffer, uint32_t argb) {
   }
 }
 
-static void framebuffer_put_argb(RenderFramebuffer *framebuffer, int x, int y, uint32_t argb) {
-  if (framebuffer == NULL || framebuffer->pixels == NULL || x < 0 || y < 0 || x >= framebuffer->width ||
-      y >= framebuffer->height) {
-    return;
-  }
-
-  framebuffer->pixels[(size_t)y * (size_t)framebuffer->pitch_pixels + (size_t)x] =
-      0xFF000000u | (argb & 0x00FFFFFFu);
-}
-
 static void apply_player_red_palette(RenderFramebuffer *framebuffer, const AppState *state) {
   int y = 0;
 
@@ -7697,62 +7687,81 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
 
 }
 
-static void render_object_frame_scaled(RenderFramebuffer *framebuffer, const ObjectFrame *frame, float screen_x,
-                                       float screen_y, float scale) {
-  int x0 = 0;
-  int x1 = 0;
-  int y0 = 0;
-  int y1 = 0;
-  int draw_y = 0;
+static int ui_double_scale_for_viewport(int w, int h) {
+  int scale = 1;
 
-  if (framebuffer == NULL || frame == NULL || frame->width <= 0 || frame->height <= 0 ||
-      frame->argb_pixels == NULL || scale <= 0.0f) {
+  if (w <= 0 || h <= 0) {
+    return 1;
+  }
+
+  while (scale < 16 && BASE_WIDTH * (scale * 2) <= w && GLOOM_HUD_STATUS_HEIGHT * (scale * 2) <= h) {
+    scale *= 2;
+  }
+
+  return scale;
+}
+
+static void render_argb_pixels_scaled(RenderFramebuffer *framebuffer, const uint32_t *pixels, int src_width,
+                                      int src_height, int x, int y, int scale) {
+  int sy = 0;
+
+  if (framebuffer == NULL || framebuffer->pixels == NULL || pixels == NULL || src_width <= 0 || src_height <= 0 ||
+      scale <= 0) {
     return;
   }
 
-  x0 = (int)screen_x;
-  y0 = (int)screen_y;
-  x1 = (int)(screen_x + ((float)frame->width * scale));
-  y1 = (int)(screen_y + ((float)frame->height * scale));
-  if (x1 < 0 || y1 < 0 || x0 >= framebuffer->width || y0 >= framebuffer->height) {
+  if (x + (src_width * scale) <= 0 || y + (src_height * scale) <= 0 || x >= framebuffer->width ||
+      y >= framebuffer->height) {
     return;
   }
-  if (x0 < 0) x0 = 0;
-  if (y0 < 0) y0 = 0;
-  if (x1 >= framebuffer->width) x1 = framebuffer->width - 1;
-  if (y1 >= framebuffer->height) y1 = framebuffer->height - 1;
 
-  for (draw_y = y0; draw_y <= y1; ++draw_y) {
-    int draw_x = 0;
-    float tv = ((float)draw_y + 0.5f - screen_y) / ((float)frame->height * scale);
+  for (sy = 0; sy < src_height; ++sy) {
+    int dst_y0 = y + (sy * scale);
+    int dst_y1 = dst_y0 + scale;
+    int sx = 0;
 
-    if (tv < 0.0f || tv > 1.0f) {
+    if (dst_y1 <= 0 || dst_y0 >= framebuffer->height) {
       continue;
     }
+    if (dst_y0 < 0) dst_y0 = 0;
+    if (dst_y1 > framebuffer->height) dst_y1 = framebuffer->height;
 
-    for (draw_x = x0; draw_x <= x1; ++draw_x) {
-      float tu = ((float)draw_x + 0.5f - screen_x) / ((float)frame->width * scale);
-      uint32_t argb = 0u;
+    for (sx = 0; sx < src_width; ++sx) {
+      uint32_t argb = pixels[(size_t)sy * (size_t)src_width + (size_t)sx];
       uint8_t alpha = 0u;
-      int sx = 0;
-      int sy = 0;
+      int dst_x0 = x + (sx * scale);
+      int dst_x1 = dst_x0 + scale;
+      int draw_y = 0;
 
-      if (tu < 0.0f || tu > 1.0f) {
-        continue;
-      }
-
-      sx = (int)(tu * (float)(frame->width - 1));
-      sy = (int)(tv * (float)(frame->height - 1));
-      argb = frame->argb_pixels[(size_t)sy * (size_t)frame->width + (size_t)sx];
       alpha = (uint8_t)(argb >> 24);
       if (alpha == 0u) {
         continue;
       }
+      if (dst_x1 <= 0 || dst_x0 >= framebuffer->width) {
+        continue;
+      }
+      if (dst_x0 < 0) dst_x0 = 0;
+      if (dst_x1 > framebuffer->width) dst_x1 = framebuffer->width;
 
-      framebuffer->pixels[(size_t)draw_y * (size_t)framebuffer->pitch_pixels + (size_t)draw_x] =
-          0xFF000000u | (argb & 0x00FFFFFFu);
+      for (draw_y = dst_y0; draw_y < dst_y1; ++draw_y) {
+        uint32_t *row = framebuffer->pixels + ((size_t)draw_y * (size_t)framebuffer->pitch_pixels);
+        int draw_x = 0;
+
+        for (draw_x = dst_x0; draw_x < dst_x1; ++draw_x) {
+          row[draw_x] = 0xFF000000u | (argb & 0x00FFFFFFu);
+        }
+      }
     }
   }
+}
+
+static void render_object_frame_scaled(RenderFramebuffer *framebuffer, const ObjectFrame *frame, int screen_x,
+                                       int screen_y, int scale) {
+  if (frame == NULL) {
+    return;
+  }
+
+  render_argb_pixels_scaled(framebuffer, frame->argb_pixels, frame->width, frame->height, screen_x, screen_y, scale);
 }
 
 static size_t player_weapon_muzzle_frame_index(uint8_t weapon_index) {
@@ -7772,14 +7781,14 @@ static void render_player_weapon(RenderFramebuffer *framebuffer, const AppState 
   const ObjectFrame *base_frame = NULL;
   const ObjectFrame *muzzle_frame = NULL;
   size_t base_frame_index = GLOOM_GUN_IDLE_FRAME;
-  float viewport_scale = 1.0f;
+  int ui_scale = 1;
   float bounce_radians = 0.0f;
   float side_phase = 0.0f;
   float side_bob = 0.0f;
   float anchor_x = 0.0f;
   float anchor_y = 0.0f;
-  float body_draw_x = 0.0f;
-  float body_draw_y = 0.0f;
+  int body_draw_x = 0;
+  int body_draw_y = 0;
 
   if (framebuffer == NULL || state == NULL || weapon_visuals == NULL || w <= 0 || h <= 0) {
     return;
@@ -7798,67 +7807,47 @@ static void render_player_weapon(RenderFramebuffer *framebuffer, const AppState 
     base_frame_index = 0u;
   }
 
-  viewport_scale = (float)h / (float)BASE_HEIGHT;
-  if (viewport_scale <= 0.0f) {
-    viewport_scale = 1.0f;
-  }
+  ui_scale = ui_double_scale_for_viewport(w, h);
 
   base_frame = &gun->frames[base_frame_index];
   bounce_radians = ((float)((uint16_t)state->player_bounce & 511u) * 6.28318530718f) / 512.0f;
   side_phase = SDL_sinf(bounce_radians);
-  side_bob = side_phase * (float)GLOOM_GUN_SIDE_BOB * viewport_scale;
+  side_bob = side_phase * (float)(GLOOM_GUN_SIDE_BOB * ui_scale);
   anchor_x = (float)x + ((float)w * 0.5f);
-  anchor_y = (float)y + (float)h + ((float)GLOOM_GUN_LOWER_OFFSET * viewport_scale);
-  anchor_y -= SDL_fabsf(side_phase) * (float)GLOOM_GUN_SIDE_LIFT * viewport_scale;
+  anchor_y = (float)y + (float)h + (float)(GLOOM_GUN_LOWER_OFFSET * ui_scale);
+  anchor_y -= SDL_fabsf(side_phase) * (float)(GLOOM_GUN_SIDE_LIFT * ui_scale);
   if (base_frame_index == (size_t)GLOOM_GUN_RECOIL_FRAME) {
-    anchor_y += (float)GLOOM_GUN_RECOIL_BACK_OFFSET * viewport_scale;
+    anchor_y += (float)(GLOOM_GUN_RECOIL_BACK_OFFSET * ui_scale);
   }
   anchor_x += side_bob;
 
   if (state->player_weapon_flash > 0.0f &&
       gun->frame_count >= (size_t)(GLOOM_GUN_MUZZLE_FIRST_FRAME + GLOOM_GUN_MUZZLE_FRAME_COUNT)) {
     size_t muzzle_frame_index = player_weapon_muzzle_frame_index(state->player_weapon);
-    float muzzle_scale = viewport_scale * ((float)GLOOM_GUN_MUZZLE_SCALE_PERCENT / 100.0f);
-    float muzzle_anchor_y = (float)y + (float)h + ((float)GLOOM_GUN_MUZZLE_LOWER_OFFSET * viewport_scale);
+    float muzzle_anchor_y = (float)y + (float)h + (float)(GLOOM_GUN_MUZZLE_LOWER_OFFSET * ui_scale);
 
     if (muzzle_frame_index < gun->frame_count) {
-      float muzzle_draw_x = 0.0f;
-      float muzzle_draw_y = 0.0f;
+      int muzzle_draw_x = 0;
+      int muzzle_draw_y = 0;
 
       muzzle_frame = &gun->frames[muzzle_frame_index];
-      muzzle_draw_x = (float)round_float_to_int32(anchor_x - ((float)muzzle_frame->handle_x * muzzle_scale));
-      muzzle_draw_y = (float)round_float_to_int32(muzzle_anchor_y - ((float)muzzle_frame->handle_y * muzzle_scale));
-      render_object_frame_scaled(framebuffer, muzzle_frame, muzzle_draw_x, muzzle_draw_y, muzzle_scale);
+      muzzle_draw_x = round_float_to_int32(anchor_x - (float)(muzzle_frame->handle_x * ui_scale));
+      muzzle_draw_y = round_float_to_int32(muzzle_anchor_y - (float)(muzzle_frame->handle_y * ui_scale));
+      render_object_frame_scaled(framebuffer, muzzle_frame, muzzle_draw_x, muzzle_draw_y, ui_scale);
     }
   }
 
-  body_draw_x = (float)round_float_to_int32(anchor_x - ((float)base_frame->handle_x * viewport_scale));
-  body_draw_y = (float)round_float_to_int32(anchor_y - ((float)base_frame->handle_y * viewport_scale));
-  render_object_frame_scaled(framebuffer, base_frame, body_draw_x, body_draw_y, viewport_scale);
+  body_draw_x = round_float_to_int32(anchor_x - (float)(base_frame->handle_x * ui_scale));
+  body_draw_y = round_float_to_int32(anchor_y - (float)(base_frame->handle_y * ui_scale));
+  render_object_frame_scaled(framebuffer, base_frame, body_draw_x, body_draw_y, ui_scale);
 }
 
-static void render_hud_glyph(RenderFramebuffer *framebuffer, const HudGlyph *glyph, int x, int y) {
-  int py = 0;
-
-  if (framebuffer == NULL || glyph == NULL || glyph->argb_pixels == NULL || glyph->width <= 0 ||
-      glyph->height <= 0) {
+static void render_hud_glyph_scaled(RenderFramebuffer *framebuffer, const HudGlyph *glyph, int x, int y, int scale) {
+  if (glyph == NULL) {
     return;
   }
 
-  for (py = 0; py < glyph->height; ++py) {
-    int px = 0;
-
-    for (px = 0; px < glyph->width; ++px) {
-      uint32_t argb = glyph->argb_pixels[(size_t)py * (size_t)glyph->width + (size_t)px];
-      uint8_t alpha = (uint8_t)(argb >> 24);
-
-      if (alpha == 0u) {
-        continue;
-      }
-
-      framebuffer_put_argb(framebuffer, x + px, y + py, argb);
-    }
-  }
+  render_argb_pixels_scaled(framebuffer, glyph->argb_pixels, glyph->width, glyph->height, x, y, scale);
 }
 
 static void render_player_weapon_status(RenderFramebuffer *framebuffer, const AppState *state, const HudFont *hud_font,
@@ -7867,6 +7856,7 @@ static void render_player_weapon_status(RenderFramebuffer *framebuffer, const Ap
   int count = 0;
   int base_x = x;
   int weapon_char = 0;
+  int ui_scale = 1;
   int status_y = y + h - GLOOM_HUD_STATUS_HEIGHT;
 
   if (framebuffer == NULL || state == NULL || hud_font == NULL || !hud_font->loaded || hud_font->glyphs == NULL ||
@@ -7875,8 +7865,10 @@ static void render_player_weapon_status(RenderFramebuffer *framebuffer, const Ap
     return;
   }
 
-  if (w > BASE_WIDTH) {
-    base_x += (w - BASE_WIDTH) / 2;
+  ui_scale = ui_double_scale_for_viewport(w, h);
+  status_y = y + h - (GLOOM_HUD_STATUS_HEIGHT * ui_scale);
+  if (w > BASE_WIDTH * ui_scale) {
+    base_x += (w - (BASE_WIDTH * ui_scale)) / 2;
   }
 
   count = state->player_hitpoints;
@@ -7884,20 +7876,22 @@ static void render_player_weapon_status(RenderFramebuffer *framebuffer, const Ap
     count = GLOOM_PLAYER_INITIAL_HEALTH;
   }
   for (slot = 0; slot < count; ++slot) {
-    render_hud_glyph(framebuffer, &hud_font->glyphs[GLOOM_HUD_HEALTH_CHAR],
-                     base_x + GLOOM_HUD_HEALTH_X + (slot * GLOOM_HUD_HEALTH_SPACING),
-                     status_y + GLOOM_HUD_HEALTH_Y);
+    render_hud_glyph_scaled(framebuffer, &hud_font->glyphs[GLOOM_HUD_HEALTH_CHAR],
+                            base_x + ((GLOOM_HUD_HEALTH_X + (slot * GLOOM_HUD_HEALTH_SPACING)) * ui_scale),
+                            status_y + (GLOOM_HUD_HEALTH_Y * ui_scale), ui_scale);
   }
 
   count = state->player_lives;
-  if (count > 6) {
-    count = 6;
+  if (count < 0) {
+    count = 0;
   }
   for (slot = 0; slot < count; ++slot) {
-    int draw_x = base_x + GLOOM_HUD_LIVES_X + ((6 - count) * GLOOM_HUD_LIVES_SPACING) +
-                 (slot * GLOOM_HUD_LIVES_SPACING);
+    int draw_x = base_x + (GLOOM_HUD_LIVES_X * ui_scale) +
+                 (((GLOOM_HUD_LIVES_RIGHT_ALIGN_COUNT - count) * GLOOM_HUD_LIVES_SPACING) * ui_scale) +
+                 ((slot * GLOOM_HUD_LIVES_SPACING) * ui_scale);
 
-    render_hud_glyph(framebuffer, &hud_font->glyphs[GLOOM_HUD_LIFE_CHAR], draw_x, status_y + GLOOM_HUD_LIVES_Y);
+    render_hud_glyph_scaled(framebuffer, &hud_font->glyphs[GLOOM_HUD_LIFE_CHAR], draw_x,
+                            status_y + (GLOOM_HUD_LIVES_Y * ui_scale), ui_scale);
   }
 
   weapon_char = GLOOM_HUD_WEAPON_FIRST_CHAR + (int)state->player_weapon;
@@ -7914,10 +7908,10 @@ static void render_player_weapon_status(RenderFramebuffer *framebuffer, const Ap
   }
 
   for (slot = 0; slot < count; ++slot) {
-    int draw_x = base_x + GLOOM_HUD_WEAPON_X + (slot * GLOOM_HUD_WEAPON_SPACING);
-    int draw_y = status_y + GLOOM_HUD_WEAPON_Y;
+    int draw_x = base_x + ((GLOOM_HUD_WEAPON_X + (slot * GLOOM_HUD_WEAPON_SPACING)) * ui_scale);
+    int draw_y = status_y + (GLOOM_HUD_WEAPON_Y * ui_scale);
 
-    render_hud_glyph(framebuffer, &hud_font->glyphs[weapon_char], draw_x, draw_y);
+    render_hud_glyph_scaled(framebuffer, &hud_font->glyphs[weapon_char], draw_x, draw_y, ui_scale);
   }
 }
 
@@ -8694,6 +8688,101 @@ static int run_pickup_selftest(void) {
   }
 
   printf("Pickup selftest passed\n");
+  return 0;
+}
+
+static int run_hud_selftest(void) {
+  RenderFramebuffer framebuffer;
+  HudGlyph glyph;
+  uint32_t glyph_pixels[4] = {0xFFFF0000u, 0x00000000u, 0xFF0000FFu, 0xFF00FF00u};
+  uint32_t framebuffer_pixels[100];
+  int x = 0;
+  int y = 0;
+
+  if (ui_double_scale_for_viewport(320, 224) != 1 || ui_double_scale_for_viewport(640, 480) != 2 ||
+      ui_double_scale_for_viewport(1280, 720) != 4 || ui_double_scale_for_viewport(2560, 1440) != 8) {
+    fprintf(stderr, "HUD selftest failed: UI scale is not restricted to 1x/2x/4x/8x width doubles\n");
+    return 1;
+  }
+
+  memset(&framebuffer, 0, sizeof(framebuffer));
+  memset(&glyph, 0, sizeof(glyph));
+  memset(framebuffer_pixels, 0, sizeof(framebuffer_pixels));
+  framebuffer.pixels = framebuffer_pixels;
+  framebuffer.width = 10;
+  framebuffer.height = 10;
+  framebuffer.pitch_pixels = 10;
+  glyph.argb_pixels = glyph_pixels;
+  glyph.width = 2;
+  glyph.height = 2;
+
+  render_hud_glyph_scaled(&framebuffer, &glyph, 1, 1, 4);
+  for (y = 1; y < 5; ++y) {
+    for (x = 1; x < 5; ++x) {
+      if (framebuffer_pixels[(size_t)y * 10u + (size_t)x] != 0xFFFF0000u) {
+        fprintf(stderr, "HUD selftest failed: scaled glyph did not duplicate source pixels exactly\n");
+        return 1;
+      }
+    }
+    for (x = 5; x < 9; ++x) {
+      if (framebuffer_pixels[(size_t)y * 10u + (size_t)x] != 0u) {
+        fprintf(stderr, "HUD selftest failed: transparent scaled glyph pixel wrote to framebuffer\n");
+        return 1;
+      }
+    }
+  }
+
+  {
+    AppState state;
+    HudFont hud_font;
+    HudGlyph glyphs[GLOOM_HUD_PANEL_CHAR + 1];
+    uint32_t life_pixel = 0xFFFF00FFu;
+    uint32_t health_pixel = 0xFF00FF00u;
+    uint32_t *status_pixels = NULL;
+    int slot = 0;
+
+    memset(&state, 0, sizeof(state));
+    memset(&hud_font, 0, sizeof(hud_font));
+    memset(glyphs, 0, sizeof(glyphs));
+    status_pixels = (uint32_t *)calloc((size_t)BASE_WIDTH * (size_t)BASE_HEIGHT, sizeof(*status_pixels));
+    if (status_pixels == NULL) {
+      fprintf(stderr, "HUD selftest failed: out of memory preparing status framebuffer fixture\n");
+      return 1;
+    }
+
+    framebuffer.pixels = status_pixels;
+    framebuffer.width = BASE_WIDTH;
+    framebuffer.height = BASE_HEIGHT;
+    framebuffer.pitch_pixels = BASE_WIDTH;
+    hud_font.loaded = true;
+    hud_font.glyphs = glyphs;
+    hud_font.glyph_count = (size_t)GLOOM_HUD_PANEL_CHAR + 1u;
+    glyphs[GLOOM_HUD_LIFE_CHAR].argb_pixels = &life_pixel;
+    glyphs[GLOOM_HUD_LIFE_CHAR].width = 1;
+    glyphs[GLOOM_HUD_LIFE_CHAR].height = 1;
+    glyphs[GLOOM_HUD_HEALTH_CHAR].argb_pixels = &health_pixel;
+    glyphs[GLOOM_HUD_HEALTH_CHAR].width = 1;
+    glyphs[GLOOM_HUD_HEALTH_CHAR].height = 1;
+    state.player_lives = 9;
+    state.player_hitpoints = 0;
+    state.player_reload = 6u;
+
+    render_player_weapon_status(&framebuffer, &state, &hud_font, 0, 0, BASE_WIDTH, BASE_HEIGHT);
+    for (slot = 0; slot < 9; ++slot) {
+      int expected_x = GLOOM_HUD_LIVES_X + ((GLOOM_HUD_LIVES_RIGHT_ALIGN_COUNT - 9) * GLOOM_HUD_LIVES_SPACING) +
+                       (slot * GLOOM_HUD_LIVES_SPACING);
+      int expected_y = BASE_HEIGHT - GLOOM_HUD_STATUS_HEIGHT + GLOOM_HUD_LIVES_Y;
+
+      if (status_pixels[(size_t)expected_y * (size_t)BASE_WIDTH + (size_t)expected_x] != life_pixel) {
+        fprintf(stderr, "HUD selftest failed: 9 lives were not right-aligned from the Amiga showstats formula\n");
+        free(status_pixels);
+        return 1;
+      }
+    }
+    free(status_pixels);
+  }
+
+  printf("HUD selftest passed\n");
   return 0;
 }
 
@@ -9590,6 +9679,10 @@ int main(int argc, char **argv) {
 
   if (argc > 1 && strcmp(argv[1], "--pickup-selftest") == 0) {
     return run_pickup_selftest();
+  }
+
+  if (argc > 1 && strcmp(argv[1], "--hud-selftest") == 0) {
+    return run_hud_selftest();
   }
 
   if (argc > 1 && strcmp(argv[1], "--wall-selftest") == 0) {
