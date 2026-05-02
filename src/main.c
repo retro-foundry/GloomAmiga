@@ -351,6 +351,17 @@ typedef struct {
 } PreviewAsset;
 
 typedef struct {
+  SDL_Texture *texture;
+  uint32_t *pixels;
+  float *depth_buffer;
+  float *sprite_depth_buffer;
+  uint8_t *filled_pixels;
+  int pitch_pixels;
+  int width;
+  int height;
+} RenderFramebuffer;
+
+typedef struct {
   uint32_t *argb_pixels;
   int width;
   int height;
@@ -6477,6 +6488,132 @@ static uint32_t sample_flat_texture_argb(const FlatTexture *texture, float world
   return texture->palette[palette_index];
 }
 
+static void free_render_framebuffer(RenderFramebuffer *framebuffer) {
+  if (framebuffer == NULL) {
+    return;
+  }
+
+  if (framebuffer->texture != NULL) {
+    SDL_DestroyTexture(framebuffer->texture);
+  }
+  free(framebuffer->depth_buffer);
+  free(framebuffer->sprite_depth_buffer);
+  free(framebuffer->filled_pixels);
+  memset(framebuffer, 0, sizeof(*framebuffer));
+}
+
+static bool ensure_render_framebuffer(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, int width, int height) {
+  float *depth_buffer = NULL;
+  float *sprite_depth_buffer = NULL;
+  uint8_t *filled_pixels = NULL;
+  SDL_Texture *texture = NULL;
+
+  if (renderer == NULL || framebuffer == NULL || width <= 0 || height <= 0) {
+    return false;
+  }
+
+  if (framebuffer->texture != NULL && framebuffer->width == width && framebuffer->height == height) {
+    return true;
+  }
+
+  depth_buffer = (float *)malloc((size_t)width * sizeof(*depth_buffer));
+  sprite_depth_buffer = (float *)malloc((size_t)width * sizeof(*sprite_depth_buffer));
+  filled_pixels = (uint8_t *)malloc((size_t)height);
+  if (depth_buffer == NULL || sprite_depth_buffer == NULL || filled_pixels == NULL) {
+    fprintf(stderr, "Cannot allocate PC renderer scratch buffers %dx%d\n", width, height);
+    free(depth_buffer);
+    free(sprite_depth_buffer);
+    free(filled_pixels);
+    return false;
+  }
+
+  texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, width, height);
+  if (texture == NULL) {
+    fprintf(stderr, "Cannot create PC renderer framebuffer texture %dx%d: %s\n", width, height, SDL_GetError());
+    free(depth_buffer);
+    free(sprite_depth_buffer);
+    free(filled_pixels);
+    return false;
+  }
+  (void)SDL_SetTextureScaleMode(texture, SDL_ScaleModeNearest);
+  (void)SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_NONE);
+
+  free_render_framebuffer(framebuffer);
+  framebuffer->texture = texture;
+  framebuffer->depth_buffer = depth_buffer;
+  framebuffer->sprite_depth_buffer = sprite_depth_buffer;
+  framebuffer->filled_pixels = filled_pixels;
+  framebuffer->width = width;
+  framebuffer->height = height;
+  return true;
+}
+
+static bool begin_render_framebuffer(RenderFramebuffer *framebuffer) {
+  void *pixels = NULL;
+  int pitch_bytes = 0;
+
+  if (framebuffer == NULL || framebuffer->texture == NULL || framebuffer->width <= 0 || framebuffer->height <= 0) {
+    return false;
+  }
+
+  if (SDL_LockTexture(framebuffer->texture, NULL, &pixels, &pitch_bytes) != 0) {
+    fprintf(stderr, "Cannot lock PC renderer framebuffer texture: %s\n", SDL_GetError());
+    return false;
+  }
+  if (pixels == NULL || pitch_bytes < framebuffer->width * (int)sizeof(uint32_t) ||
+      (pitch_bytes % (int)sizeof(uint32_t)) != 0) {
+    fprintf(stderr, "Cannot render: SDL framebuffer pitch %d is invalid for %dx%d ARGB pixels\n", pitch_bytes,
+            framebuffer->width, framebuffer->height);
+    SDL_UnlockTexture(framebuffer->texture);
+    framebuffer->pixels = NULL;
+    framebuffer->pitch_pixels = 0;
+    return false;
+  }
+
+  framebuffer->pixels = (uint32_t *)pixels;
+  framebuffer->pitch_pixels = pitch_bytes / (int)sizeof(uint32_t);
+  return true;
+}
+
+static void end_render_framebuffer(RenderFramebuffer *framebuffer) {
+  if (framebuffer == NULL || framebuffer->texture == NULL || framebuffer->pixels == NULL) {
+    return;
+  }
+
+  SDL_UnlockTexture(framebuffer->texture);
+  framebuffer->pixels = NULL;
+  framebuffer->pitch_pixels = 0;
+}
+
+static void framebuffer_clear(RenderFramebuffer *framebuffer, uint32_t argb) {
+  size_t count = 0u;
+  size_t i = 0u;
+
+  if (framebuffer == NULL || framebuffer->pixels == NULL || framebuffer->width <= 0 || framebuffer->height <= 0) {
+    return;
+  }
+
+  count = (size_t)framebuffer->width;
+  for (i = 0u; i < (size_t)framebuffer->height; ++i) {
+    uint32_t *row = framebuffer->pixels + (i * (size_t)framebuffer->pitch_pixels);
+    size_t x = 0u;
+
+    for (x = 0u; x < count; ++x) {
+      row[x] = argb;
+    }
+  }
+}
+
+static void framebuffer_put_argb(RenderFramebuffer *framebuffer, int x, int y, uint32_t argb) {
+  if (framebuffer == NULL || framebuffer->pixels == NULL || x < 0 || y < 0 || x >= framebuffer->width ||
+      y >= framebuffer->height) {
+    return;
+  }
+
+  framebuffer->pixels[(size_t)y * (size_t)framebuffer->pitch_pixels + (size_t)x] =
+      0xFF000000u | (argb & 0x00FFFFFFu);
+}
+
 static float projection_focal_for_viewport(int w, int h) {
   float scale_x = (float)w / (float)GLOOM_AMIGA_VIEW_COLUMNS;
   float scale_y = (float)h / (float)GLOOM_AMIGA_VIEW_ROWS;
@@ -6489,7 +6626,7 @@ static float projection_focal_for_viewport(int w, int h) {
   return (float)GLOOM_AMIGA_FOCAL * scale;
 }
 
-static void render_flat_textures(SDL_Renderer *renderer, const AppState *state, const FlatTextureSet *flats, int x,
+static void render_flat_textures(RenderFramebuffer *framebuffer, const AppState *state, const FlatTextureSet *flats, int x,
                                  int y, int w, int h, float focal, float far_depth) {
   float eye_height = 0.0f;
   float ceiling_delta = 0.0f;
@@ -6497,7 +6634,7 @@ static void render_flat_textures(SDL_Renderer *renderer, const AppState *state, 
   float view_sin = 0.0f;
   int row = 0;
 
-  if (renderer == NULL || state == NULL || flats == NULL || !flats->floor.loaded || !flats->roof.loaded) {
+  if (framebuffer == NULL || state == NULL || flats == NULL || !flats->floor.loaded || !flats->roof.loaded) {
     return;
   }
 
@@ -6537,27 +6674,20 @@ static void render_flat_textures(SDL_Renderer *renderer, const AppState *state, 
     }
 
     for (col = 0; col < w; ++col) {
+      size_t dst = (size_t)(y + row) * (size_t)framebuffer->pitch_pixels + (size_t)(x + col);
       float ray_x = ((float)(col - (w / 2))) / focal;
       float view_x = ray_x * depth;
       float world_x = state->camera_x + (view_x * view_cos) + (depth * view_sin);
       float world_z = state->camera_z - (view_x * view_sin) + (depth * view_cos);
       uint32_t argb = sample_flat_texture_argb(texture, world_x, world_z);
-      uint8_t r = 0u;
-      uint8_t g = 0u;
-      uint8_t b = 0u;
 
       argb = apply_amiga_depth_argb(argb, depth);
-      r = (uint8_t)(argb >> 16);
-      g = (uint8_t)(argb >> 8);
-      b = (uint8_t)argb;
-
-      SDL_SetRenderDrawColor(renderer, r, g, b, 255);
-      SDL_RenderDrawPoint(renderer, x + col, y + row);
+      framebuffer->pixels[dst] = 0xFF000000u | (argb & 0x00FFFFFFu);
     }
   }
 }
 
-static void render_wall_debug(SDL_Renderer *renderer, const AppState *state, const GridOffsetSet *grid_offsets,
+static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *state, const GridOffsetSet *grid_offsets,
                               const WallTextureSet *wall_textures, const FlatTextureSet *flats,
                               const ObjectVisualSet *object_visuals, const WeaponVisualSet *weapon_visuals, int x,
                               int y, int w, int h) {
@@ -6599,13 +6729,10 @@ static void render_wall_debug(SDL_Renderer *renderer, const AppState *state, con
     return;
   }
 
-  depth_buffer = (float *)malloc((size_t)w * sizeof(*depth_buffer));
-  sprite_depth_buffer = (float *)malloc((size_t)w * sizeof(*sprite_depth_buffer));
-  filled_pixels = (uint8_t *)malloc((size_t)h);
+  depth_buffer = framebuffer != NULL ? framebuffer->depth_buffer : NULL;
+  sprite_depth_buffer = framebuffer != NULL ? framebuffer->sprite_depth_buffer : NULL;
+  filled_pixels = framebuffer != NULL ? framebuffer->filled_pixels : NULL;
   if (depth_buffer == NULL || sprite_depth_buffer == NULL || filled_pixels == NULL) {
-    free(depth_buffer);
-    free(sprite_depth_buffer);
-    free(filled_pixels);
     return;
   }
 
@@ -6618,7 +6745,7 @@ static void render_wall_debug(SDL_Renderer *renderer, const AppState *state, con
     qsort(wall_candidates, wall_candidate_count, sizeof(wall_candidates[0]), compare_wall_candidates);
   }
 
-  render_flat_textures(renderer, state, flats, x, y, w, h, focal, far_depth);
+  render_flat_textures(framebuffer, state, flats, x, y, w, h, focal, far_depth);
 
   for (i = 0; i < (size_t)w; ++i) {
     depth_buffer[i] = 1.0e9f;
@@ -6759,9 +6886,6 @@ static void render_wall_debug(SDL_Renderer *renderer, const AppState *state, con
         float wall_v = ((float)draw_y + 0.5f - wall_top) / wall_height;
         uint32_t argb = 0u;
         uint8_t alpha = 0u;
-        uint8_t r = 0u;
-        uint8_t g = 0u;
-        uint8_t b = 0u;
 
         if (filled_pixels[draw_y - y] != 0u) {
           continue;
@@ -6775,11 +6899,8 @@ static void render_wall_debug(SDL_Renderer *renderer, const AppState *state, con
         }
 
         argb = apply_amiga_depth_argb(argb, hit->depth);
-        r = (uint8_t)(argb >> 16);
-        g = (uint8_t)(argb >> 8);
-        b = (uint8_t)argb;
-        SDL_SetRenderDrawColor(renderer, r, g, b, 255);
-        SDL_RenderDrawPoint(renderer, screen_x, draw_y);
+        framebuffer->pixels[(size_t)draw_y * (size_t)framebuffer->pitch_pixels + (size_t)screen_x] =
+            0xFF000000u | (argb & 0x00FFFFFFu);
         filled_pixels[draw_y - y] = 1u;
 
         if (hit->depth < depth_buffer[i]) {
@@ -7122,8 +7243,8 @@ static void render_wall_debug(SDL_Renderer *renderer, const AppState *state, con
     }
 
     argb = amiga_blood_argb(blood->color_mask, svz);
-    SDL_SetRenderDrawColor(renderer, (uint8_t)(argb >> 16u), (uint8_t)(argb >> 8u), (uint8_t)argb, 255);
-    SDL_RenderDrawPoint(renderer, screen_x, screen_y);
+    framebuffer->pixels[(size_t)screen_y * (size_t)framebuffer->pitch_pixels + (size_t)screen_x] =
+        0xFF000000u | (argb & 0x00FFFFFFu);
   }
 
   for (i = 0; i < (size_t)w; ++i) {
@@ -7185,28 +7306,26 @@ static void render_wall_debug(SDL_Renderer *renderer, const AppState *state, con
         float tv = ((float)draw_y + 0.5f - sp->screen_y) / sp->screen_h;
         uint32_t argb = 0;
         uint8_t alpha = 0;
-        uint8_t r = 0;
-        uint8_t g = 0;
-        uint8_t b = 0;
+        int sx = 0;
+        int sy = 0;
 
-        argb = sample_object_frame_argb(frame, tu, tv);
+        if (tv < 0.0f || tv > 1.0f || tu < 0.0f || tu > 1.0f) {
+          continue;
+        }
+
+        sx = (int)(tu * (float)(frame->width - 1));
+        sy = (int)(tv * (float)(frame->height - 1));
+        argb = frame->argb_pixels[(size_t)sy * (size_t)frame->width + (size_t)sx];
 
         alpha = (uint8_t)(argb >> 24);
-        r = (uint8_t)(argb >> 16);
-        g = (uint8_t)(argb >> 8);
-        b = (uint8_t)argb;
 
         if (alpha == 0u) {
           continue;
         }
 
         argb = apply_amiga_depth_argb(argb, sp->depth);
-        r = (uint8_t)(argb >> 16);
-        g = (uint8_t)(argb >> 8);
-        b = (uint8_t)argb;
-
-        SDL_SetRenderDrawColor(renderer, r, g, b, 255);
-        SDL_RenderDrawPoint(renderer, screen_x, draw_y);
+        framebuffer->pixels[(size_t)draw_y * (size_t)framebuffer->pitch_pixels + (size_t)screen_x] =
+            0xFF000000u | (argb & 0x00FFFFFFu);
         column_drawn = true;
       }
 
@@ -7216,21 +7335,18 @@ static void render_wall_debug(SDL_Renderer *renderer, const AppState *state, con
     }
   }
 
-  free(filled_pixels);
-  free(sprite_depth_buffer);
-  free(depth_buffer);
 }
 
-static void render_object_frame_scaled(SDL_Renderer *renderer, const ObjectFrame *frame, float screen_x, float screen_y,
-                                       float scale) {
+static void render_object_frame_scaled(RenderFramebuffer *framebuffer, const ObjectFrame *frame, float screen_x,
+                                       float screen_y, float scale) {
   int x0 = 0;
   int x1 = 0;
   int y0 = 0;
   int y1 = 0;
   int draw_y = 0;
 
-  if (renderer == NULL || frame == NULL || frame->width <= 0 || frame->height <= 0 || frame->argb_pixels == NULL ||
-      scale <= 0.0f) {
+  if (framebuffer == NULL || frame == NULL || frame->width <= 0 || frame->height <= 0 ||
+      frame->argb_pixels == NULL || scale <= 0.0f) {
     return;
   }
 
@@ -7238,6 +7354,13 @@ static void render_object_frame_scaled(SDL_Renderer *renderer, const ObjectFrame
   y0 = (int)screen_y;
   x1 = (int)(screen_x + ((float)frame->width * scale));
   y1 = (int)(screen_y + ((float)frame->height * scale));
+  if (x1 < 0 || y1 < 0 || x0 >= framebuffer->width || y0 >= framebuffer->height) {
+    return;
+  }
+  if (x0 < 0) x0 = 0;
+  if (y0 < 0) y0 = 0;
+  if (x1 >= framebuffer->width) x1 = framebuffer->width - 1;
+  if (y1 >= framebuffer->height) y1 = framebuffer->height - 1;
 
   for (draw_y = y0; draw_y <= y1; ++draw_y) {
     int draw_x = 0;
@@ -7251,19 +7374,23 @@ static void render_object_frame_scaled(SDL_Renderer *renderer, const ObjectFrame
       float tu = ((float)draw_x + 0.5f - screen_x) / ((float)frame->width * scale);
       uint32_t argb = 0u;
       uint8_t alpha = 0u;
+      int sx = 0;
+      int sy = 0;
 
       if (tu < 0.0f || tu > 1.0f) {
         continue;
       }
 
-      argb = sample_object_frame_argb(frame, tu, tv);
+      sx = (int)(tu * (float)(frame->width - 1));
+      sy = (int)(tv * (float)(frame->height - 1));
+      argb = frame->argb_pixels[(size_t)sy * (size_t)frame->width + (size_t)sx];
       alpha = (uint8_t)(argb >> 24);
       if (alpha == 0u) {
         continue;
       }
 
-      SDL_SetRenderDrawColor(renderer, (uint8_t)(argb >> 16), (uint8_t)(argb >> 8), (uint8_t)argb, alpha);
-      SDL_RenderDrawPoint(renderer, draw_x, draw_y);
+      framebuffer->pixels[(size_t)draw_y * (size_t)framebuffer->pitch_pixels + (size_t)draw_x] =
+          0xFF000000u | (argb & 0x00FFFFFFu);
     }
   }
 }
@@ -7279,8 +7406,8 @@ static size_t player_weapon_muzzle_frame_index(uint8_t weapon_index) {
          (size_t)((clamped_weapon * (uint32_t)GLOOM_GUN_MUZZLE_FRAME_COUNT) / (uint32_t)GLOOM_WEAPON_COUNT);
 }
 
-static void render_player_weapon(SDL_Renderer *renderer, const AppState *state, const WeaponVisualSet *weapon_visuals,
-                                 int x, int y, int w, int h) {
+static void render_player_weapon(RenderFramebuffer *framebuffer, const AppState *state,
+                                 const WeaponVisualSet *weapon_visuals, int x, int y, int w, int h) {
   const ObjectVisual *gun = NULL;
   const ObjectFrame *base_frame = NULL;
   const ObjectFrame *muzzle_frame = NULL;
@@ -7294,7 +7421,7 @@ static void render_player_weapon(SDL_Renderer *renderer, const AppState *state, 
   float body_draw_x = 0.0f;
   float body_draw_y = 0.0f;
 
-  if (renderer == NULL || state == NULL || weapon_visuals == NULL || w <= 0 || h <= 0) {
+  if (framebuffer == NULL || state == NULL || weapon_visuals == NULL || w <= 0 || h <= 0) {
     return;
   }
 
@@ -7341,19 +7468,20 @@ static void render_player_weapon(SDL_Renderer *renderer, const AppState *state, 
       muzzle_frame = &gun->frames[muzzle_frame_index];
       muzzle_draw_x = (float)round_float_to_int32(anchor_x - ((float)muzzle_frame->handle_x * muzzle_scale));
       muzzle_draw_y = (float)round_float_to_int32(muzzle_anchor_y - ((float)muzzle_frame->handle_y * muzzle_scale));
-      render_object_frame_scaled(renderer, muzzle_frame, muzzle_draw_x, muzzle_draw_y, muzzle_scale);
+      render_object_frame_scaled(framebuffer, muzzle_frame, muzzle_draw_x, muzzle_draw_y, muzzle_scale);
     }
   }
 
   body_draw_x = (float)round_float_to_int32(anchor_x - ((float)base_frame->handle_x * viewport_scale));
   body_draw_y = (float)round_float_to_int32(anchor_y - ((float)base_frame->handle_y * viewport_scale));
-  render_object_frame_scaled(renderer, base_frame, body_draw_x, body_draw_y, viewport_scale);
+  render_object_frame_scaled(framebuffer, base_frame, body_draw_x, body_draw_y, viewport_scale);
 }
 
-static void render_hud_glyph(SDL_Renderer *renderer, const HudGlyph *glyph, int x, int y) {
+static void render_hud_glyph(RenderFramebuffer *framebuffer, const HudGlyph *glyph, int x, int y) {
   int py = 0;
 
-  if (renderer == NULL || glyph == NULL || glyph->argb_pixels == NULL || glyph->width <= 0 || glyph->height <= 0) {
+  if (framebuffer == NULL || glyph == NULL || glyph->argb_pixels == NULL || glyph->width <= 0 ||
+      glyph->height <= 0) {
     return;
   }
 
@@ -7368,21 +7496,20 @@ static void render_hud_glyph(SDL_Renderer *renderer, const HudGlyph *glyph, int 
         continue;
       }
 
-      SDL_SetRenderDrawColor(renderer, (uint8_t)(argb >> 16), (uint8_t)(argb >> 8), (uint8_t)argb, alpha);
-      SDL_RenderDrawPoint(renderer, x + px, y + py);
+      framebuffer_put_argb(framebuffer, x + px, y + py, argb);
     }
   }
 }
 
-static void render_player_weapon_status(SDL_Renderer *renderer, const AppState *state, const HudFont *hud_font, int x,
-                                        int y, int w, int h) {
+static void render_player_weapon_status(RenderFramebuffer *framebuffer, const AppState *state, const HudFont *hud_font,
+                                        int x, int y, int w, int h) {
   int slot = 0;
   int count = 0;
   int base_x = x;
   int weapon_char = 0;
   int status_y = y + h - GLOOM_HUD_STATUS_HEIGHT;
 
-  if (renderer == NULL || state == NULL || hud_font == NULL || !hud_font->loaded || hud_font->glyphs == NULL ||
+  if (framebuffer == NULL || state == NULL || hud_font == NULL || !hud_font->loaded || hud_font->glyphs == NULL ||
       state->player_weapon >= GLOOM_WEAPON_COUNT || (size_t)GLOOM_HUD_LIFE_CHAR >= hud_font->glyph_count ||
       (size_t)GLOOM_HUD_HEALTH_CHAR >= hud_font->glyph_count) {
     return;
@@ -7397,7 +7524,7 @@ static void render_player_weapon_status(SDL_Renderer *renderer, const AppState *
     count = GLOOM_PLAYER_INITIAL_HEALTH;
   }
   for (slot = 0; slot < count; ++slot) {
-    render_hud_glyph(renderer, &hud_font->glyphs[GLOOM_HUD_HEALTH_CHAR],
+    render_hud_glyph(framebuffer, &hud_font->glyphs[GLOOM_HUD_HEALTH_CHAR],
                      base_x + GLOOM_HUD_HEALTH_X + (slot * GLOOM_HUD_HEALTH_SPACING),
                      status_y + GLOOM_HUD_HEALTH_Y);
   }
@@ -7410,7 +7537,7 @@ static void render_player_weapon_status(SDL_Renderer *renderer, const AppState *
     int draw_x = base_x + GLOOM_HUD_LIVES_X + ((6 - count) * GLOOM_HUD_LIVES_SPACING) +
                  (slot * GLOOM_HUD_LIVES_SPACING);
 
-    render_hud_glyph(renderer, &hud_font->glyphs[GLOOM_HUD_LIFE_CHAR], draw_x, status_y + GLOOM_HUD_LIVES_Y);
+    render_hud_glyph(framebuffer, &hud_font->glyphs[GLOOM_HUD_LIFE_CHAR], draw_x, status_y + GLOOM_HUD_LIVES_Y);
   }
 
   weapon_char = GLOOM_HUD_WEAPON_FIRST_CHAR + (int)state->player_weapon;
@@ -7430,7 +7557,7 @@ static void render_player_weapon_status(SDL_Renderer *renderer, const AppState *
     int draw_x = base_x + GLOOM_HUD_WEAPON_X + (slot * GLOOM_HUD_WEAPON_SPACING);
     int draw_y = status_y + GLOOM_HUD_WEAPON_Y;
 
-    render_hud_glyph(renderer, &hud_font->glyphs[weapon_char], draw_x, draw_y);
+    render_hud_glyph(framebuffer, &hud_font->glyphs[weapon_char], draw_x, draw_y);
   }
 }
 
@@ -7488,14 +7615,14 @@ static void draw_bar(SDL_Renderer *renderer, int x, int y, int width, int height
   SDL_RenderDrawRect(renderer, &bg);
 }
 
-static void render_scene_contents(SDL_Renderer *renderer, const AppState *state, const GridOffsetSet *grid_offsets,
+static void render_scene_contents(RenderFramebuffer *framebuffer, const AppState *state, const GridOffsetSet *grid_offsets,
                                   const WallTextureSet *wall_textures, const FlatTextureSet *flat_textures,
                                   const ObjectVisualSet *object_visuals, const WeaponVisualSet *weapon_visuals,
                                   const HudFont *hud_font, int render_width, int render_height) {
-  render_wall_debug(renderer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals, 0, 0,
+  render_wall_debug(framebuffer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals, 0, 0,
                     render_width, render_height);
-  render_player_weapon(renderer, state, weapon_visuals, 0, 0, render_width, render_height);
-  render_player_weapon_status(renderer, state, hud_font, 0, 0, render_width, render_height);
+  render_player_weapon(framebuffer, state, weapon_visuals, 0, 0, render_width, render_height);
+  render_player_weapon_status(framebuffer, state, hud_font, 0, 0, render_width, render_height);
 }
 
 static bool render_pixelate_texture(SDL_Renderer *renderer, SDL_Texture *texture, int render_width, int render_height,
@@ -7551,48 +7678,45 @@ static bool render_pixelate_texture(SDL_Renderer *renderer, SDL_Texture *texture
   return true;
 }
 
-static void render(SDL_Renderer *renderer, const AppState *state, const GridOffsetSet *grid_offsets,
+static void render(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const AppState *state,
+                   const GridOffsetSet *grid_offsets,
                    const WallTextureSet *wall_textures, const FlatTextureSet *flat_textures,
                    const ObjectVisualSet *object_visuals, const WeaponVisualSet *weapon_visuals,
                    const HudFont *hud_font, int render_width, int render_height) {
   int pixsize = state != NULL ? state->player_pixsize : 0;
 
+  if (framebuffer == NULL || framebuffer->texture == NULL || framebuffer->width != render_width ||
+      framebuffer->height != render_height) {
+    fprintf(stderr, "Cannot render: PC framebuffer was not prepared for %dx%d\n", render_width, render_height);
+    return;
+  }
+
+  if (!begin_render_framebuffer(framebuffer)) {
+    return;
+  }
+  framebuffer_clear(framebuffer, 0xFF000000u);
+  render_scene_contents(framebuffer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals,
+                        hud_font, render_width, render_height);
+  end_render_framebuffer(framebuffer);
+
   SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
   SDL_RenderClear(renderer);
 
   if (pixsize > 1) {
-    SDL_Texture *pixel_texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET,
-                                                   render_width, render_height);
-
-    if (pixel_texture == NULL) {
-      fprintf(stderr, "Cannot render pixelate transition: SDL target texture creation failed: %s\n", SDL_GetError());
-    } else {
-      (void)SDL_SetTextureScaleMode(pixel_texture, SDL_ScaleModeNearest);
-      if (SDL_SetRenderTarget(renderer, pixel_texture) != 0) {
-        fprintf(stderr, "Cannot render pixelate transition: SDL_SetRenderTarget failed: %s\n", SDL_GetError());
-      } else {
-        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
-        SDL_RenderClear(renderer);
-        render_scene_contents(renderer, state, grid_offsets, wall_textures, flat_textures, object_visuals,
-                              weapon_visuals, hud_font, render_width, render_height);
-        (void)SDL_SetRenderTarget(renderer, NULL);
-        SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
-        SDL_RenderClear(renderer);
-        if (!render_pixelate_texture(renderer, pixel_texture, render_width, render_height, pixsize)) {
-          fprintf(stderr, "Cannot render pixelate transition: SDL_RenderCopy failed: %s\n", SDL_GetError());
-        }
-      }
-      SDL_DestroyTexture(pixel_texture);
+    if (!render_pixelate_texture(renderer, framebuffer->texture, render_width, render_height, pixsize)) {
+      fprintf(stderr, "Cannot render pixelate transition: SDL_RenderCopy failed: %s\n", SDL_GetError());
     }
   } else {
-    render_scene_contents(renderer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals,
-                          hud_font, render_width, render_height);
+    SDL_Rect dst = {0, 0, render_width, render_height};
+    if (SDL_RenderCopy(renderer, framebuffer->texture, NULL, &dst) != 0) {
+      fprintf(stderr, "Cannot render PC framebuffer texture: %s\n", SDL_GetError());
+    }
   }
 
   SDL_RenderPresent(renderer);
 }
 
-static void update_render_dimensions(SDL_Renderer *renderer, bool classic_viewport, int *render_width,
+static void update_render_dimensions(SDL_Renderer *renderer, bool classic_viewport, int render_scale, int *render_width,
                                      int *render_height) {
   int target_width = BASE_WIDTH;
   int target_height = BASE_HEIGHT;
@@ -7601,19 +7725,25 @@ static void update_render_dimensions(SDL_Renderer *renderer, bool classic_viewpo
     return;
   }
 
+  if (render_scale < 1) {
+    render_scale = 1;
+  }
+  target_height = BASE_HEIGHT * render_scale;
+  target_width = BASE_WIDTH * render_scale;
+
   if (!classic_viewport) {
     int output_width = 0;
     int output_height = 0;
 
     if (SDL_GetRendererOutputSize(renderer, &output_width, &output_height) == 0 && output_width > 0 &&
         output_height > 0) {
-      int64_t scaled_width = ((int64_t)output_width * (int64_t)BASE_HEIGHT) + (output_height / 2);
+      int64_t scaled_width = ((int64_t)output_width * (int64_t)target_height) + (output_height / 2);
       target_width = (int)(scaled_width / output_height);
       if (target_width < 1) {
         target_width = 1;
       }
     } else {
-      target_width = WIDESCREEN_WIDTH;
+      target_width = WIDESCREEN_WIDTH * render_scale;
     }
   }
 
@@ -8585,7 +8715,7 @@ static int run_replay_selftest(int argc, char **argv) {
 
 static bool load_runtime_level(const char *map_path, AppState *state, WallTextureSet *wall_textures,
                                FlatTextureSet *flat_textures, ObjectVisualSet *object_visuals,
-                               GloomZone **previous_zones, GloomZone **render_zones, bool preserve_player,
+                               GloomZone *previous_zones, GloomZone *render_zones, bool preserve_player,
                                int16_t preserved_hitpoints, int16_t preserved_lives, uint8_t preserved_weapon,
                                uint8_t preserved_reload, bool barrel_projectile_origin, uint8_t violence_mode,
                                char *resolved_map_path, size_t resolved_map_path_size) {
@@ -8593,8 +8723,6 @@ static bool load_runtime_level(const char *map_path, AppState *state, WallTextur
   WallTextureSet next_wall_textures;
   FlatTextureSet next_flat_textures;
   ObjectVisualSet next_object_visuals;
-  GloomZone *next_previous_zones = NULL;
-  GloomZone *next_render_zones = NULL;
   char map_path_buffer[1024] = {0};
   const char *resolved = map_path;
   char error[256] = {0};
@@ -8670,25 +8798,21 @@ static bool load_runtime_level(const char *map_path, AppState *state, WallTextur
   next_state.violence_mode = violence_mode;
   initialize_runtime_objects(&next_state);
 
-  if (next_state.map.zone_count > 0u) {
-    next_previous_zones = (GloomZone *)malloc(next_state.map.zone_count * sizeof(*next_previous_zones));
-    next_render_zones = (GloomZone *)malloc(next_state.map.zone_count * sizeof(*next_render_zones));
-    if (next_previous_zones == NULL || next_render_zones == NULL) {
-      fprintf(stderr, "Out of memory while preparing render interpolation zone buffers for %s\n", resolved);
-      free(next_previous_zones);
-      free(next_render_zones);
-      free_object_visual_set(&next_object_visuals);
-      free_flat_texture_set(&next_flat_textures);
-      free_wall_texture_set(&next_wall_textures);
-      gloom_map_free(&next_state.map);
-      return false;
-    }
-    memcpy(next_previous_zones, next_state.map.zones, next_state.map.zone_count * sizeof(*next_previous_zones));
-    memcpy(next_render_zones, next_state.map.zones, next_state.map.zone_count * sizeof(*next_render_zones));
+  if (next_state.map.zone_count > (size_t)GLOOM_MAX_RENDER_ZONES) {
+    fprintf(stderr, "Cannot load %s: zone count %zu exceeds fixed render buffer capacity %u\n", resolved,
+            next_state.map.zone_count, (unsigned)GLOOM_MAX_RENDER_ZONES);
+    free_object_visual_set(&next_object_visuals);
+    free_flat_texture_set(&next_flat_textures);
+    free_wall_texture_set(&next_wall_textures);
+    gloom_map_free(&next_state.map);
+    return false;
   }
 
-  free(*previous_zones);
-  free(*render_zones);
+  if (next_state.map.zone_count > 0u) {
+    memcpy(previous_zones, next_state.map.zones, next_state.map.zone_count * sizeof(*previous_zones));
+    memcpy(render_zones, next_state.map.zones, next_state.map.zone_count * sizeof(*render_zones));
+  }
+
   free_object_visual_set(object_visuals);
   free_flat_texture_set(flat_textures);
   free_wall_texture_set(wall_textures);
@@ -8698,8 +8822,6 @@ static bool load_runtime_level(const char *map_path, AppState *state, WallTextur
   *wall_textures = next_wall_textures;
   *flat_textures = next_flat_textures;
   *object_visuals = next_object_visuals;
-  *previous_zones = next_previous_zones;
-  *render_zones = next_render_zones;
 
   if (resolved_map_path != NULL && resolved_map_path_size > 0u) {
     (void)snprintf(resolved_map_path, resolved_map_path_size, "%s", resolved);
@@ -8726,6 +8848,7 @@ int main(int argc, char **argv) {
   ObjectVisualSet object_visuals;
   WeaponVisualSet weapon_visuals;
   HudFont hud_font;
+  RenderFramebuffer framebuffer;
   GloomZone *previous_zones = NULL;
   GloomZone *render_zones = NULL;
   uint64_t perf_frequency = 0;
@@ -8737,6 +8860,7 @@ int main(int argc, char **argv) {
   int mouse_dx_accum = 0;
   int render_width = WIDESCREEN_WIDTH;
   int render_height = BASE_HEIGHT;
+  int render_scale = 1;
   bool classic_viewport = false;
   bool barrel_projectile_origin = true;
   uint8_t violence_mode = GLOOM_VIOLENCE_MEATY_MESSY;
@@ -8750,6 +8874,7 @@ int main(int argc, char **argv) {
   memset(&object_visuals, 0, sizeof(object_visuals));
   memset(&weapon_visuals, 0, sizeof(weapon_visuals));
   memset(&hud_font, 0, sizeof(hud_font));
+  memset(&framebuffer, 0, sizeof(framebuffer));
 
   if (argc > 1 && strcmp(argv[1], "--iff-info") == 0) {
     const char *iff_path = argc > 2 ? argv[2] : "amiga/combat.iff";
@@ -8810,6 +8935,22 @@ int main(int argc, char **argv) {
       } else if (strcmp(argv[argi], "--widescreen") == 0) {
         classic_viewport = false;
         render_width = WIDESCREEN_WIDTH;
+      } else if (strcmp(argv[argi], "--render-scale") == 0) {
+        char *end = NULL;
+        long parsed = 0;
+
+        if (argi + 1 >= argc) {
+          fprintf(stderr, "--render-scale requires an integer value from 1 to 6\n");
+          return 1;
+        }
+        parsed = strtol(argv[++argi], &end, 10);
+        if (end == argv[argi] || *end != '\0' || parsed < 1 || parsed > 6) {
+          fprintf(stderr, "--render-scale requires an integer value from 1 to 6\n");
+          return 1;
+        }
+        render_scale = (int)parsed;
+        render_width = (classic_viewport ? BASE_WIDTH : WIDESCREEN_WIDTH) * render_scale;
+        render_height = BASE_HEIGHT * render_scale;
       } else if (strcmp(argv[argi], "--barrel-projectiles") == 0) {
         barrel_projectile_origin = true;
       } else if (strcmp(argv[argi], "--player-projectiles") == 0 ||
@@ -8826,6 +8967,9 @@ int main(int argc, char **argv) {
       }
     }
   }
+
+  render_width = (classic_viewport ? BASE_WIDTH : WIDESCREEN_WIDTH) * render_scale;
+  render_height = BASE_HEIGHT * render_scale;
 
   if (resolve_runtime_file_path(map_path, map_path_buffer, sizeof(map_path_buffer))) {
     resolved_map_path = map_path_buffer;
@@ -8923,22 +9067,35 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+  if (state.map.zone_count > (size_t)GLOOM_MAX_RENDER_ZONES) {
+    fprintf(stderr, "Cannot load %s: zone count %zu exceeds fixed render buffer capacity %u\n", resolved_map_path,
+            state.map.zone_count, (unsigned)GLOOM_MAX_RENDER_ZONES);
+    free_hud_font(&hud_font);
+    free_weapon_visual_set(&weapon_visuals);
+    free_grid_offset_set(&grid_offsets);
+    free_object_visual_set(&object_visuals);
+    free_flat_texture_set(&flat_textures);
+    free_wall_texture_set(&wall_textures);
+    gloom_map_free(&state.map);
+    return 1;
+  }
+
+  previous_zones = (GloomZone *)malloc((size_t)GLOOM_MAX_RENDER_ZONES * sizeof(*previous_zones));
+  render_zones = (GloomZone *)malloc((size_t)GLOOM_MAX_RENDER_ZONES * sizeof(*render_zones));
+  if (previous_zones == NULL || render_zones == NULL) {
+    fprintf(stderr, "Out of memory while preparing fixed render interpolation zone buffers\n");
+    free(previous_zones);
+    free(render_zones);
+    free_hud_font(&hud_font);
+    free_weapon_visual_set(&weapon_visuals);
+    free_grid_offset_set(&grid_offsets);
+    free_object_visual_set(&object_visuals);
+    free_flat_texture_set(&flat_textures);
+    free_wall_texture_set(&wall_textures);
+    gloom_map_free(&state.map);
+    return 1;
+  }
   if (state.map.zone_count > 0u) {
-    previous_zones = (GloomZone *)malloc(state.map.zone_count * sizeof(*previous_zones));
-    render_zones = (GloomZone *)malloc(state.map.zone_count * sizeof(*render_zones));
-    if (previous_zones == NULL || render_zones == NULL) {
-      fprintf(stderr, "Out of memory while preparing render interpolation zone buffers\n");
-      free(previous_zones);
-      free(render_zones);
-      free_hud_font(&hud_font);
-      free_weapon_visual_set(&weapon_visuals);
-      free_grid_offset_set(&grid_offsets);
-      free_object_visual_set(&object_visuals);
-      free_flat_texture_set(&flat_textures);
-      free_wall_texture_set(&wall_textures);
-      gloom_map_free(&state.map);
-      return 1;
-    }
     memcpy(previous_zones, state.map.zones, state.map.zone_count * sizeof(*previous_zones));
     memcpy(render_zones, state.map.zones, state.map.zone_count * sizeof(*render_zones));
   }
@@ -8992,9 +9149,9 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_TARGETTEXTURE);
+  renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
   if (renderer == NULL) {
-    renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE | SDL_RENDERER_TARGETTEXTURE);
+    renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
   }
   if (renderer == NULL) {
     fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
@@ -9015,7 +9172,23 @@ int main(int argc, char **argv) {
 
   (void)SDL_RenderSetIntegerScale(renderer, classic_viewport ? SDL_TRUE : SDL_FALSE);
   (void)SDL_RenderSetLogicalSize(renderer, render_width, render_height);
-  update_render_dimensions(renderer, classic_viewport, &render_width, &render_height);
+  update_render_dimensions(renderer, classic_viewport, render_scale, &render_width, &render_height);
+  if (!ensure_render_framebuffer(renderer, &framebuffer, render_width, render_height)) {
+    SDL_DestroyRenderer(renderer);
+    SDL_DestroyWindow(window);
+    audio_shutdown(&g_audio);
+    SDL_Quit();
+    free(previous_zones);
+    free(render_zones);
+    free_hud_font(&hud_font);
+    free_weapon_visual_set(&weapon_visuals);
+    free_grid_offset_set(&grid_offsets);
+    free_object_visual_set(&object_visuals);
+    free_flat_texture_set(&flat_textures);
+    free_wall_texture_set(&wall_textures);
+    gloom_map_free(&state.map);
+    return 1;
+  }
   (void)SDL_SetRelativeMouseMode(SDL_TRUE);
   (void)SDL_ShowCursor(SDL_DISABLE);
 
@@ -9086,11 +9259,15 @@ int main(int argc, char **argv) {
       title_timer = 0.0;
     }
 
-    update_render_dimensions(renderer, classic_viewport, &render_width, &render_height);
+    update_render_dimensions(renderer, classic_viewport, render_scale, &render_width, &render_height);
+    if (!ensure_render_framebuffer(renderer, &framebuffer, render_width, render_height)) {
+      running = false;
+      continue;
+    }
     render_alpha = (float)(accumulator / dt);
     render_state = interpolate_render_state(&previous_state, &state, render_alpha, render_zones, state.map.zone_count);
-    render(renderer, &render_state, &grid_offsets, &wall_textures, &flat_textures, &object_visuals, &weapon_visuals,
-           &hud_font, render_width, render_height);
+    render(renderer, &framebuffer, &render_state, &grid_offsets, &wall_textures, &flat_textures, &object_visuals,
+           &weapon_visuals, &hud_font, render_width, render_height);
 
     if (level_transition_pending) {
       char next_map_path[1024] = {0};
@@ -9107,7 +9284,7 @@ int main(int argc, char **argv) {
       }
 
       if (!load_runtime_level(next_map_path, &state, &wall_textures, &flat_textures, &object_visuals,
-                              &previous_zones, &render_zones, true, preserved_hitpoints, preserved_lives,
+                              previous_zones, render_zones, true, preserved_hitpoints, preserved_lives,
                               preserved_weapon, preserved_reload, barrel_projectile_origin, violence_mode,
                               map_path_buffer, sizeof(map_path_buffer))) {
         fprintf(stderr, "Cannot complete levelover: failed to load next script map %s\n", next_map_path);
@@ -9128,6 +9305,7 @@ int main(int argc, char **argv) {
   free(render_zones);
   free_hud_font(&hud_font);
   free_weapon_visual_set(&weapon_visuals);
+  free_render_framebuffer(&framebuffer);
   free_grid_offset_set(&grid_offsets);
   free_object_visual_set(&object_visuals);
   free_flat_texture_set(&flat_textures);
