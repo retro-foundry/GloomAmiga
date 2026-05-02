@@ -588,6 +588,7 @@ static void audio_vblank_tick(void);
 static void update_rotpolys(AppState *state);
 static void update_doors(AppState *state);
 static void check_event_triggers(AppState *state);
+static void update_with_controls(AppState *state, const PlayerControls *controls, const ObjectVisualSet *object_visuals);
 
 static AudioSystem g_audio;
 
@@ -3300,7 +3301,7 @@ static int16_t player_control_axis(bool negative_pressed, bool positive_pressed)
   return 0;
 }
 
-static PlayerControls read_modern_player_controls(const uint8_t *keyboard) {
+static PlayerControls read_modern_player_controls(const uint8_t *keyboard, bool mouse_fire) {
   PlayerControls controls;
   int16_t strafe = 0;
   int16_t turn = 0;
@@ -3316,7 +3317,7 @@ static PlayerControls read_modern_player_controls(const uint8_t *keyboard) {
   turn = player_control_axis(keyboard[SDL_SCANCODE_LEFT] || keyboard[SDL_SCANCODE_Q],
                              keyboard[SDL_SCANCODE_RIGHT] || keyboard[SDL_SCANCODE_E]);
   controls.fire = keyboard[SDL_SCANCODE_SPACE] || keyboard[SDL_SCANCODE_LCTRL] || keyboard[SDL_SCANCODE_RCTRL] ||
-                  ((SDL_GetMouseState(NULL, NULL) & SDL_BUTTON(SDL_BUTTON_LEFT)) != 0u);
+                  mouse_fire;
 
   if (strafe != 0) {
     controls.joyx = strafe;
@@ -5356,9 +5357,7 @@ static void update_pickups(AppState *state) {
   }
 }
 
-static void update(AppState *state, const uint8_t *keyboard, const ObjectVisualSet *object_visuals) {
-  PlayerControls controls;
-
+static void update_with_controls(AppState *state, const PlayerControls *controls, const ObjectVisualSet *object_visuals) {
   state->tick_count += 1;
   audio_vblank_tick();
   update_player_power_timers(state);
@@ -5395,11 +5394,17 @@ static void update(AppState *state, const uint8_t *keyboard, const ObjectVisualS
     return;
   }
 
-  controls = read_modern_player_controls(keyboard);
-  update_player_keyboard_rotation(state, &controls);
-  update_player_movement(state, &controls);
+  update_player_keyboard_rotation(state, controls);
+  update_player_movement(state, controls);
   update_pickups(state);
-  update_player_weapon(state, &controls);
+  update_player_weapon(state, controls);
+}
+
+static void update(AppState *state, const uint8_t *keyboard, const ObjectVisualSet *object_visuals) {
+  PlayerControls controls =
+      read_modern_player_controls(keyboard, (SDL_GetMouseState(NULL, NULL) & SDL_BUTTON(SDL_BUTTON_LEFT)) != 0u);
+
+  update_with_controls(state, &controls, object_visuals);
 }
 
 static void world_to_screen(const AppState *state, int x, int z, int rx, int ry, int rw, int rh, int *sx, int *sy) {
@@ -8271,6 +8276,313 @@ static int run_teleport_selftest(void) {
   return 0;
 }
 
+typedef struct {
+  uint32_t ticks;
+  PlayerControls controls;
+  int mouse_dx;
+} ReplayInputStep;
+
+typedef struct {
+  uint64_t hash;
+  uint64_t ticks;
+  int32_t camera_x;
+  int32_t camera_z;
+  int32_t camera_y;
+  int32_t player_rot_fixed;
+  int16_t player_hitpoints;
+  int16_t player_lives;
+  uint16_t active_projectiles;
+  uint16_t active_enemies;
+} ReplayResult;
+
+static void replay_hash_bytes(uint64_t *hash, const void *data, size_t size) {
+  const uint8_t *bytes = (const uint8_t *)data;
+  size_t i = 0u;
+
+  if (hash == NULL || data == NULL) {
+    return;
+  }
+
+  for (i = 0u; i < size; ++i) {
+    *hash ^= (uint64_t)bytes[i];
+    *hash *= 1099511628211ull;
+  }
+}
+
+static void replay_hash_u64(uint64_t *hash, uint64_t value) {
+  replay_hash_bytes(hash, &value, sizeof(value));
+}
+
+static void replay_hash_i32(uint64_t *hash, int32_t value) {
+  replay_hash_bytes(hash, &value, sizeof(value));
+}
+
+static int32_t replay_quantize_float(float value) {
+  return round_float_to_int32(value * 256.0f);
+}
+
+static uint64_t replay_fingerprint_state(const AppState *state, ReplayResult *out_result) {
+  uint64_t hash = 1469598103934665603ull;
+  uint16_t active_projectiles = 0u;
+  uint16_t active_enemies = 0u;
+  size_t i = 0u;
+
+  if (state == NULL) {
+    return 0u;
+  }
+
+  replay_hash_u64(&hash, state->tick_count);
+  replay_hash_i32(&hash, replay_quantize_float(state->camera_x));
+  replay_hash_i32(&hash, replay_quantize_float(state->camera_z));
+  replay_hash_i32(&hash, replay_quantize_float(state->camera_y));
+  replay_hash_i32(&hash, state->player_rot_fixed);
+  replay_hash_i32(&hash, state->player_rotspeed);
+  replay_hash_i32(&hash, replay_quantize_float(state->player_bounce));
+  replay_hash_i32(&hash, state->player_hitpoints);
+  replay_hash_i32(&hash, state->player_lives);
+  replay_hash_i32(&hash, state->player_dead ? 1 : 0);
+  replay_hash_i32(&hash, (int32_t)state->player_weapon);
+  replay_hash_i32(&hash, (int32_t)state->player_reload);
+  replay_hash_i32(&hash, replay_quantize_float(state->player_reload_counter));
+  replay_hash_i32(&hash, replay_quantize_float(state->player_weapon_flash));
+  replay_hash_i32(&hash, replay_quantize_float(state->player_mega_timer));
+  replay_hash_i32(&hash, state->finished);
+  replay_hash_i32(&hash, state->finished2);
+  replay_hash_i32(&hash, (int32_t)state->rng_state);
+
+  for (i = 0u; i < GLOOM_MAX_RUNTIME_PROJECTILES; ++i) {
+    const RuntimeProjectile *projectile = &state->projectiles[i];
+
+    if (!projectile->active) {
+      continue;
+    }
+    active_projectiles += 1u;
+    replay_hash_i32(&hash, (int32_t)i);
+    replay_hash_i32(&hash, projectile->enemy ? 1 : 0);
+    replay_hash_i32(&hash, (int32_t)projectile->weapon_index);
+    replay_hash_i32(&hash, replay_quantize_float(projectile->x));
+    replay_hash_i32(&hash, replay_quantize_float(projectile->z));
+    replay_hash_i32(&hash, replay_quantize_float(projectile->vx));
+    replay_hash_i32(&hash, replay_quantize_float(projectile->vz));
+    replay_hash_i32(&hash, projectile->hitpoints);
+  }
+
+  for (i = 0u; i < GLOOM_MAX_RUNTIME_OBJECTS; ++i) {
+    const RuntimeObjectState *object = &state->objects[i];
+
+    if (!object->active || !object->enemy) {
+      continue;
+    }
+    active_enemies += 1u;
+    replay_hash_i32(&hash, (int32_t)i);
+    replay_hash_i32(&hash, replay_quantize_float(object->x));
+    replay_hash_i32(&hash, replay_quantize_float(object->z));
+    replay_hash_i32(&hash, object->rotation);
+    replay_hash_i32(&hash, object->hitpoints);
+    replay_hash_i32(&hash, (int32_t)object->logic_state);
+    replay_hash_i32(&hash, replay_quantize_float(object->delay));
+    replay_hash_i32(&hash, replay_quantize_float(object->pause_delay));
+    replay_hash_i32(&hash, (int32_t)object->frame_fixed);
+  }
+
+  if (out_result != NULL) {
+    out_result->hash = hash;
+    out_result->ticks = state->tick_count;
+    out_result->camera_x = replay_quantize_float(state->camera_x);
+    out_result->camera_z = replay_quantize_float(state->camera_z);
+    out_result->camera_y = replay_quantize_float(state->camera_y);
+    out_result->player_rot_fixed = state->player_rot_fixed;
+    out_result->player_hitpoints = state->player_hitpoints;
+    out_result->player_lives = state->player_lives;
+    out_result->active_projectiles = active_projectiles;
+    out_result->active_enemies = active_enemies;
+  }
+
+  return hash;
+}
+
+static bool replay_load_steps(const char *path, ReplayInputStep *steps, size_t max_steps, size_t *out_count) {
+  FILE *file = NULL;
+  char line[256] = {0};
+  size_t count = 0u;
+  uint32_t line_number = 0u;
+
+  if (path == NULL || steps == NULL || max_steps == 0u || out_count == NULL) {
+    return false;
+  }
+
+  file = fopen(path, "r");
+  if (file == NULL) {
+    fprintf(stderr, "Replay selftest failed: cannot open input replay %s\n", path);
+    return false;
+  }
+
+  while (fgets(line, sizeof(line), file) != NULL) {
+    uint32_t ticks = 0u;
+    int joyx = 0;
+    int joyy = 0;
+    int joys = 0;
+    int fire = 0;
+    int mouse_dx = 0;
+    int matched = 0;
+    char *cursor = line;
+
+    line_number += 1u;
+    while (*cursor == ' ' || *cursor == '\t') {
+      cursor += 1;
+    }
+    if (*cursor == '\0' || *cursor == '\n' || *cursor == '\r' || *cursor == '#') {
+      continue;
+    }
+
+    matched = sscanf(cursor, "%u %d %d %d %d %d", &ticks, &joyx, &joyy, &joys, &fire, &mouse_dx);
+    if (matched < 5 || ticks == 0u) {
+      fprintf(stderr,
+              "Replay selftest failed: %s:%u must be: ticks joyx joyy joys fire [mouse_dx], with ticks > 0\n",
+              path, line_number);
+      fclose(file);
+      return false;
+    }
+    if (count >= max_steps) {
+      fprintf(stderr, "Replay selftest failed: %s has more than %zu input rows\n", path, max_steps);
+      fclose(file);
+      return false;
+    }
+
+    memset(&steps[count], 0, sizeof(steps[count]));
+    steps[count].ticks = ticks;
+    steps[count].controls.joyx = (int16_t)joyx;
+    steps[count].controls.joyy = (int16_t)joyy;
+    steps[count].controls.joys = (int16_t)joys;
+    steps[count].controls.fire = fire != 0;
+    steps[count].mouse_dx = matched >= 6 ? mouse_dx : 0;
+    count += 1u;
+  }
+
+  fclose(file);
+  *out_count = count;
+  return true;
+}
+
+static bool replay_run_once(const char *map_path, const ReplayInputStep *steps, size_t step_count,
+                            ReplayResult *out_result) {
+  AppState state;
+  ObjectVisualSet object_visuals;
+  char resolved_map_path[1024] = {0};
+  const char *resolved = map_path;
+  char error[256] = {0};
+  size_t i = 0u;
+
+  if (map_path == NULL || steps == NULL || step_count == 0u || out_result == NULL) {
+    return false;
+  }
+
+  memset(&state, 0, sizeof(state));
+  memset(&object_visuals, 0, sizeof(object_visuals));
+  memset(&g_audio, 0, sizeof(g_audio));
+
+  if (resolve_runtime_file_path(map_path, resolved_map_path, sizeof(resolved_map_path))) {
+    resolved = resolved_map_path;
+  }
+
+  state.barrel_projectile_origin = true;
+  if (!gloom_map_load(resolved, &state.map, error, sizeof(error))) {
+    fprintf(stderr, "Replay selftest failed: map parse failed for %s: %s\n", resolved,
+            error[0] ? error : "unknown error");
+    return false;
+  }
+  if (!load_player_collision_radius(&state.player_radius)) {
+    fprintf(stderr, "Replay selftest failed: cannot load player radius from original objs/player asset\n");
+    gloom_map_free(&state.map);
+    return false;
+  }
+  if (!load_object_visual_set_for_map(&state.map, &object_visuals)) {
+    gloom_map_free(&state.map);
+    return false;
+  }
+
+  compute_map_bounds(&state);
+  if (!initialize_camera_from_map_spawn(&state)) {
+    fprintf(stderr, "Replay selftest failed: no player spawn found in %s\n", resolved);
+    free_object_visual_set(&object_visuals);
+    gloom_map_free(&state.map);
+    return false;
+  }
+  state.violence_mode = GLOOM_VIOLENCE_MEATY_MESSY;
+  initialize_runtime_objects(&state);
+
+  for (i = 0u; i < step_count; ++i) {
+    uint32_t tick = 0u;
+
+    for (tick = 0u; tick < steps[i].ticks; ++tick) {
+      apply_mouse_look(&state, steps[i].mouse_dx);
+      update_with_controls(&state, &steps[i].controls, &object_visuals);
+      if (state.finished == GLOOM_LEVEL_COMPLETE_FINISHED) {
+        break;
+      }
+    }
+    if (state.finished == GLOOM_LEVEL_COMPLETE_FINISHED) {
+      break;
+    }
+  }
+
+  (void)replay_fingerprint_state(&state, out_result);
+  free_object_visual_set(&object_visuals);
+  gloom_map_free(&state.map);
+  return true;
+}
+
+static int run_replay_selftest(int argc, char **argv) {
+  static const ReplayInputStep default_steps[] = {
+      {30u, {0, -1, 0, false}, 0}, {18u, {1, -1, -1, false}, 0}, {12u, {0, 0, 0, true}, 2},
+      {20u, {-1, 0, 0, false}, -1}, {25u, {0, 1, 0, false}, 0}, {10u, {0, 0, 0, true}, 0}};
+  ReplayInputStep file_steps[256];
+  const ReplayInputStep *steps = default_steps;
+  size_t step_count = sizeof(default_steps) / sizeof(default_steps[0]);
+  const char *map_path = "amiga/maps/map1_1";
+  const char *replay_path = NULL;
+  ReplayResult first;
+  ReplayResult second;
+
+  memset(file_steps, 0, sizeof(file_steps));
+  memset(&first, 0, sizeof(first));
+  memset(&second, 0, sizeof(second));
+
+  if (argc > 2) {
+    map_path = argv[2];
+  }
+  if (argc > 3) {
+    replay_path = argv[3];
+  }
+  if (replay_path != NULL && !replay_load_steps(replay_path, file_steps, sizeof(file_steps) / sizeof(file_steps[0]),
+                                                &step_count)) {
+    return 1;
+  }
+  if (replay_path != NULL) {
+    steps = file_steps;
+  }
+  if (step_count == 0u) {
+    fprintf(stderr, "Replay selftest failed: no replay input rows were provided\n");
+    return 1;
+  }
+
+  if (!replay_run_once(map_path, steps, step_count, &first) || !replay_run_once(map_path, steps, step_count, &second)) {
+    return 1;
+  }
+  if (first.hash != second.hash) {
+    fprintf(stderr, "Replay selftest failed: deterministic fingerprints differ (%016llx != %016llx)\n",
+            (unsigned long long)first.hash, (unsigned long long)second.hash);
+    return 1;
+  }
+
+  printf("Replay selftest passed: map=%s steps=%zu ticks=%llu hash=%016llx x=%.2f z=%.2f rot=%d hp=%d "
+         "projectiles=%u enemies=%u\n",
+         map_path, step_count, (unsigned long long)first.ticks, (unsigned long long)first.hash,
+         (double)first.camera_x / 256.0, (double)first.camera_z / 256.0, first.player_rot_fixed,
+         first.player_hitpoints, (unsigned)first.active_projectiles, (unsigned)first.active_enemies);
+  return 0;
+}
+
 static bool load_runtime_level(const char *map_path, AppState *state, WallTextureSet *wall_textures,
                                FlatTextureSet *flat_textures, ObjectVisualSet *object_visuals,
                                GloomZone **previous_zones, GloomZone **render_zones, bool preserve_player,
@@ -8482,6 +8794,10 @@ int main(int argc, char **argv) {
 
   if (argc > 1 && strcmp(argv[1], "--teleport-selftest") == 0) {
     return run_teleport_selftest();
+  }
+
+  if (argc > 1 && strcmp(argv[1], "--replay-selftest") == 0) {
+    return run_replay_selftest(argc, argv);
   }
 
   if (argc > 1) {
