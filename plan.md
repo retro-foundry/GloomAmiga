@@ -31,6 +31,7 @@
 - Map parser now exposes the real 32x32 wall/trigger grid cells from the map header grid block.
 - Wall debug pass now uses the original `gridoffs4.bin` search order plus grid/ppnt wall candidates instead of drawing every zone segment.
 - Main viewport now starts from the event-1 player spawn and renders full-screen wall columns from real map grid candidates using the zones' real texture slot/scale data.
+- Wall texture coordinate selection now follows the Amiga wall renderer's half-range `wl_sc` path: `wl_sc=2` maps one full texture across the wall, `wl_sc=4` advances to the second texture slot halfway along, and non-positive scales preserve the original doubled-then-shifted coordinate shape.
 - Main runtime now treats missing named texture screens or zone references to unloaded texture screens as fatal startup errors.
 - Main viewport now derives the map's `tile_` tag from the original script and renders perspective floor/roof flats from the real `txts/floor*` and `txts/roof*` tile assets.
 - Event parsing now preserves real open-door and texture-change commands, validates command texture references, and the runtime triggers events from the map trigger grid using the player collision radius read from the real `objs/player` asset. Trigger/switch activation now follows the Amiga `checkevent`/`checknew2` shape: touch-based, no separate use/fire input, first colliding trigger in grid order only, and cleared negative triggers still block later overlapping triggers.

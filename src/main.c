@@ -3204,8 +3204,10 @@ static uint32_t sample_wall_texture_argb_ex(const WallTextureSet *set, uint8_t t
 
   u = clampf(u, 0.0f, 1.0f);
   v = clampf(v, 0.0f, 1.0f);
-  tx = (size_t)(u * (float)(GLOOM_TEXTURE_WIDTH - 1));
-  ty = (size_t)(v * (float)(GLOOM_TEXTURE_HEIGHT - 1));
+  tx = (size_t)(u * (float)GLOOM_TEXTURE_WIDTH);
+  ty = (size_t)(v * (float)GLOOM_TEXTURE_HEIGHT);
+  if (tx >= (size_t)GLOOM_TEXTURE_WIDTH) tx = (size_t)GLOOM_TEXTURE_WIDTH - 1u;
+  if (ty >= (size_t)GLOOM_TEXTURE_HEIGHT) ty = (size_t)GLOOM_TEXTURE_HEIGHT - 1u;
 
   offset = local_index * ((size_t)GLOOM_TEXTURE_WIDTH * (size_t)GLOOM_TEXTURE_HEIGHT) +
            ty * (size_t)GLOOM_TEXTURE_WIDTH + tx;
@@ -3225,12 +3227,69 @@ static uint32_t sample_wall_texture_argb_ex(const WallTextureSet *set, uint8_t t
   return set->screens[screen_index].palette[palette_index];
 }
 
+static void zone_wall_texture_coordinates(const GloomZone *zone, float wall_u, int *out_tile_index,
+                                          float *out_local_u, size_t *out_texture_x) {
+  float scaled_u = 0.0f;
+  float local_u = 0.0f;
+  int tile_base = 0;
+  int tile_index = 0;
+  size_t texture_x = 0u;
+
+  wall_u = clampf(wall_u, 0.0f, 1.0f);
+  scaled_u = wall_u;
+
+  if (zone != NULL) {
+    if (zone->scale > 0) {
+      scaled_u = (wall_u * (float)zone->scale) * 0.5f;
+    } else {
+      int shift = zone->scale < 0 ? -zone->scale : 0;
+      float divisor = 1.0f;
+
+      if (shift > 30) {
+        shift = 30;
+      }
+      if (shift > 0) {
+        divisor = (float)(1u << (uint32_t)shift);
+      }
+      /*
+       * amiga/gloom2.s wall column renderer: d0 has been lsr #1 before wl_sc is
+       * applied. Positive wl_sc values therefore scale from a half-range fraction,
+       * while wl_sc <= 0 doubles that half-range before the right shift.
+       */
+      scaled_u = wall_u / divisor;
+    }
+  }
+
+  tile_base = (int)scaled_u;
+  local_u = scaled_u - (float)tile_base;
+  if (local_u < 0.0f) {
+    local_u += 1.0f;
+    tile_base -= 1;
+  }
+  if (local_u < 0.0f) local_u = 0.0f;
+  if (local_u > 1.0f) local_u = 1.0f;
+
+  tile_index = tile_base & 7;
+  texture_x = (size_t)(local_u * (float)GLOOM_TEXTURE_WIDTH);
+  if (texture_x >= (size_t)GLOOM_TEXTURE_WIDTH) {
+    texture_x = (size_t)GLOOM_TEXTURE_WIDTH - 1u;
+  }
+
+  if (out_tile_index != NULL) {
+    *out_tile_index = tile_index;
+  }
+  if (out_local_u != NULL) {
+    *out_local_u = local_u;
+  }
+  if (out_texture_x != NULL) {
+    *out_texture_x = texture_x;
+  }
+}
+
 static uint32_t sample_zone_wall_texture_argb(const WallTextureSet *set, const AppState *state,
                                               const GloomZone *zone, float wall_u, float wall_v) {
-  float scaled_u = wall_u;
   float local_u = 0.0f;
   int tile_index = 0;
-  int tile_base = 0;
   uint8_t texture_index = 0;
 
   if (zone == NULL) {
@@ -3240,26 +3299,7 @@ static uint32_t sample_zone_wall_texture_argb(const WallTextureSet *set, const A
   wall_u = clampf(wall_u, 0.0f, 1.0f);
   wall_v = clampf(wall_v, 0.0f, 1.0f);
 
-  if (zone->scale > 0) {
-    scaled_u = wall_u * (float)zone->scale;
-  } else if (zone->scale < 0) {
-    int shift = -zone->scale;
-    float divisor = 1.0f;
-
-    if (shift > 1) {
-      divisor = (float)(1u << (uint32_t)(shift - 1));
-    }
-    scaled_u = wall_u / divisor;
-  }
-
-  tile_base = (int)scaled_u;
-  local_u = scaled_u - (float)tile_base;
-  if (local_u < 0.0f) {
-    local_u += 1.0f;
-    tile_base -= 1;
-  }
-
-  tile_index = tile_base & 7;
+  zone_wall_texture_coordinates(zone, wall_u, &tile_index, &local_u, NULL);
   texture_index = remap_wall_texture_index(state, zone->textures[tile_index]);
   return sample_wall_texture_argb_ex(set, texture_index, local_u, wall_v, NULL);
 }
@@ -8776,9 +8816,7 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
       subtract = dark_index * 17;
       {
         const GloomZone *zone = hit->wall->zone;
-        float scaled_u = hit->wall_u;
         float local_u = 0.0f;
-        int tile_base = 0;
         int tile_index = 0;
         uint8_t texture_index = 0u;
         size_t screen_index = 0u;
@@ -8786,28 +8824,7 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
         size_t tx = 0u;
 
         if (zone != NULL) {
-          if (zone->scale > 0) {
-            scaled_u = hit->wall_u * (float)zone->scale;
-          } else if (zone->scale < 0) {
-            int shift = -zone->scale;
-            float divisor = 1.0f;
-
-            if (shift > 1) {
-              divisor = (float)(1u << (uint32_t)(shift - 1));
-            }
-            scaled_u = hit->wall_u / divisor;
-          }
-
-          tile_base = (int)scaled_u;
-          local_u = scaled_u - (float)tile_base;
-          if (local_u < 0.0f) {
-            local_u += 1.0f;
-            tile_base -= 1;
-          }
-
-          if (local_u < 0.0f) local_u = 0.0f;
-          if (local_u > 1.0f) local_u = 1.0f;
-          tile_index = tile_base & 7;
+          zone_wall_texture_coordinates(zone, hit->wall_u, &tile_index, &local_u, &tx);
           texture_index = remap_wall_texture_index(state, zone->textures[tile_index]);
           screen_index = texture_index / (uint8_t)GLOOM_TEXTURES_PER_SCREEN;
           local_index = texture_index % (uint8_t)GLOOM_TEXTURES_PER_SCREEN;
@@ -8816,7 +8833,6 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
               local_index < wall_textures->screens[screen_index].texture_count) {
             const WallTextureScreen *screen = &wall_textures->screens[screen_index];
 
-            tx = (size_t)(local_u * (float)(GLOOM_TEXTURE_WIDTH - 1));
             wall_texels = screen->texels;
             wall_palette = screen->shaded_palette[dark_index];
             wall_texel_base = local_index * ((size_t)GLOOM_TEXTURE_WIDTH * (size_t)GLOOM_TEXTURE_HEIGHT) + tx;
@@ -12098,7 +12114,7 @@ static int run_menu_selftest(void) {
 }
 
 static int run_wall_selftest(void) {
-  AppState state;
+  static AppState state;
   GloomAnim anim;
   GloomZone zones[8];
   GloomTextureChangeCommand texture_change;
@@ -12153,6 +12169,46 @@ static int run_wall_selftest(void) {
   if (zones[0].textures[0] != 10u || remap_wall_texture_index(&state, zones[0].textures[0]) != 12u) {
     fprintf(stderr, "Wall selftest failed: exec_changetxt did not store the raw zone texture byte before remap\n");
     return 1;
+  }
+
+  memset(&zones[0], 0, sizeof(zones[0]));
+  zones[0].scale = 2;
+  {
+    int tile_index = -1;
+    size_t texture_x = 999u;
+    float local_u = -1.0f;
+
+    zone_wall_texture_coordinates(&zones[0], 0.25f, &tile_index, &local_u, &texture_x);
+    if (tile_index != 0 || texture_x != 16u || local_u < 0.249f || local_u > 0.251f) {
+      fprintf(stderr, "Wall selftest failed: wl_sc=2 did not use one full Amiga texture across the wall\n");
+      return 1;
+    }
+    zone_wall_texture_coordinates(&zones[0], 0.5f, &tile_index, &local_u, &texture_x);
+    if (tile_index != 0 || texture_x != 32u || local_u < 0.499f || local_u > 0.501f) {
+      fprintf(stderr, "Wall selftest failed: wl_sc=2 advanced texture slots too early\n");
+      return 1;
+    }
+
+    zones[0].scale = 4;
+    zone_wall_texture_coordinates(&zones[0], 0.5f, &tile_index, &local_u, &texture_x);
+    if (tile_index != 1 || texture_x != 0u || local_u > 0.001f) {
+      fprintf(stderr, "Wall selftest failed: wl_sc=4 did not advance to the second texture slot halfway along wall\n");
+      return 1;
+    }
+
+    zones[0].scale = 0;
+    zone_wall_texture_coordinates(&zones[0], 0.5f, &tile_index, &local_u, &texture_x);
+    if (tile_index != 0 || texture_x != 32u || local_u < 0.499f || local_u > 0.501f) {
+      fprintf(stderr, "Wall selftest failed: wl_sc=0 did not match the Amiga doubled half-range coordinate\n");
+      return 1;
+    }
+
+    zones[0].scale = -1;
+    zone_wall_texture_coordinates(&zones[0], 0.75f, &tile_index, &local_u, &texture_x);
+    if (tile_index != 0 || texture_x != 24u || local_u < 0.374f || local_u > 0.376f) {
+      fprintf(stderr, "Wall selftest failed: wl_sc=-1 no longer matches the Amiga shifted texture coordinate\n");
+      return 1;
+    }
   }
 
   memset(&state, 0, sizeof(state));
