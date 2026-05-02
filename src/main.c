@@ -1886,12 +1886,12 @@ static bool resolve_object_asset_path(const char *name, char *out_path, size_t o
   }
 
   (void)snprintf(path0, sizeof(path0), "%s", name);
-  (void)snprintf(path1, sizeof(path1), "amiga/%s", name);
-  (void)snprintf(path2, sizeof(path2), "amiga/objs/%s", name);
-  (void)snprintf(path3, sizeof(path3), "amiga/data/objs/%s", name);
-  (void)snprintf(path4, sizeof(path4), "amiga/prog/objs/%s", name);
-  (void)snprintf(path5, sizeof(path5), "objs/%s", name);
-  (void)snprintf(path6, sizeof(path6), "data/objs/%s", name);
+  (void)snprintf(path1, sizeof(path1), "amiga/objs/%s", name);
+  (void)snprintf(path2, sizeof(path2), "amiga/data/objs/%s", name);
+  (void)snprintf(path3, sizeof(path3), "amiga/prog/objs/%s", name);
+  (void)snprintf(path4, sizeof(path4), "objs/%s", name);
+  (void)snprintf(path5, sizeof(path5), "data/objs/%s", name);
+  (void)snprintf(path6, sizeof(path6), "amiga/%s", name);
 
   candidates[0] = path0;
   candidates[1] = path1;
@@ -2065,6 +2065,44 @@ static void free_wall_texture_set(WallTextureSet *set) {
   }
 
   memset(set, 0, sizeof(*set));
+}
+
+static bool clone_wall_texture_screen(const WallTextureScreen *source, WallTextureScreen *destination) {
+  size_t texel_count = 0u;
+  size_t flag_count = 0u;
+
+  if (source == NULL || destination == NULL || !source->loaded || source->texels == NULL ||
+      source->texture_count == 0u) {
+    return false;
+  }
+
+  free(destination->texels);
+  free(destination->column_flags);
+  *destination = *source;
+  destination->texels = NULL;
+  destination->column_flags = NULL;
+
+  texel_count = source->texture_count * (size_t)GLOOM_TEXTURE_WIDTH * (size_t)GLOOM_TEXTURE_HEIGHT;
+  flag_count = source->texture_count * (size_t)GLOOM_TEXTURE_WIDTH;
+
+  destination->texels = (uint8_t *)malloc(texel_count * sizeof(*destination->texels));
+  if (destination->texels == NULL) {
+    memset(destination, 0, sizeof(*destination));
+    return false;
+  }
+  memcpy(destination->texels, source->texels, texel_count * sizeof(*destination->texels));
+
+  if (source->column_flags != NULL) {
+    destination->column_flags = (uint8_t *)malloc(flag_count * sizeof(*destination->column_flags));
+    if (destination->column_flags == NULL) {
+      free(destination->texels);
+      memset(destination, 0, sizeof(*destination));
+      return false;
+    }
+    memcpy(destination->column_flags, source->column_flags, flag_count * sizeof(*destination->column_flags));
+  }
+
+  return true;
 }
 
 static void set_default_texture_palette(uint32_t palette[256]) {
@@ -2663,8 +2701,14 @@ static bool load_map_wall_textures(const GloomMap *map, WallTextureSet *set) {
   for (i = 0; i < GLOOM_TEXTURE_SCREENS; ++i) {
     const char *name = map->texture_names[i];
     char resolved_path[256] = {0};
+    size_t target_screen = set->loaded_count;
 
     if (name[0] == '\0') {
+      continue;
+    }
+    if (target_screen >= GLOOM_TEXTURE_SCREENS) {
+      fprintf(stderr, "Map references more than %u compact texture screens\n", (unsigned)GLOOM_TEXTURE_SCREENS);
+      ok = false;
       continue;
     }
 
@@ -2674,7 +2718,12 @@ static bool load_map_wall_textures(const GloomMap *map, WallTextureSet *set) {
       continue;
     }
 
-    if (!load_wall_texture_screen(resolved_path, name, &set->screens[i])) {
+    /*
+     * amiga/gloom2.s: loadtxts only appends 20 entries to the global textures
+     * pointer table for non-empty names; empty texture-name slots do not reserve a
+     * 20-texture gap.
+     */
+    if (!load_wall_texture_screen(resolved_path, name, &set->screens[target_screen])) {
       fprintf(stderr, "Failed to decode texture screen %s (%s)\n", name, resolved_path);
       ok = false;
       continue;
@@ -2772,6 +2821,48 @@ static bool validate_map_wall_texture_references(const GloomMap *map, const Wall
               (unsigned)command->event_id, (unsigned)command->zone_index, texture_index, screen_index,
               set->screens[screen_index].texture_count);
       ok = false;
+    }
+  }
+
+  return ok;
+}
+
+static bool preserve_stale_wall_texture_references(const GloomMap *map, WallTextureSet *set,
+                                                   const WallTextureSet *previous_set) {
+  bool ok = true;
+  size_t zone_index = 0u;
+
+  if (map == NULL || set == NULL || previous_set == NULL) {
+    return true;
+  }
+
+  for (zone_index = 0u; zone_index < map->zone_count; ++zone_index) {
+    const GloomZone *zone = &map->zones[zone_index];
+    size_t slot = 0u;
+
+    for (slot = 0u; slot < sizeof(zone->textures); ++slot) {
+      uint8_t texture_index = zone->textures[slot];
+      size_t screen_index = texture_index / (uint8_t)GLOOM_TEXTURES_PER_SCREEN;
+
+      if (texture_index == 255u || screen_index >= GLOOM_TEXTURE_SCREENS || set->screens[screen_index].loaded) {
+        continue;
+      }
+      if (!previous_set->screens[screen_index].loaded) {
+        continue;
+      }
+
+      /*
+       * amiga/gloom2.s: freetxts clears textscrns but not the global textures
+       * pointer table. loadtxts then overwrites only screens named by the next
+       * map, so maps can still read stale texture slots from the previous level.
+       */
+      if (!clone_wall_texture_screen(&previous_set->screens[screen_index], &set->screens[screen_index])) {
+        fprintf(stderr, "Failed to preserve stale wall texture screen %zu for zone %zu texture %u\n", screen_index,
+                zone_index, texture_index);
+        ok = false;
+      } else if (set->loaded_count <= screen_index) {
+        set->loaded_count = screen_index + 1u;
+      }
     }
   }
 
@@ -3028,11 +3119,25 @@ static ScriptPlayNextResult resolve_next_script_play_map_or_done(const char *cur
       size_t map_len = line_len - 5u;
 
       if (found_current) {
+        char data_candidate[256] = {0};
+        char raw_candidate[256] = {0};
+
         if (map_len + strlen("amiga/maps/") >= out_map_path_size) {
           free(script);
           return SCRIPT_PLAY_NEXT_ERROR;
         }
-        (void)snprintf(out_map_path, out_map_path_size, "amiga/maps/%.*s", (int)map_len, map_name);
+        (void)snprintf(data_candidate, sizeof(data_candidate), "amiga/data/maps/%.*s", (int)map_len, map_name);
+        (void)snprintf(raw_candidate, sizeof(raw_candidate), "amiga/maps/%.*s", (int)map_len, map_name);
+        /*
+         * amiga/gloom2.s scriptplay loads "maps/<name>" from the packaged game
+         * data. In this repo the packaged maps live under amiga/data/maps, while
+         * amiga/maps also contains raw source maps that can be stale.
+         */
+        if (resolve_runtime_file_path(data_candidate, out_map_path, out_map_path_size)) {
+          free(script);
+          return SCRIPT_PLAY_NEXT_MAP;
+        }
+        (void)snprintf(out_map_path, out_map_path_size, "%s", raw_candidate);
         free(script);
         return SCRIPT_PLAY_NEXT_MAP;
       }
@@ -11463,6 +11568,31 @@ static int run_combat_selftest(void) {
                                 "re-entering contact should damage again after separation")) {
       return 1;
     }
+
+    memset(&state, 0, sizeof(state));
+    memset(contact_spawns, 0, sizeof(contact_spawns));
+    contact_spawns[0].object_type = GLOOM_OBJECT_TYPE_DRAGON;
+    state.map.object_spawns = contact_spawns;
+    state.map.object_spawn_count = 1u;
+    state.two_player_mode = true;
+    state.player_hitpoints = GLOOM_PLAYER_INITIAL_HEALTH;
+    state.player_radius = 33;
+    state.camera_x = 200.0f;
+    state.player2.player_hitpoints = GLOOM_PLAYER_INITIAL_HEALTH;
+    state.objects[0].active = true;
+    state.objects[0].enemy = true;
+    state.objects[0].radius = 33;
+    state.objects[0].damage = objects[GLOOM_OBJECT_TYPE_DRAGON].damage;
+    state.objects[0].hitpoints = objects[GLOOM_OBJECT_TYPE_DRAGON].hitpoints;
+
+    runtime_update_object_player_contacts(&state, NULL);
+    if (!combat_selftest_expect(state.player_hitpoints == GLOOM_PLAYER_INITIAL_HEALTH &&
+                                    state.player2.player_hitpoints == 15 &&
+                                    state.objects[0].hitpoints == 249 &&
+                                    state.objects[0].contact_was_hit_player == 2u,
+                                "obj_loop contact should damage player two when player one is not overlapping")) {
+      return 1;
+    }
   }
   memset(&state, 0, sizeof(state));
   memset(&test_projectile, 0, sizeof(test_projectile));
@@ -12644,7 +12774,7 @@ static int run_teleport_selftest(void) {
   }
 
   if (!resolve_next_script_play_map("amiga/maps/map1_1", next_map_path, sizeof(next_map_path)) ||
-      strcmp(next_map_path, "amiga/maps/map1_2") != 0) {
+      strcmp(next_map_path, "amiga/data/maps/map1_2") != 0) {
     fprintf(stderr, "Teleport selftest failed: levelover/scriptplay did not resolve map1_1 to script play_map1_2\n");
     return 1;
   }
@@ -13133,7 +13263,8 @@ static bool load_runtime_level(const char *map_path, AppState *state, WallTextur
     return false;
   }
 
-  if (!validate_map_wall_texture_references(&next_state->map, &next_wall_textures)) {
+  if (!preserve_stale_wall_texture_references(&next_state->map, &next_wall_textures, wall_textures) ||
+      !validate_map_wall_texture_references(&next_state->map, &next_wall_textures)) {
     free_wall_texture_set(&next_wall_textures);
     gloom_map_free(&next_state->map);
     return false;
@@ -13218,6 +13349,17 @@ static bool load_runtime_level(const char *map_path, AppState *state, WallTextur
 }
 
 static int run_level_transition_selftest(void) {
+  static const char *expected_play_chain[] = {"amiga/maps/map1_1",      "amiga/data/maps/map1_2",
+                                             "amiga/data/maps/map1_3", "amiga/data/maps/map1_4",
+                                             "amiga/data/maps/map1_5", "amiga/data/maps/map1_6",
+                                             "amiga/data/maps/map1_7", "amiga/data/maps/map3_1",
+                                             "amiga/data/maps/map3_2", "amiga/data/maps/map3_3",
+                                             "amiga/data/maps/map3_4", "amiga/data/maps/map3_5",
+                                             "amiga/data/maps/map3_6", "amiga/data/maps/map3_7",
+                                             "amiga/data/maps/map4_1", "amiga/data/maps/map4_2",
+                                             "amiga/data/maps/map4_3", "amiga/data/maps/map4_4",
+                                             "amiga/data/maps/map4_5", "amiga/data/maps/map4_6",
+                                             "amiga/data/maps/map4_7"};
   AppState *state = NULL;
   WallTextureSet *wall_textures = NULL;
   FlatTextureSet *flat_textures = NULL;
@@ -13230,6 +13372,7 @@ static int run_level_transition_selftest(void) {
   MenuImage completion_image;
   int16_t preserved_lives = 1;
   int16_t preserved_p2_lives = 3;
+  size_t chain_index = 0u;
   int result = 1;
 
   memset(&completion, 0, sizeof(completion));
@@ -13250,6 +13393,11 @@ static int run_level_transition_selftest(void) {
     fprintf(stderr, "Level transition selftest failed: script did not resolve the map after map1_1\n");
     goto cleanup;
   }
+  if (strcmp(next_map_path, "amiga/data/maps/map1_2") != 0) {
+    fprintf(stderr, "Level transition selftest failed: map1_1 advanced to %s instead of amiga/data/maps/map1_2\n",
+            next_map_path);
+    goto cleanup;
+  }
   if (resolve_next_script_play_map_or_done("amiga/maps/map4_7", next_map_path, sizeof(next_map_path), &completion) !=
           SCRIPT_PLAY_NEXT_DONE ||
       strcmp(completion.picture, "theend") != 0 ||
@@ -13262,11 +13410,25 @@ static int run_level_transition_selftest(void) {
     goto cleanup;
   }
 
+  for (chain_index = 0u; chain_index + 1u < sizeof(expected_play_chain) / sizeof(expected_play_chain[0]);
+       ++chain_index) {
+    if (!resolve_next_script_play_map(expected_play_chain[chain_index], next_map_path, sizeof(next_map_path))) {
+      fprintf(stderr, "Level transition selftest failed: script did not resolve after %s\n",
+              expected_play_chain[chain_index]);
+      goto cleanup;
+    }
+    if (strcmp(next_map_path, expected_play_chain[chain_index + 1u]) != 0) {
+      fprintf(stderr, "Level transition selftest failed: %s advanced to %s instead of %s\n",
+              expected_play_chain[chain_index], next_map_path, expected_play_chain[chain_index + 1u]);
+      goto cleanup;
+    }
+  }
+
   share_levelover_two_player_lives(&preserved_lives, &preserved_p2_lives);
-  if (!load_runtime_level(next_map_path, state, wall_textures, flat_textures, object_visuals, previous_zones,
+  if (!load_runtime_level("amiga/data/maps/map1_2", state, wall_textures, flat_textures, object_visuals, previous_zones,
                           render_zones, true, 11, preserved_lives, 2u, 0u, 0, preserved_p2_lives, 4u, 2u, true,
                           true, GLOOM_VIOLENCE_MEATY_MESSY, resolved_map_path, sizeof(resolved_map_path))) {
-    fprintf(stderr, "Level transition selftest failed: could not load scriptplay next map %s\n", next_map_path);
+    fprintf(stderr, "Level transition selftest failed: could not load scriptplay next map amiga/data/maps/map1_2\n");
     goto cleanup;
   }
 
@@ -13287,6 +13449,18 @@ static int run_level_transition_selftest(void) {
       state->player2.player_pixsizeadd != 0) {
     fprintf(stderr, "Level transition selftest failed: resetplayer/scriptplay transition flags were not cleared\n");
     goto cleanup;
+  }
+
+  for (chain_index = 2u; chain_index < sizeof(expected_play_chain) / sizeof(expected_play_chain[0]); ++chain_index) {
+    if (!load_runtime_level(expected_play_chain[chain_index], state, wall_textures, flat_textures, object_visuals,
+                            previous_zones, render_zones, true, state->player_hitpoints, state->player_lives,
+                            state->player_weapon, state->player_reload, state->player2.player_hitpoints,
+                            state->player2.player_lives, state->player2.player_weapon, state->player2.player_reload,
+                            true, true, GLOOM_VIOLENCE_MEATY_MESSY, resolved_map_path, sizeof(resolved_map_path))) {
+      fprintf(stderr, "Level transition selftest failed: could not load scriptplay chain map %s\n",
+              expected_play_chain[chain_index]);
+      goto cleanup;
+    }
   }
 
   printf("Level transition selftest passed\n");
