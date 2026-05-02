@@ -56,6 +56,7 @@ enum {
   GLOOM_PLAYER_FRAME_SPEED_FIXED = 0x6000,
   GLOOM_PLAYER_BOB_HEIGHT = 20,
   GLOOM_PLAYER_INITIAL_HEALTH = 25,
+  GLOOM_PLAYER_CONTACT_DAMAGE = 1,
   GLOOM_PLAYER_RED_PAL_TIMER = 2,
   GLOOM_PLAYER_DEATH_ROT_STEP = 4,
   GLOOM_PLAYER_DEATH_EYE_STEP = 4,
@@ -335,6 +336,7 @@ typedef struct {
   float render_y_offset;
   uint8_t logic_state;
   uint8_t old_logic_state;
+  uint8_t contact_was_hit_player;
 } RuntimeObjectState;
 
 typedef struct {
@@ -5244,6 +5246,31 @@ static void runtime_blowdragon(AppState *state, RuntimeObjectState *object, cons
   state->dragon_finished_reported = false;
 }
 
+static void runtime_damage_object(AppState *state, const ObjectVisualSet *object_visuals, RuntimeObjectState *object,
+                                  const ObjectCombatDefinition *combat, int16_t object_type, uint16_t object_index,
+                                  int16_t damage) {
+  if (state == NULL || object == NULL || combat == NULL || damage <= 0 || !object->active) {
+    return;
+  }
+
+  object->hitpoints -= damage;
+  if (object->hitpoints <= 0) {
+    if (combat->death_routine == GLOOM_OBJECT_DIE_BLOWDRAGON) {
+      runtime_blowdragon(state, object, combat, object_visuals, object_type);
+    } else if (combat->death_routine == GLOOM_OBJECT_DIE_BLOWOBJECT ||
+               combat->death_routine == GLOOM_OBJECT_DIE_BLOWQUICK ||
+               combat->death_routine == GLOOM_OBJECT_DIE_BLOWDEATH ||
+               combat->death_routine == GLOOM_OBJECT_DIE_BLOWTERRA) {
+      runtime_blowobject(state, object, combat, object_visuals, object_type);
+    } else {
+      fprintf(stderr, "Cannot kill object type %d: original death routine is not represented in the PC runtime\n",
+              object_type);
+    }
+  } else {
+    runtime_apply_object_hit(state, object, combat, object_type, object_index);
+  }
+}
+
 static int16_t radians_to_amiga_rotation(float radians) {
   int32_t unit = 0;
 
@@ -5419,50 +5446,59 @@ static void runtime_advance_monster_frame(RuntimeObjectState *object, int32_t fr
       (uint32_t)((int32_t)object->frame_fixed + (int32_t)((float)frame_speed_fixed * step_scale)) & 0x0003ffffu;
 }
 
+static bool runtime_object_collides_player_at_index(const AppState *state, const RuntimeObjectState *object,
+                                                   int player_index) {
+  float dx = 0.0f;
+  float dz = 0.0f;
+  float radius = 0.0f;
+  float player_x = 0.0f;
+  float player_z = 0.0f;
+
+  if (state == NULL || object == NULL) {
+    return false;
+  }
+
+  if (player_index == 0) {
+    if (!player_can_take_damage(state)) {
+      return false;
+    }
+    player_x = state->camera_x;
+    player_z = state->camera_z;
+  } else if (player_index == 1) {
+    if (!state->two_player_mode || !secondary_player_can_take_damage(&state->player2)) {
+      return false;
+    }
+    player_x = state->player2.camera_x;
+    player_z = state->player2.camera_z;
+  } else {
+    return false;
+  }
+
+  radius = (float)(object->radius + state->player_radius);
+  dx = player_x - object->x;
+  dz = player_z - object->z;
+  return SDL_fabsf(dx) < radius && SDL_fabsf(dz) < radius && (dx * dx + dz * dz) < (radius * radius);
+}
+
 static bool runtime_object_collides_player(const AppState *state, const RuntimeObjectState *object) {
   return runtime_object_collides_player_index(state, object) >= 0;
 }
 
 static int runtime_object_collides_player_index(const AppState *state, const RuntimeObjectState *object) {
-  float dx = 0.0f;
-  float dz = 0.0f;
-  float radius = 0.0f;
-
-  if (state == NULL || object == NULL) {
-    return -1;
+  if (runtime_object_collides_player_at_index(state, object, 0)) {
+    return 0;
   }
-
-  radius = (float)(object->radius + state->player_radius);
-  if (player_can_take_damage(state)) {
-    dx = state->camera_x - object->x;
-    dz = state->camera_z - object->z;
-    if (SDL_fabsf(dx) < radius && SDL_fabsf(dz) < radius && (dx * dx + dz * dz) < (radius * radius)) {
-      return 0;
-    }
+  if (runtime_object_collides_player_at_index(state, object, 1)) {
+    return 1;
   }
-
-  if (state->two_player_mode && secondary_player_can_take_damage(&state->player2)) {
-    dx = state->player2.camera_x - object->x;
-    dz = state->player2.camera_z - object->z;
-    if (SDL_fabsf(dx) < radius && SDL_fabsf(dz) < radius && (dx * dx + dz * dz) < (radius * radius)) {
-      return 1;
-    }
-  }
-
   return -1;
 }
 
-static void damage_player_from_object(AppState *state, const RuntimeObjectState *object) {
-  int player_index = 0;
-
+static void damage_player_from_object_index(AppState *state, const RuntimeObjectState *object, int player_index) {
   if (state == NULL || object == NULL || object->damage <= 0) {
     return;
   }
 
-  player_index = runtime_object_collides_player_index(state, object);
-  if (player_index < 0) {
-    player_index = 0;
-  }
   if (player_index == 0) {
     if (!player_can_take_damage(state)) {
       return;
@@ -5476,11 +5512,84 @@ static void damage_player_from_object(AppState *state, const RuntimeObjectState 
       start_player_death(state);
     }
   } else if (player_index == 1) {
+    if (!state->two_player_mode || !secondary_player_can_take_damage(&state->player2)) {
+      return;
+    }
     state->player2.player_hitpoints -= object->damage;
     if (state->player2.player_hitpoints < 0) {
       state->player2.player_hitpoints = 0;
     }
     state->player2.player_palette_timer = (float)GLOOM_PLAYER_RED_PAL_TIMER;
+  }
+}
+
+static void damage_player_from_object(AppState *state, const RuntimeObjectState *object) {
+  int player_index = 0;
+
+  if (state == NULL || object == NULL || object->damage <= 0) {
+    return;
+  }
+
+  player_index = runtime_object_collides_player_index(state, object);
+  if (player_index < 0) {
+    player_index = 0;
+  }
+  damage_player_from_object_index(state, object, player_index);
+}
+
+static void runtime_update_object_player_contacts(AppState *state, const ObjectVisualSet *object_visuals) {
+  size_t i = 0u;
+  size_t count = 0u;
+
+  if (state == NULL) {
+    return;
+  }
+
+  count = state->map.object_spawn_count;
+  if (count > (size_t)GLOOM_MAX_RUNTIME_OBJECTS) {
+    count = (size_t)GLOOM_MAX_RUNTIME_OBJECTS;
+  }
+
+  for (i = 0u; i < count; ++i) {
+    const GloomObjectSpawn *spawn = &state->map.object_spawns[i];
+    RuntimeObjectState *object = &state->objects[i];
+    const ObjectCombatDefinition *combat = NULL;
+    int player_index = -1;
+    uint8_t contact_marker = 0u;
+
+    if (!object->active || !object->enemy) {
+      continue;
+    }
+    if (spawn->object_type < 0 || spawn->object_type >= (int16_t)GLOOM_OBJECT_TYPE_COUNT) {
+      continue;
+    }
+
+    /*
+     * amiga/gloom2.s: obj_loop/checkcoll tests enemy ob_collwith against player
+     * ob_colltype, stores ob_washit for the same overlapping pair, and only re-arms
+     * contact damage after separation.
+     */
+    player_index = runtime_object_collides_player_index(state, object);
+    if (player_index < 0) {
+      object->contact_was_hit_player = 0u;
+      continue;
+    }
+
+    contact_marker = (uint8_t)(player_index + 1);
+    if (object->contact_was_hit_player == contact_marker) {
+      continue;
+    }
+    object->contact_was_hit_player = contact_marker;
+    if (state->finished2 != 0) {
+      continue;
+    }
+
+    combat = object_type_combat_definition(spawn->object_type);
+    damage_player_from_object_index(state, object, player_index);
+    if (object->active && combat != NULL) {
+      runtime_damage_object(state, object_visuals, object, combat, spawn->object_type, (uint16_t)i,
+                            GLOOM_PLAYER_CONTACT_DAMAGE);
+    }
   }
 }
 
@@ -5533,7 +5642,8 @@ static void update_baldy_family_object(AppState *state, RuntimeObjectState *obje
     if ((object->frame_fixed >> 16u) == 0u) {
       object->rotation = runtime_angle_to_player(state, object);
       object->frame_fixed = 5u << 16;
-      damage_player_from_object(state, object);
+      /* amiga/gloom2.s: baldypunch clears ob_washit; obj_loop applies the contact damage. */
+      object->contact_was_hit_player = 0u;
     } else {
       object->frame_fixed = 0u;
     }
@@ -5557,11 +5667,16 @@ static void update_baldy_family_object(AppState *state, RuntimeObjectState *obje
       return;
     }
 
-    if (runtime_object_collides_player(state, object)) {
-      object->logic_state = GLOOM_OBJECT_LOGIC_BALDYPUNCH;
-      object->delay = (float)object_type_punch_rate(object_type);
-      object->frame_fixed = 0u;
-      return;
+    {
+      int player_index = runtime_object_collides_player_index(state, object);
+
+      if (player_index >= 0) {
+        object->contact_was_hit_player = (uint8_t)(player_index + 1);
+        object->logic_state = GLOOM_OBJECT_LOGIC_BALDYPUNCH;
+        object->delay = (float)object_type_punch_rate(object_type);
+        object->frame_fixed = 0u;
+        return;
+      }
     }
 
     runtime_advance_monster_frame(object, object->frame_speed_fixed, step_scale);
@@ -6209,22 +6324,7 @@ static bool damage_projectile_enemy(AppState *state, const ObjectVisualSet *obje
       return true;
     }
 
-    object->hitpoints -= projectile->damage;
-    if (object->hitpoints <= 0) {
-      if (combat->death_routine == GLOOM_OBJECT_DIE_BLOWDRAGON) {
-        runtime_blowdragon(state, object, combat, object_visuals, spawn->object_type);
-      } else if (combat->death_routine == GLOOM_OBJECT_DIE_BLOWOBJECT ||
-                 combat->death_routine == GLOOM_OBJECT_DIE_BLOWQUICK ||
-                 combat->death_routine == GLOOM_OBJECT_DIE_BLOWDEATH ||
-                 combat->death_routine == GLOOM_OBJECT_DIE_BLOWTERRA) {
-        runtime_blowobject(state, object, combat, object_visuals, spawn->object_type);
-      } else {
-        fprintf(stderr, "Cannot kill object type %d: original death routine is not represented in the PC runtime\n",
-                spawn->object_type);
-      }
-    } else {
-      runtime_apply_object_hit(state, object, combat, spawn->object_type, (uint16_t)i);
-    }
+    runtime_damage_object(state, object_visuals, object, combat, spawn->object_type, (uint16_t)i, projectile->damage);
 
     return true;
   }
@@ -7044,6 +7144,7 @@ static void update_with_controls(AppState *state, const PlayerControls *controls
   update_rotpolys(state);
   update_doors(state);
   update_runtime_objects(state);
+  runtime_update_object_player_contacts(state, object_visuals);
   update_pickup_animations(state);
   update_projectiles(state, object_visuals);
   update_sparks(state);
@@ -7077,6 +7178,7 @@ static void update_with_controls(AppState *state, const PlayerControls *controls
     state->active_player_index = 0u;
     state->active_other_player_lives = state->player2.player_lives;
   }
+  runtime_update_object_player_contacts(state, object_visuals);
 }
 
 static void update(AppState *state, const uint8_t *keyboard, bool mouse_fire, const ObjectVisualSet *object_visuals) {
@@ -11319,6 +11421,49 @@ static int run_combat_selftest(void) {
                               "two-player enemy projectile damages player two")) {
     return 1;
   }
+  {
+    GloomObjectSpawn contact_spawns[1];
+
+    memset(&state, 0, sizeof(state));
+    memset(contact_spawns, 0, sizeof(contact_spawns));
+    contact_spawns[0].object_type = GLOOM_OBJECT_TYPE_DRAGON;
+    state.map.object_spawns = contact_spawns;
+    state.map.object_spawn_count = 1u;
+    state.player_hitpoints = GLOOM_PLAYER_INITIAL_HEALTH;
+    state.player_radius = 33;
+    state.objects[0].active = true;
+    state.objects[0].enemy = true;
+    state.objects[0].radius = 33;
+    state.objects[0].damage = objects[GLOOM_OBJECT_TYPE_DRAGON].damage;
+    state.objects[0].hitpoints = objects[GLOOM_OBJECT_TYPE_DRAGON].hitpoints;
+
+    runtime_update_object_player_contacts(&state, NULL);
+    if (!combat_selftest_expect(state.player_hitpoints == 15 && state.objects[0].hitpoints == 249 &&
+                                    state.objects[0].contact_was_hit_player == 1u,
+                                "obj_loop contact should damage player and object once on first overlap")) {
+      return 1;
+    }
+
+    runtime_update_object_player_contacts(&state, NULL);
+    if (!combat_selftest_expect(state.player_hitpoints == 15 && state.objects[0].hitpoints == 249,
+                                "ob_washit should suppress repeated same-pair contact damage")) {
+      return 1;
+    }
+
+    state.camera_x = 200.0f;
+    runtime_update_object_player_contacts(&state, NULL);
+    if (!combat_selftest_expect(state.objects[0].contact_was_hit_player == 0u,
+                                "ob_washit should re-arm after the player separates")) {
+      return 1;
+    }
+
+    state.camera_x = 0.0f;
+    runtime_update_object_player_contacts(&state, NULL);
+    if (!combat_selftest_expect(state.player_hitpoints == 5 && state.objects[0].hitpoints == 248,
+                                "re-entering contact should damage again after separation")) {
+      return 1;
+    }
+  }
   memset(&state, 0, sizeof(state));
   memset(&test_projectile, 0, sizeof(test_projectile));
   state.two_player_mode = true;
@@ -12629,6 +12774,7 @@ static uint64_t replay_fingerprint_state(const AppState *state, ReplayResult *ou
     replay_hash_i32(&hash, object->rotation);
     replay_hash_i32(&hash, object->hitpoints);
     replay_hash_i32(&hash, (int32_t)object->logic_state);
+    replay_hash_i32(&hash, (int32_t)object->contact_was_hit_player);
     replay_hash_i32(&hash, replay_quantize_float(object->delay));
     replay_hash_i32(&hash, replay_quantize_float(object->pause_delay));
     replay_hash_i32(&hash, (int32_t)object->frame_fixed);
