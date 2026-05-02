@@ -6616,8 +6616,9 @@ static void check_event_triggers(AppState *state) {
   int base_z = 0;
   size_t offset_index = 0u;
 
-  if (state == NULL || state->player_radius <= 0 || !state->map.has_grid_cells || state->map.ppnt_blob == NULL ||
-      state->map.ppnt_blob_size < 2u || state->map.zone_count > (size_t)GLOOM_MAX_RENDER_ZONES) {
+  if (state == NULL || state->player_radius <= 0 || state->player_pixsizeadd != 0 || state->finished2 != 0 ||
+      !state->map.has_grid_cells || state->map.ppnt_blob == NULL || state->map.ppnt_blob_size < 2u ||
+      state->map.zone_count > (size_t)GLOOM_MAX_RENDER_ZONES) {
     return;
   }
 
@@ -6661,7 +6662,7 @@ static void check_event_triggers(AppState *state) {
       size_t zone_index = (size_t)main_read_be16(state->map.ppnt_blob + (word_offset * 2u));
       GloomZone *zone = NULL;
       uint16_t distance = 0u;
-      uint8_t event_id = 0u;
+      int16_t event_id = 0;
 
       if (zone_index >= state->map.zone_count || zone_index >= (size_t)GLOOM_MAX_RENDER_ZONES || seen[zone_index]) {
         continue;
@@ -6669,17 +6670,17 @@ static void check_event_triggers(AppState *state) {
 
       seen[zone_index] = 1u;
       zone = &state->map.zones[zone_index];
-      if (zone->event_id <= 0 || zone->event_id > (int16_t)GLOOM_EVENT_COUNT) {
-        continue;
-      }
-
       distance = zone_segment_distance(zone, (int16_t)cam_x, (int16_t)cam_z);
       if ((int32_t)distance - (int32_t)state->player_radius >= 0) {
         continue;
       }
 
-      event_id = (uint8_t)zone->event_id;
-      execute_map_event(state, event_id);
+      event_id = zone->event_id;
+      if (event_id <= 0 || event_id > (int16_t)GLOOM_EVENT_COUNT) {
+        return;
+      }
+      execute_map_event(state, (uint8_t)event_id);
+      return;
     }
   }
 }
@@ -8888,6 +8889,91 @@ static int run_wall_selftest(void) {
   return 0;
 }
 
+static void configure_horizontal_test_zone(GloomZone *zone, int16_t x1, int16_t z1, int16_t x2, int16_t z2,
+                                           int16_t event_id) {
+  if (zone == NULL) {
+    return;
+  }
+
+  memset(zone, 0, sizeof(*zone));
+  zone->x1 = x1;
+  zone->z1 = z1;
+  zone->x2 = x2;
+  zone->z2 = z2;
+  zone->na = 32766;
+  zone->nb = 0;
+  zone->a = 0;
+  zone->b = 32766;
+  zone->ln = (int16_t)(x2 - x1);
+  zone->event_id = event_id;
+}
+
+static int run_switch_selftest(void) {
+  AppState state;
+  GloomZone zones[4];
+  GloomTextureChangeCommand texture_changes[2];
+  uint8_t ppnt_blob[4] = {0, 0, 0, 1};
+  PlayerControls controls;
+  size_t i = 0u;
+
+  memset(&state, 0, sizeof(state));
+  memset(zones, 0, sizeof(zones));
+  memset(texture_changes, 0, sizeof(texture_changes));
+  memset(&controls, 0, sizeof(controls));
+
+  state.map.zones = zones;
+  state.map.zone_count = 4u;
+  state.map.has_grid_cells = true;
+  state.map.ppnt_blob = ppnt_blob;
+  state.map.ppnt_blob_size = sizeof(ppnt_blob);
+  state.map.trigger_grid[0].count_minus_one = 1;
+  state.map.trigger_grid[0].ppnt_word_offset = 0u;
+  state.map.texture_change_commands = texture_changes;
+  state.map.texture_change_command_count = 2u;
+  state.player_radius = 33;
+  state.camera_x = 128.0f;
+  state.camera_z = 120.0f;
+
+  configure_horizontal_test_zone(&zones[0], 96, 128, 160, 128, 2);
+  configure_horizontal_test_zone(&zones[1], 96, 128, 160, 128, 3);
+  for (i = 0u; i < sizeof(zones[2].textures); ++i) {
+    zones[2].textures[i] = 4u;
+    zones[3].textures[i] = 4u;
+  }
+  texture_changes[0].event_id = 2u;
+  texture_changes[0].zone_index = 2u;
+  texture_changes[0].texture_index = 10u;
+  texture_changes[1].event_id = 3u;
+  texture_changes[1].zone_index = 3u;
+  texture_changes[1].texture_index = 11u;
+
+  check_event_triggers(&state);
+  if (zones[0].event_id != -2 || zones[2].textures[0] != 10u || zones[3].textures[0] != 4u) {
+    fprintf(stderr,
+            "Switch selftest failed: checkevent should run only the first colliding trigger without fire/use input\n");
+    return 1;
+  }
+
+  controls.fire = true;
+  update_player_weapon(&state, &controls);
+  check_event_triggers(&state);
+  if (zones[3].textures[0] != 4u) {
+    fprintf(stderr, "Switch selftest failed: a cleared first trigger should block later overlapping triggers\n");
+    return 1;
+  }
+
+  state.player_pixsizeadd = 1;
+  zones[0].event_id = 4;
+  check_event_triggers(&state);
+  if (zones[0].event_id != 4) {
+    fprintf(stderr, "Switch selftest failed: checkevent ran while ob_pixsizeadd was active\n");
+    return 1;
+  }
+
+  printf("Switch selftest passed\n");
+  return 0;
+}
+
 static int run_teleport_selftest(void) {
   AppState state;
   GloomTeleportCommand command;
@@ -9508,6 +9594,10 @@ int main(int argc, char **argv) {
 
   if (argc > 1 && strcmp(argv[1], "--wall-selftest") == 0) {
     return run_wall_selftest();
+  }
+
+  if (argc > 1 && strcmp(argv[1], "--switch-selftest") == 0) {
+    return run_switch_selftest();
   }
 
   if (argc > 1 && strcmp(argv[1], "--teleport-selftest") == 0) {
