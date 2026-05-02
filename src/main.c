@@ -108,6 +108,7 @@ enum {
   GLOOM_PLAYER_DEATH_DEAD_DELAY,
   GLOOM_PLAYER_DEATH_WAIT_RESTART,
   GLOOM_PLAYER_DEATH_INVINCIBLE,
+  GLOOM_PLAYER_DEATH_OUT_OF_LIVES,
   GLOOM_PLAYER_DEATH_GAME_OVER
 };
 
@@ -303,6 +304,39 @@ typedef struct {
 } RuntimeObjectState;
 
 typedef struct {
+  float camera_x;
+  float camera_z;
+  float camera_y;
+  float camera_angle;
+  int32_t player_rot_fixed;
+  int32_t player_rotspeed;
+  float player_bounce;
+  float player_eye_y;
+  int16_t player_hitpoints;
+  int16_t player_lives;
+  bool player_dead;
+  uint8_t player_death_phase;
+  float player_death_timer;
+  uint8_t player_weapon;
+  uint8_t player_reload;
+  uint8_t player_bouncy_bullets;
+  float player_reload_counter;
+  float player_weapon_flash;
+  float player_palette_timer;
+  float player_mega_timer;
+  float player_invisible_timer;
+  float player_thermo_timer;
+  float player_hyper_timer;
+  bool player_last_fire;
+  int16_t player_pixsize;
+  int16_t player_pixsizeadd;
+  float player_pixsize_accum;
+  int16_t player_respawn_x;
+  int16_t player_respawn_z;
+  int16_t player_respawn_rotation;
+} RuntimePlayerState;
+
+typedef struct {
   uint64_t tick_count;
   GloomMap map;
   uint8_t wall_texture_remap[GLOOM_TOTAL_WALL_TEXTURES];
@@ -347,6 +381,10 @@ typedef struct {
   int16_t player_respawn_x;
   int16_t player_respawn_z;
   int16_t player_respawn_rotation;
+  bool two_player_mode;
+  uint8_t active_player_index;
+  int16_t active_other_player_lives;
+  RuntimePlayerState player2;
   int16_t teleport_x;
   int16_t teleport_z;
   int16_t teleport_rotation;
@@ -601,6 +639,8 @@ static float amiga_rotation_to_radians(int16_t rotation);
 static float player_rotation_fixed_to_radians(int32_t rotation_fixed);
 static void apply_mouse_look(AppState *state, int mouse_dx);
 static void update_player_camera_y(AppState *state);
+static void capture_primary_player_state(const AppState *state, RuntimePlayerState *out_player);
+static void apply_primary_player_state(AppState *state, const RuntimePlayerState *player);
 static bool player_can_take_damage(const AppState *state);
 static void start_player_death(AppState *state);
 static void update_player_death(AppState *state, const PlayerControls *controls);
@@ -618,6 +658,7 @@ static float object_type_move_speed(int16_t object_type);
 static const ObjectCombatDefinition *object_type_combat_definition(int16_t object_type);
 static bool object_type_is_enemy(int16_t object_type);
 static bool object_type_is_pickup(int16_t object_type);
+static bool object_type_is_player(int16_t object_type);
 static void initialize_runtime_objects(AppState *state);
 static uint16_t runtime_random_word(AppState *state);
 static bool spawn_enemy_projectile_params(AppState *state, const RuntimeObjectState *object, uint8_t weapon_index,
@@ -635,7 +676,8 @@ static void update_wall_animations(AppState *state);
 static void update_rotpolys(AppState *state);
 static void update_doors(AppState *state);
 static void check_event_triggers(AppState *state);
-static void update_with_controls(AppState *state, const PlayerControls *controls, const ObjectVisualSet *object_visuals);
+static void update_with_controls(AppState *state, const PlayerControls *controls, const PlayerControls *controls2,
+                                 const ObjectVisualSet *object_visuals);
 
 static AudioSystem g_audio;
 static bool g_depth_tables_initialized = false;
@@ -767,6 +809,7 @@ static void compute_map_bounds(AppState *state) {
 
 static bool initialize_camera_from_map_spawn(AppState *state) {
   const GloomObjectSpawn *spawn = NULL;
+  const GloomObjectSpawn *spawn2 = NULL;
   size_t i = 0;
 
   if (state == NULL) {
@@ -779,6 +822,38 @@ static bool initialize_camera_from_map_spawn(AppState *state) {
     if (candidate->event_id == 1u && candidate->object_type == 0) {
       spawn = candidate;
       break;
+    }
+  }
+
+  if (state->two_player_mode) {
+    bool seen_first_player = false;
+
+    for (i = 0; i < state->map.object_spawn_count; ++i) {
+      const GloomObjectSpawn *candidate = &state->map.object_spawns[i];
+
+      if (candidate->event_id == 1u && candidate->object_type == 1) {
+        spawn2 = candidate;
+        break;
+      }
+    }
+
+    for (i = 0; i < state->map.object_spawn_count; ++i) {
+      const GloomObjectSpawn *candidate = &state->map.object_spawns[i];
+
+      if (spawn2 != NULL) {
+        break;
+      }
+      if (candidate->object_type != 0) {
+        continue;
+      }
+      if (candidate == spawn) {
+        seen_first_player = true;
+        continue;
+      }
+      if (candidate->event_id == 1u || seen_first_player) {
+        spawn2 = candidate;
+        break;
+      }
     }
   }
 
@@ -795,6 +870,9 @@ static bool initialize_camera_from_map_spawn(AppState *state) {
 
   if (spawn == NULL) {
     return false;
+  }
+  if (spawn2 == NULL) {
+    spawn2 = spawn;
   }
 
   initialize_wall_texture_remap(state);
@@ -835,6 +913,19 @@ static bool initialize_camera_from_map_spawn(AppState *state) {
   state->violence_mode = GLOOM_VIOLENCE_MEATY_MESSY;
   state->camera_angle = player_rotation_fixed_to_radians(state->player_rot_fixed);
   update_player_camera_y(state);
+  memset(&state->player2, 0, sizeof(state->player2));
+  state->player2.camera_x = (float)spawn2->x;
+  state->player2.camera_z = (float)spawn2->z;
+  state->player2.player_respawn_x = spawn2->x;
+  state->player2.player_respawn_z = spawn2->z;
+  state->player2.player_respawn_rotation = spawn2->rotation;
+  state->player2.player_rot_fixed = amiga_rotation_to_fixed(spawn2->rotation);
+  state->player2.camera_angle = player_rotation_fixed_to_radians(state->player2.player_rot_fixed);
+  state->player2.player_eye_y = (float)GLOOM_PLAYER_EYE_Y;
+  state->player2.player_hitpoints = GLOOM_PLAYER_INITIAL_HEALTH;
+  state->player2.player_lives = GLOOM_PLAYER_INITIAL_LIVES;
+  state->player2.player_reload = (uint8_t)GLOOM_PLAYER_INITIAL_RELOAD;
+  state->player2.camera_y = state->player2.player_eye_y;
   return true;
 }
 
@@ -860,6 +951,10 @@ static void initialize_runtime_objects(AppState *state) {
     bool is_pickup = object_type_is_pickup(spawn->object_type);
     int16_t hitpoints = object_type_initial_hitpoints(spawn->object_type);
     uint16_t scale = 0x0200u;
+
+    if (object_type_is_player(spawn->object_type)) {
+      continue;
+    }
 
     if (hitpoints <= 0 && !is_pickup) {
       continue;
@@ -2925,6 +3020,10 @@ static bool object_type_is_enemy(int16_t object_type) {
   return object_type_initial_hitpoints(object_type) > 0 && object_type != 0 && object_type != 1;
 }
 
+static bool object_type_is_player(int16_t object_type) {
+  return object_type == 0 || object_type == 1;
+}
+
 static const char *violence_mode_name(uint8_t violence_mode) {
   switch (violence_mode) {
     case GLOOM_VIOLENCE_MEATY:
@@ -3508,6 +3607,31 @@ static PlayerControls read_modern_player_controls(const uint8_t *keyboard, bool 
   return controls;
 }
 
+static PlayerControls read_second_player_controls(const uint8_t *keyboard) {
+  PlayerControls controls;
+  int16_t strafe = 0;
+  int16_t turn = 0;
+
+  memset(&controls, 0, sizeof(controls));
+  if (keyboard == NULL) {
+    return controls;
+  }
+
+  controls.joyy = player_control_axis(keyboard[SDL_SCANCODE_I], keyboard[SDL_SCANCODE_K]);
+  strafe = player_control_axis(keyboard[SDL_SCANCODE_U], keyboard[SDL_SCANCODE_O]);
+  turn = player_control_axis(keyboard[SDL_SCANCODE_J], keyboard[SDL_SCANCODE_L]);
+  controls.fire = keyboard[SDL_SCANCODE_RETURN] || keyboard[SDL_SCANCODE_RCTRL];
+
+  if (strafe != 0) {
+    controls.joyx = strafe;
+    controls.joys = -1;
+  } else {
+    controls.joyx = turn;
+  }
+
+  return controls;
+}
+
 static int32_t wrap_player_rotation_fixed(int64_t rotation_fixed) {
   const int32_t period = 256 << 16;
   int64_t wrapped = rotation_fixed % (int64_t)period;
@@ -3658,6 +3782,80 @@ static void update_player_camera_y(AppState *state) {
   state->camera_y = state->player_eye_y + bob;
 }
 
+static void capture_primary_player_state(const AppState *state, RuntimePlayerState *out_player) {
+  if (state == NULL || out_player == NULL) {
+    return;
+  }
+
+  out_player->camera_x = state->camera_x;
+  out_player->camera_z = state->camera_z;
+  out_player->camera_y = state->camera_y;
+  out_player->camera_angle = state->camera_angle;
+  out_player->player_rot_fixed = state->player_rot_fixed;
+  out_player->player_rotspeed = state->player_rotspeed;
+  out_player->player_bounce = state->player_bounce;
+  out_player->player_eye_y = state->player_eye_y;
+  out_player->player_hitpoints = state->player_hitpoints;
+  out_player->player_lives = state->player_lives;
+  out_player->player_dead = state->player_dead;
+  out_player->player_death_phase = state->player_death_phase;
+  out_player->player_death_timer = state->player_death_timer;
+  out_player->player_weapon = state->player_weapon;
+  out_player->player_reload = state->player_reload;
+  out_player->player_bouncy_bullets = state->player_bouncy_bullets;
+  out_player->player_reload_counter = state->player_reload_counter;
+  out_player->player_weapon_flash = state->player_weapon_flash;
+  out_player->player_palette_timer = state->player_palette_timer;
+  out_player->player_mega_timer = state->player_mega_timer;
+  out_player->player_invisible_timer = state->player_invisible_timer;
+  out_player->player_thermo_timer = state->player_thermo_timer;
+  out_player->player_hyper_timer = state->player_hyper_timer;
+  out_player->player_last_fire = state->player_last_fire;
+  out_player->player_pixsize = state->player_pixsize;
+  out_player->player_pixsizeadd = state->player_pixsizeadd;
+  out_player->player_pixsize_accum = state->player_pixsize_accum;
+  out_player->player_respawn_x = state->player_respawn_x;
+  out_player->player_respawn_z = state->player_respawn_z;
+  out_player->player_respawn_rotation = state->player_respawn_rotation;
+}
+
+static void apply_primary_player_state(AppState *state, const RuntimePlayerState *player) {
+  if (state == NULL || player == NULL) {
+    return;
+  }
+
+  state->camera_x = player->camera_x;
+  state->camera_z = player->camera_z;
+  state->camera_y = player->camera_y;
+  state->camera_angle = player->camera_angle;
+  state->player_rot_fixed = player->player_rot_fixed;
+  state->player_rotspeed = player->player_rotspeed;
+  state->player_bounce = player->player_bounce;
+  state->player_eye_y = player->player_eye_y;
+  state->player_hitpoints = player->player_hitpoints;
+  state->player_lives = player->player_lives;
+  state->player_dead = player->player_dead;
+  state->player_death_phase = player->player_death_phase;
+  state->player_death_timer = player->player_death_timer;
+  state->player_weapon = player->player_weapon;
+  state->player_reload = player->player_reload;
+  state->player_bouncy_bullets = player->player_bouncy_bullets;
+  state->player_reload_counter = player->player_reload_counter;
+  state->player_weapon_flash = player->player_weapon_flash;
+  state->player_palette_timer = player->player_palette_timer;
+  state->player_mega_timer = player->player_mega_timer;
+  state->player_invisible_timer = player->player_invisible_timer;
+  state->player_thermo_timer = player->player_thermo_timer;
+  state->player_hyper_timer = player->player_hyper_timer;
+  state->player_last_fire = player->player_last_fire;
+  state->player_pixsize = player->player_pixsize;
+  state->player_pixsizeadd = player->player_pixsizeadd;
+  state->player_pixsize_accum = player->player_pixsize_accum;
+  state->player_respawn_x = player->player_respawn_x;
+  state->player_respawn_z = player->player_respawn_z;
+  state->player_respawn_rotation = player->player_respawn_rotation;
+}
+
 static bool player_can_take_damage(const AppState *state) {
   return state != NULL && state->player_death_phase == GLOOM_PLAYER_DEATH_NONE && !state->player_dead &&
          state->player_hitpoints > 0;
@@ -3671,6 +3869,7 @@ static bool player_death_blocks_controls(const AppState *state) {
   return state->player_death_phase == GLOOM_PLAYER_DEATH_FALLING ||
          state->player_death_phase == GLOOM_PLAYER_DEATH_DEAD_DELAY ||
          state->player_death_phase == GLOOM_PLAYER_DEATH_WAIT_RESTART ||
+         state->player_death_phase == GLOOM_PLAYER_DEATH_OUT_OF_LIVES ||
          state->player_death_phase == GLOOM_PLAYER_DEATH_GAME_OVER;
 }
 
@@ -3757,6 +3956,9 @@ static void advance_player_death_amiga_tick(AppState *state) {
         state->player_death_timer = (float)GLOOM_PLAYER_DEAD_DELAY;
         if (state->player_lives > 0) {
           state->player_lives -= 1;
+          if (state->two_player_mode && state->active_player_index == 0u && state->player_lives > 0) {
+            state->player2.player_lives = state->player_lives;
+          }
         }
       }
       break;
@@ -3765,8 +3967,12 @@ static void advance_player_death_amiga_tick(AppState *state) {
       state->player_death_timer -= 1.0f;
       if (state->player_death_timer <= 0.0f) {
         if (state->player_lives == 0) {
-          state->player_death_phase = GLOOM_PLAYER_DEATH_GAME_OVER;
-          state->finished = 2;
+          if (state->two_player_mode && state->active_other_player_lives > 0) {
+            state->player_death_phase = GLOOM_PLAYER_DEATH_OUT_OF_LIVES;
+          } else {
+            state->player_death_phase = GLOOM_PLAYER_DEATH_GAME_OVER;
+            state->finished = 2;
+          }
         } else {
           state->player_death_phase = GLOOM_PLAYER_DEATH_WAIT_RESTART;
         }
@@ -5721,21 +5927,19 @@ static void update_pickups(AppState *state) {
   }
 }
 
-static void update_with_controls(AppState *state, const PlayerControls *controls, const ObjectVisualSet *object_visuals) {
-  state->tick_count += 1;
-  audio_vblank_tick();
-  if (!player_death_blocks_controls(state)) {
-    update_player_power_timers(state);
+static void mirror_two_player_lives_after_active_update(AppState *state, int16_t previous_lives,
+                                                        RuntimePlayerState *inactive_player) {
+  if (state == NULL || inactive_player == NULL || !state->two_player_mode || state->player_lives == previous_lives) {
+    return;
   }
-  update_wall_animations(state);
-  update_rotpolys(state);
-  update_doors(state);
-  update_runtime_objects(state);
-  update_projectiles(state, object_visuals);
-  update_sparks(state);
-  update_blood(state);
-  update_chunks(state);
 
+  /* amiga/gloom2.s: playerdeath mirrors remaining nonzero cooperative lives to the other player. */
+  if (state->player_lives > 0) {
+    inactive_player->player_lives = state->player_lives;
+  }
+}
+
+static void update_active_player_logic(AppState *state, const PlayerControls *controls) {
   if (update_player_pixsize_transition(state)) {
     update_player_camera_y(state);
     return;
@@ -5779,10 +5983,55 @@ static void update_with_controls(AppState *state, const PlayerControls *controls
   update_player_weapon(state, controls);
 }
 
+static void update_with_controls(AppState *state, const PlayerControls *controls, const PlayerControls *controls2,
+                                 const ObjectVisualSet *object_visuals) {
+  int16_t previous_lives = 0;
+
+  state->tick_count += 1;
+  audio_vblank_tick();
+  update_wall_animations(state);
+  update_rotpolys(state);
+  update_doors(state);
+  update_runtime_objects(state);
+  update_projectiles(state, object_visuals);
+  update_sparks(state);
+  update_blood(state);
+  update_chunks(state);
+
+  state->active_player_index = 0u;
+  state->active_other_player_lives = state->two_player_mode ? state->player2.player_lives : 0;
+  if (!player_death_blocks_controls(state)) {
+    update_player_power_timers(state);
+  }
+  previous_lives = state->player_lives;
+  update_active_player_logic(state, controls);
+  mirror_two_player_lives_after_active_update(state, previous_lives, &state->player2);
+
+  if (state->two_player_mode) {
+    RuntimePlayerState player1;
+
+    capture_primary_player_state(state, &player1);
+    apply_primary_player_state(state, &state->player2);
+    state->active_player_index = 1u;
+    state->active_other_player_lives = player1.player_lives;
+    if (!player_death_blocks_controls(state)) {
+      update_player_power_timers(state);
+    }
+    previous_lives = state->player_lives;
+    update_active_player_logic(state, controls2);
+    mirror_two_player_lives_after_active_update(state, previous_lives, &player1);
+    capture_primary_player_state(state, &state->player2);
+    apply_primary_player_state(state, &player1);
+    state->active_player_index = 0u;
+    state->active_other_player_lives = state->player2.player_lives;
+  }
+}
+
 static void update(AppState *state, const uint8_t *keyboard, bool mouse_fire, const ObjectVisualSet *object_visuals) {
   PlayerControls controls = read_modern_player_controls(keyboard, mouse_fire);
+  PlayerControls controls2 = read_second_player_controls(keyboard);
 
-  update_with_controls(state, &controls, object_visuals);
+  update_with_controls(state, &controls, &controls2, object_visuals);
 }
 
 static void world_to_screen(const AppState *state, int x, int z, int rx, int ry, int rw, int rh, int *sx, int *sy) {
@@ -7009,19 +7258,38 @@ static void framebuffer_clear(RenderFramebuffer *framebuffer, uint32_t argb) {
   }
 }
 
-static void apply_player_red_palette(RenderFramebuffer *framebuffer, const AppState *state) {
-  int y = 0;
+static void apply_player_red_palette_rect(RenderFramebuffer *framebuffer, const AppState *state, int x, int y, int w,
+                                          int h) {
+  int row_index = 0;
 
   if (framebuffer == NULL || framebuffer->pixels == NULL || state == NULL || state->player_palette_timer <= 0.0f) {
     return;
   }
 
-  for (y = 0; y < framebuffer->height; ++y) {
-    uint32_t *row = framebuffer->pixels + ((size_t)y * (size_t)framebuffer->pitch_pixels);
-    int x = 0;
+  if (x < 0) {
+    w += x;
+    x = 0;
+  }
+  if (y < 0) {
+    h += y;
+    y = 0;
+  }
+  if (x + w > framebuffer->width) {
+    w = framebuffer->width - x;
+  }
+  if (y + h > framebuffer->height) {
+    h = framebuffer->height - y;
+  }
+  if (w <= 0 || h <= 0) {
+    return;
+  }
 
-    for (x = 0; x < framebuffer->width; ++x) {
-      uint32_t argb = row[x];
+  for (row_index = 0; row_index < h; ++row_index) {
+    uint32_t *row = framebuffer->pixels + ((size_t)(y + row_index) * (size_t)framebuffer->pitch_pixels);
+    int col = 0;
+
+    for (col = 0; col < w; ++col) {
+      uint32_t argb = row[x + col];
       int r = (int)((argb >> 16) & 0xFFu);
       int g = (int)((argb >> 8) & 0xFFu);
       int b = (int)(argb & 0xFFu);
@@ -7030,9 +7298,16 @@ static void apply_player_red_palette(RenderFramebuffer *framebuffer, const AppSt
       if (red > 255) {
         red = 255;
       }
-      row[x] = 0xFF000000u | ((uint32_t)red << 16);
+      row[x + col] = 0xFF000000u | ((uint32_t)red << 16);
     }
   }
+}
+
+static void apply_player_red_palette(RenderFramebuffer *framebuffer, const AppState *state) {
+  if (framebuffer == NULL) {
+    return;
+  }
+  apply_player_red_palette_rect(framebuffer, state, 0, 0, framebuffer->width, framebuffer->height);
 }
 
 static float projection_focal_for_viewport(int w, int h) {
@@ -7469,7 +7744,7 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
       float top_view_y = 0.0f;
       float left_view_x = 0.0f;
 
-      if (spawn->event_id == 1u && spawn->object_type == 0) {
+      if (object_type_is_player(spawn->object_type)) {
         continue;
       }
 
@@ -8164,11 +8439,11 @@ static void draw_bar(SDL_Renderer *renderer, int x, int y, int width, int height
 static void render_scene_contents(RenderFramebuffer *framebuffer, const AppState *state, const GridOffsetSet *grid_offsets,
                                   const WallTextureSet *wall_textures, const FlatTextureSet *flat_textures,
                                   const ObjectVisualSet *object_visuals, const WeaponVisualSet *weapon_visuals,
-                                  const HudFont *hud_font, int render_width, int render_height) {
-  render_wall_debug(framebuffer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals, 0, 0,
-                    render_width, render_height);
-  render_player_weapon(framebuffer, state, weapon_visuals, 0, 0, render_width, render_height);
-  render_player_weapon_status(framebuffer, state, hud_font, 0, 0, render_width, render_height);
+                                  const HudFont *hud_font, int x, int y, int w, int h) {
+  render_wall_debug(framebuffer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals, x, y,
+                    w, h);
+  render_player_weapon(framebuffer, state, weapon_visuals, x, y, w, h);
+  render_player_weapon_status(framebuffer, state, hud_font, x, y, w, h);
 }
 
 static bool render_pixelate_texture(SDL_Renderer *renderer, SDL_Texture *texture, int render_width, int render_height,
@@ -8241,9 +8516,23 @@ static void render(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const
     return;
   }
   framebuffer_clear(framebuffer, 0xFF000000u);
-  render_scene_contents(framebuffer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals,
-                        hud_font, render_width, render_height);
-  apply_player_red_palette(framebuffer, state);
+  if (state != NULL && state->two_player_mode) {
+    AppState player2_state = *state;
+    int top_h = render_height / 2;
+    int bottom_h = render_height - top_h;
+
+    render_scene_contents(framebuffer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals,
+                          hud_font, 0, 0, render_width, top_h);
+    apply_player_red_palette_rect(framebuffer, state, 0, 0, render_width, top_h);
+    apply_primary_player_state(&player2_state, &state->player2);
+    render_scene_contents(framebuffer, &player2_state, grid_offsets, wall_textures, flat_textures, object_visuals,
+                          weapon_visuals, hud_font, 0, top_h, render_width, bottom_h);
+    apply_player_red_palette_rect(framebuffer, &player2_state, 0, top_h, render_width, bottom_h);
+  } else {
+    render_scene_contents(framebuffer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals,
+                          hud_font, 0, 0, render_width, render_height);
+    apply_player_red_palette(framebuffer, state);
+  }
   end_render_framebuffer(framebuffer);
 
   SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
@@ -8407,6 +8696,18 @@ static AppState interpolate_render_state(const AppState *previous, const AppStat
 
   render_state.player_rot_fixed = current->player_rot_fixed;
   render_state.camera_angle = current->camera_angle;
+  if (previous->two_player_mode && current->two_player_mode) {
+    render_state.player2.camera_x =
+        previous->player2.camera_x + ((current->player2.camera_x - previous->player2.camera_x) * alpha);
+    render_state.player2.camera_z =
+        previous->player2.camera_z + ((current->player2.camera_z - previous->player2.camera_z) * alpha);
+    render_state.player2.camera_y =
+        previous->player2.camera_y + ((current->player2.camera_y - previous->player2.camera_y) * alpha);
+    render_state.player2.player_bounce =
+        previous->player2.player_bounce + ((current->player2.player_bounce - previous->player2.player_bounce) * alpha);
+    render_state.player2.player_rot_fixed = current->player2.player_rot_fixed;
+    render_state.player2.camera_angle = current->player2.camera_angle;
+  }
   return render_state;
 }
 
@@ -8774,6 +9075,60 @@ static int run_player_death_selftest(void) {
                               "playerdead should set finished=2 when the final one-player life is gone")) {
     return 1;
   }
+
+  memset(&state, 0, sizeof(state));
+  state.two_player_mode = true;
+  state.active_player_index = 0u;
+  state.active_other_player_lives = 3;
+  state.player_hitpoints = 1;
+  state.player_lives = 3;
+  state.player_eye_y = (float)GLOOM_PLAYER_EYE_Y;
+  state.player2.player_lives = 3;
+  state.player2.player_hitpoints = GLOOM_PLAYER_INITIAL_HEALTH;
+  damage_player_from_object(&state, &test_object);
+  for (i = 0; i < 20; ++i) {
+    advance_player_death_amiga_tick(&state);
+  }
+  if (!combat_selftest_expect(state.player_lives == 2 && state.player2.player_lives == 2 &&
+                                  state.player_death_phase == GLOOM_PLAYER_DEATH_DEAD_DELAY,
+                              "two-player playerdeath should mirror nonzero shared lives to the other player")) {
+    return 1;
+  }
+
+  memset(&state, 0, sizeof(state));
+  state.two_player_mode = true;
+  state.active_player_index = 0u;
+  state.active_other_player_lives = 1;
+  state.player_hitpoints = 1;
+  state.player_lives = 1;
+  state.player_eye_y = (float)GLOOM_PLAYER_EYE_Y;
+  state.player2.player_lives = 1;
+  damage_player_from_object(&state, &test_object);
+  for (i = 0; i < 20 + GLOOM_PLAYER_DEAD_DELAY; ++i) {
+    advance_player_death_amiga_tick(&state);
+  }
+  if (!combat_selftest_expect(state.player_lives == 0 && state.player_death_phase == GLOOM_PLAYER_DEATH_OUT_OF_LIVES &&
+                                  state.finished == 0,
+                              "two-player playerdead should leave one player out when the other still has lives")) {
+    return 1;
+  }
+
+  memset(&state, 0, sizeof(state));
+  state.map.object_spawns = (GloomObjectSpawn *)calloc(2u, sizeof(*state.map.object_spawns));
+  if (state.map.object_spawns == NULL) {
+    fprintf(stderr, "Combat selftest failed: out of memory preparing player spawn fixture\n");
+    return 1;
+  }
+  state.map.object_spawn_count = 2u;
+  state.map.object_spawns[0].object_type = 0;
+  state.map.object_spawns[1].object_type = 1;
+  initialize_runtime_objects(&state);
+  if (!combat_selftest_expect(!state.objects[0].active && !state.objects[1].active,
+                              "single-player runtime object list should not expose player spawns as sprites")) {
+    free(state.map.object_spawns);
+    return 1;
+  }
+  free(state.map.object_spawns);
 
   printf("Player death selftest passed\n");
   return 0;
@@ -9530,6 +9885,18 @@ static uint64_t replay_fingerprint_state(const AppState *state, ReplayResult *ou
   replay_hash_i32(&hash, state->finished);
   replay_hash_i32(&hash, state->finished2);
   replay_hash_i32(&hash, (int32_t)state->rng_state);
+  replay_hash_i32(&hash, state->two_player_mode ? 1 : 0);
+  if (state->two_player_mode) {
+    replay_hash_i32(&hash, replay_quantize_float(state->player2.camera_x));
+    replay_hash_i32(&hash, replay_quantize_float(state->player2.camera_z));
+    replay_hash_i32(&hash, replay_quantize_float(state->player2.camera_y));
+    replay_hash_i32(&hash, state->player2.player_rot_fixed);
+    replay_hash_i32(&hash, state->player2.player_hitpoints);
+    replay_hash_i32(&hash, state->player2.player_lives);
+    replay_hash_i32(&hash, state->player2.player_dead ? 1 : 0);
+    replay_hash_i32(&hash, (int32_t)state->player2.player_death_phase);
+    replay_hash_i32(&hash, (int32_t)state->player2.player_weapon);
+  }
 
   for (i = 0u; i < GLOOM_MAX_RUNTIME_PROJECTILES; ++i) {
     const RuntimeProjectile *projectile = &state->projectiles[i];
@@ -9697,7 +10064,7 @@ static bool replay_run_once(const char *map_path, const ReplayInputStep *steps, 
 
     for (tick = 0u; tick < steps[i].ticks; ++tick) {
       apply_mouse_look(&state, steps[i].mouse_dx);
-      update_with_controls(&state, &steps[i].controls, &object_visuals);
+      update_with_controls(&state, &steps[i].controls, NULL, &object_visuals);
       if (state.finished == GLOOM_LEVEL_COMPLETE_FINISHED) {
         break;
       }
@@ -9768,8 +10135,8 @@ static bool load_runtime_level(const char *map_path, AppState *state, WallTextur
                                FlatTextureSet *flat_textures, ObjectVisualSet *object_visuals,
                                GloomZone *previous_zones, GloomZone *render_zones, bool preserve_player,
                                int16_t preserved_hitpoints, int16_t preserved_lives, uint8_t preserved_weapon,
-                               uint8_t preserved_reload, bool barrel_projectile_origin, uint8_t violence_mode,
-                               char *resolved_map_path, size_t resolved_map_path_size) {
+                               uint8_t preserved_reload, bool barrel_projectile_origin, bool two_player_mode,
+                               uint8_t violence_mode, char *resolved_map_path, size_t resolved_map_path_size) {
   AppState next_state;
   WallTextureSet next_wall_textures;
   FlatTextureSet next_flat_textures;
@@ -9793,6 +10160,7 @@ static bool load_runtime_level(const char *map_path, AppState *state, WallTextur
   }
 
   next_state.barrel_projectile_origin = barrel_projectile_origin;
+  next_state.two_player_mode = two_player_mode;
   if (!gloom_map_load(resolved, &next_state.map, error, sizeof(error))) {
     fprintf(stderr, "Map parse failed for %s: %s\n", resolved, error[0] ? error : "unknown error");
     return false;
@@ -9943,6 +10311,7 @@ int main(int argc, char **argv) {
   bool classic_viewport = false;
   bool explicit_resolution = false;
   bool barrel_projectile_origin = true;
+  bool two_player_mode = false;
   uint8_t violence_mode = GLOOM_VIOLENCE_MEATY_MESSY;
   bool level_transition_pending = false;
   AppState state;
@@ -10070,6 +10439,8 @@ int main(int argc, char **argv) {
         explicit_resolution = true;
       } else if (strcmp(argv[argi], "--barrel-projectiles") == 0) {
         barrel_projectile_origin = true;
+      } else if (strcmp(argv[argi], "--two-player") == 0 || strcmp(argv[argi], "--2p") == 0) {
+        two_player_mode = true;
       } else if (strcmp(argv[argi], "--player-projectiles") == 0 ||
                  strcmp(argv[argi], "--legacy-projectiles") == 0) {
         barrel_projectile_origin = false;
@@ -10105,6 +10476,7 @@ int main(int argc, char **argv) {
   memset(&state, 0, sizeof(state));
   memset(&previous_state, 0, sizeof(previous_state));
   state.barrel_projectile_origin = barrel_projectile_origin;
+  state.two_player_mode = two_player_mode;
 
   if (!gloom_map_load(resolved_map_path, &state.map, error, sizeof(error))) {
     fprintf(stderr, "Map parse failed: %s\n", error[0] ? error : "unknown error");
@@ -10181,6 +10553,10 @@ int main(int argc, char **argv) {
   state.violence_mode = violence_mode;
   initialize_runtime_objects(&state);
   printf("Camera spawn: x=%.0f z=%.0f angle=%.3f\n", state.camera_x, state.camera_z, state.camera_angle);
+  if (state.two_player_mode) {
+    printf("Two-player mode: p1 x=%.0f z=%.0f, p2 x=%.0f z=%.0f\n", state.camera_x, state.camera_z,
+           state.player2.camera_x, state.player2.camera_z);
+  }
   printf("Projectile origin: %s\n", state.barrel_projectile_origin ? "barrel" : "player");
   printf("Violence model: %s\n", violence_mode_name(state.violence_mode));
 
@@ -10392,7 +10768,12 @@ int main(int argc, char **argv) {
 
     if (title_timer >= 1.0) {
       char title[160];
-      if (state.player_dead) {
+      if (state.two_player_mode) {
+        (void)snprintf(title, sizeof(title),
+                       "Gloom PC Port | 2P | P1 HP=%d L=%d | P2 HP=%d L=%d | zones=%zu",
+                       state.player_hitpoints, state.player_lives, state.player2.player_hitpoints,
+                       state.player2.player_lives, state.map.zone_count);
+      } else if (state.player_dead) {
         (void)snprintf(title, sizeof(title), "Gloom PC Port | DEAD | x=%.0f z=%.0f angle=%.2f | zones=%zu",
                        state.camera_x, state.camera_z, state.camera_angle, state.map.zone_count);
       } else {
@@ -10415,6 +10796,10 @@ int main(int argc, char **argv) {
       int16_t preserved_lives = state.player_lives;
       uint8_t preserved_weapon = state.player_weapon;
       uint8_t preserved_reload = state.player_reload;
+      int16_t preserved_p2_hitpoints = state.player2.player_hitpoints;
+      int16_t preserved_p2_lives = state.player2.player_lives;
+      uint8_t preserved_p2_weapon = state.player2.player_weapon;
+      uint8_t preserved_p2_reload = state.player2.player_reload;
 
       level_transition_pending = false;
       if (!resolve_next_script_play_map(resolved_map_path, next_map_path, sizeof(next_map_path))) {
@@ -10425,11 +10810,27 @@ int main(int argc, char **argv) {
 
       if (!load_runtime_level(next_map_path, &state, &wall_textures, &flat_textures, &object_visuals,
                               previous_zones, render_zones, true, preserved_hitpoints, preserved_lives,
-                              preserved_weapon, preserved_reload, barrel_projectile_origin, violence_mode,
+                              preserved_weapon, preserved_reload, barrel_projectile_origin, two_player_mode, violence_mode,
                               map_path_buffer, sizeof(map_path_buffer))) {
         fprintf(stderr, "Cannot complete levelover: failed to load next script map %s\n", next_map_path);
         running = false;
         continue;
+      }
+
+      if (state.two_player_mode) {
+        int16_t shared_lives = preserved_lives > preserved_p2_lives ? preserved_lives : preserved_p2_lives;
+
+        state.player2.player_hitpoints =
+            preserved_p2_hitpoints > 0 ? preserved_p2_hitpoints : GLOOM_PLAYER_INITIAL_HEALTH;
+        state.player2.player_lives = preserved_p2_lives > 0 ? preserved_p2_lives : GLOOM_PLAYER_INITIAL_LIVES;
+        state.player2.player_weapon = preserved_p2_weapon;
+        state.player2.player_reload =
+            preserved_p2_reload > 0u ? preserved_p2_reload : (uint8_t)GLOOM_PLAYER_INITIAL_RELOAD;
+        if (shared_lives <= 0) {
+          shared_lives = GLOOM_PLAYER_INITIAL_LIVES;
+        }
+        state.player_lives = shared_lives;
+        state.player2.player_lives = shared_lives;
       }
 
       resolved_map_path = map_path_buffer;
