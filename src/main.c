@@ -2947,6 +2947,20 @@ static bool resolve_script_tile_tag_for_map(const char *map_path, char *out_tag,
     return false;
   }
 
+  if (strlen(map_name) >= 6u && memcmp(map_name, "com", 3u) == 0 && map_name[3] >= '1' && map_name[3] <= '3' &&
+      map_name[4] == '_') {
+    /*
+     * amiga/gloom2.s: pickcombat copies comseriesnum into floortag before
+     * loadtile, so combat maps use the single-character series tile tag.
+     */
+    if (out_tag_size < 2u) {
+      return false;
+    }
+    out_tag[0] = map_name[3];
+    out_tag[1] = '\0';
+    return true;
+  }
+
   for (candidate_index = 0u; candidate_index < sizeof(script_candidates) / sizeof(script_candidates[0]); ++candidate_index) {
     char resolved_path[1024] = {0};
 
@@ -13360,6 +13374,17 @@ static int run_level_transition_selftest(void) {
                                              "amiga/data/maps/map4_3", "amiga/data/maps/map4_4",
                                              "amiga/data/maps/map4_5", "amiga/data/maps/map4_6",
                                              "amiga/data/maps/map4_7"};
+  static const char *combat_map_chain[] = {"amiga/data/maps/com1_1", "amiga/data/maps/com1_2",
+                                           "amiga/data/maps/com1_3", "amiga/data/maps/com1_4",
+                                           "amiga/data/maps/com1_5", "amiga/data/maps/com1_6",
+                                           "amiga/data/maps/com1_7", "amiga/data/maps/com2_1",
+                                           "amiga/data/maps/com2_2", "amiga/data/maps/com2_3",
+                                           "amiga/data/maps/com2_4", "amiga/data/maps/com2_5",
+                                           "amiga/data/maps/com2_6", "amiga/data/maps/com2_7",
+                                           "amiga/data/maps/com3_1", "amiga/data/maps/com3_2",
+                                           "amiga/data/maps/com3_3", "amiga/data/maps/com3_4",
+                                           "amiga/data/maps/com3_5", "amiga/data/maps/com3_6",
+                                           "amiga/data/maps/com3_7"};
   AppState *state = NULL;
   WallTextureSet *wall_textures = NULL;
   FlatTextureSet *flat_textures = NULL;
@@ -13373,6 +13398,7 @@ static int run_level_transition_selftest(void) {
   int16_t preserved_lives = 1;
   int16_t preserved_p2_lives = 3;
   size_t chain_index = 0u;
+  size_t combat_index = 0u;
   int result = 1;
 
   memset(&completion, 0, sizeof(completion));
@@ -13463,7 +13489,22 @@ static int run_level_transition_selftest(void) {
     }
   }
 
-  printf("Level transition selftest passed\n");
+  state->combat_mode = true;
+  initialize_combat_rotation_state(state, 1u, 3);
+  for (combat_index = 0u; combat_index < sizeof(combat_map_chain) / sizeof(combat_map_chain[0]); ++combat_index) {
+    if (!load_runtime_level(combat_map_chain[combat_index], state, wall_textures, flat_textures, object_visuals,
+                            previous_zones, render_zones, true, GLOOM_PLAYER_INITIAL_HEALTH, 3, 0u,
+                            (uint8_t)GLOOM_PLAYER_INITIAL_RELOAD, GLOOM_PLAYER_INITIAL_HEALTH, 3, 0u,
+                            (uint8_t)GLOOM_PLAYER_INITIAL_RELOAD, true, true, GLOOM_VIOLENCE_MEATY_MESSY,
+                            resolved_map_path, sizeof(resolved_map_path))) {
+      fprintf(stderr, "Level transition selftest failed: could not load combat map %s\n", combat_map_chain[combat_index]);
+      goto cleanup;
+    }
+  }
+
+  printf("Level transition selftest passed: loaded %u campaign maps and %u combat maps\n",
+         (unsigned)(sizeof(expected_play_chain) / sizeof(expected_play_chain[0])),
+         (unsigned)(sizeof(combat_map_chain) / sizeof(combat_map_chain[0])));
   result = 0;
 
 cleanup:
