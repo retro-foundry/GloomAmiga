@@ -7691,6 +7691,40 @@ static int floor_to_int(float value) {
   return as_int;
 }
 
+#ifdef GLOOM_DOS_SDL3
+static int32_t dos_float_to_fixed16(float value) {
+  float scaled = 0.0f;
+  int32_t fixed = 0;
+
+  if (value >= 32767.999f) return INT32_MAX;
+  if (value <= -32768.0f) return INT32_MIN;
+
+  scaled = value * 65536.0f;
+  fixed = (int32_t)scaled;
+  if (scaled < 0.0f && (float)fixed > scaled) {
+    fixed -= 1;
+  }
+  return fixed;
+}
+
+static int dos_fixed16_floor_to_int(int32_t value) {
+  if (value >= 0) {
+    return (int)(value >> 16);
+  }
+
+  {
+    int64_t wide_value = value;
+    return -(int)(((-wide_value) + 65535) >> 16);
+  }
+}
+
+static int32_t dos_fixed16_clamp_unit(int32_t value) {
+  if (value < 0) return 0;
+  if (value > 0x10000) return 0x10000;
+  return value;
+}
+#endif
+
 static int32_t amiga_arithmetic_shift_right_16(int64_t value) {
   if (value >= 0) {
     return (int32_t)(value >> 16);
@@ -9000,6 +9034,27 @@ static void render_flat_textures(RenderFramebuffer *framebuffer, const AppState 
     world_z_step = -view_x_step * view_sin;
     palette = texture->shaded_palette[amiga_depth_dark_index(depth)];
 
+#ifdef GLOOM_DOS_SDL3
+    {
+      uint32_t *dst_row =
+          framebuffer->pixels + ((size_t)(y + row) * (size_t)framebuffer->pitch_pixels + (size_t)x);
+      int32_t world_x_fixed = dos_float_to_fixed16(world_x);
+      int32_t world_z_fixed = dos_float_to_fixed16(world_z);
+      int32_t world_x_step_fixed = dos_float_to_fixed16(world_x_step);
+      int32_t world_z_step_fixed = dos_float_to_fixed16(world_z_step);
+
+      for (col = 0; col < w; ++col) {
+        int tx = dos_fixed16_floor_to_int(world_x_fixed) & (GLOOM_FLAT_TEXTURE_SIZE - 1);
+        int tz = dos_fixed16_floor_to_int(world_z_fixed) & (GLOOM_FLAT_TEXTURE_SIZE - 1);
+        uint8_t palette_index = texels[(tx * GLOOM_FLAT_TEXTURE_SIZE) + tz];
+        uint32_t argb = palette[palette_index];
+
+        dst_row[col] = 0xFF000000u | (argb & 0x00FFFFFFu);
+        world_x_fixed += world_x_step_fixed;
+        world_z_fixed += world_z_step_fixed;
+      }
+    }
+#else
     for (col = 0; col < w; ++col) {
       size_t dst = (size_t)(y + row) * (size_t)framebuffer->pitch_pixels + (size_t)(x + col);
       int tx = floor_to_int(world_x) & (GLOOM_FLAT_TEXTURE_SIZE - 1);
@@ -9011,6 +9066,7 @@ static void render_flat_textures(RenderFramebuffer *framebuffer, const AppState 
       world_x += world_x_step;
       world_z += world_z_step;
     }
+#endif
   }
 }
 
@@ -9350,6 +9406,53 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
           }
         }
       }
+#ifdef GLOOM_DOS_SDL3
+      {
+        int32_t wall_v_fixed = dos_float_to_fixed16(((float)y0 + 0.5f - wall_top) / wall_height);
+        int32_t wall_v_step_fixed = dos_float_to_fixed16(1.0f / wall_height);
+
+        for (draw_y = y0; draw_y <= y1; ++draw_y) {
+          int32_t wall_v_current_fixed = wall_v_fixed;
+          uint32_t argb = 0u;
+          uint8_t alpha = 0u;
+
+          wall_v_fixed += wall_v_step_fixed;
+
+          if (filled_stamps[draw_y - y] == filled_stamp) {
+            continue;
+          }
+
+          if (fast_wall_column) {
+            int32_t wall_v_clamped = dos_fixed16_clamp_unit(wall_v_current_fixed);
+            size_t ty = (size_t)((wall_v_clamped * (GLOOM_TEXTURE_HEIGHT - 1)) >> 16);
+            uint8_t palette_index = wall_texels[wall_texel_base + (ty * (size_t)GLOOM_TEXTURE_WIDTH)];
+
+            if (transparent_wall_column && palette_index == 0u) {
+              continue;
+            }
+            argb = wall_palette[palette_index];
+          } else {
+            float wall_v = (float)wall_v_current_fixed / 65536.0f;
+
+            argb = sample_zone_wall_texture_argb(wall_textures, state, hit->wall->zone, hit->wall_u, wall_v);
+            argb = shade_argb_subtract(argb, subtract);
+          }
+          alpha = (uint8_t)(argb >> 24);
+
+          if (alpha == 0u) {
+            continue;
+          }
+
+          framebuffer->pixels[(size_t)draw_y * (size_t)framebuffer->pitch_pixels + (size_t)screen_x] =
+              0xFF000000u | (argb & 0x00FFFFFFu);
+          filled_stamps[draw_y - y] = filled_stamp;
+
+          if (hit->depth < depth_buffer[i]) {
+            depth_buffer[i] = hit->depth;
+          }
+        }
+      }
+#else
       for (draw_y = y0; draw_y <= y1; ++draw_y) {
         float wall_v = ((float)draw_y + 0.5f - wall_top) / wall_height;
         uint32_t argb = 0u;
@@ -9389,6 +9492,7 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
           depth_buffer[i] = hit->depth;
         }
       }
+#endif
     }
   }
 
