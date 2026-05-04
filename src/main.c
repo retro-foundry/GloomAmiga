@@ -14615,6 +14615,7 @@ int main(int argc, char **argv) {
   dos_logf("DOS checkpoint: before SDL_Init");
 #ifdef GLOOM_DOS_SDL3
   SDL_SetHint(SDL_HINT_AUDIO_DRIVER, "soundblaster");
+  SDL_SetHint(SDL_HINT_DOS_ALLOW_DIRECT_FRAMEBUFFER, "1");
   if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_AUDIO) != 0) {
 #else
   if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) {
