@@ -1,13 +1,42 @@
+#ifdef GLOOM_DOS_SDL3
+#include "sdl_dos_compat.h"
+#else
 #include <SDL.h>
+#endif
 
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <stdio.h>
+#include <stdarg.h>
 #include <string.h>
 
 #include "iff.h"
 #include "map.h"
+
+#ifdef GLOOM_DOS_SDL3
+static void dos_logf(const char *fmt, ...) {
+  FILE *file = fopen("GLOOM.LOG", "a");
+  va_list args;
+
+  if (file == NULL || fmt == NULL) {
+    if (file != NULL) {
+      fclose(file);
+    }
+    return;
+  }
+
+  va_start(args, fmt);
+  vfprintf(file, fmt, args);
+  va_end(args);
+  fputc('\n', file);
+  fclose(file);
+}
+#else
+static void dos_logf(const char *fmt, ...) {
+  (void)fmt;
+}
+#endif
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -820,6 +849,11 @@ static RuntimeControlConfig g_control_config = {GLOOM_CONTROL_KEYBOARD, GLOOM_CO
 static bool g_webrtc_guest_connected = false;
 static uint32_t g_webrtc_guest_player2_input = 0u;
 static bool g_runtime_mouse_capture_active = false;
+#ifdef GLOOM_DOS_SDL3
+static bool g_dos_mouse_absolute_capture = false;
+static bool g_dos_mouse_absolute_valid = false;
+static float g_dos_mouse_absolute_x = 0.0f;
+#endif
 static bool g_depth_tables_initialized = false;
 static uint8_t g_depth_dark_indices[GLOOM_AMIGA_MAX_Z];
 static uint8_t g_depth_subtract_values[GLOOM_AMIGA_MAX_Z];
@@ -1525,6 +1559,17 @@ static void audio_callback(void *userdata, Uint8 *stream, int len) {
 }
 
 static bool audio_start(AudioSystem *audio) {
+#ifdef GLOOM_DOS_SDL3
+  if (audio == NULL) {
+    return false;
+  }
+
+  /* TODO(port): amiga/gloom2.s Paula playback path needs a DOS Sound Blaster backend. */
+  audio->initialized = false;
+  audio->device = 0u;
+  memset(&audio->obtained, 0, sizeof(audio->obtained));
+  return true;
+#else
   SDL_AudioSpec desired;
 
   if (audio == NULL) {
@@ -1555,6 +1600,7 @@ static bool audio_start(AudioSystem *audio) {
   audio->initialized = true;
   SDL_PauseAudioDevice(audio->device, 0);
   return true;
+#endif
 }
 
 static void audio_shutdown(AudioSystem *audio) {
@@ -1911,8 +1957,15 @@ static bool resolve_object_asset_path(const char *name, char *out_path, size_t o
 }
 
 static bool resolve_hud_font_path(char *out_path, size_t out_path_size) {
-  const char *candidates[4] = {"amiga/misc/smallfont2.bin", "amiga/prog/misc/smallfont2.bin", "misc/smallfont2.bin",
-                               "data/misc/smallfont2.bin"};
+  const char *candidates[8] = {"amiga/misc/smallfont2.bin", "amiga/prog/misc/smallfont2.bin", "misc/smallfont2.bin",
+                               "data/misc/smallfont2.bin",
+#ifdef GLOOM_DOS_SDL3
+                               "amiga/misc/smallf2.bin", "amiga/prog/misc/smallf2.bin", "misc/smallf2.bin",
+                               "data/misc/smallf2.bin"
+#else
+                               NULL, NULL, NULL, NULL
+#endif
+  };
   size_t i = 0u;
 
   if (out_path == NULL || out_path_size == 0u) {
@@ -1920,6 +1973,9 @@ static bool resolve_hud_font_path(char *out_path, size_t out_path_size) {
   }
 
   for (i = 0u; i < sizeof(candidates) / sizeof(candidates[0]); ++i) {
+    if (candidates[i] == NULL) {
+      continue;
+    }
     if (resolve_runtime_file_path(candidates[i], out_path, out_path_size)) {
       return true;
     }
@@ -2009,10 +2065,17 @@ static void free_grid_offset_set(GridOffsetSet *set) {
 }
 
 static bool load_grid_offset_set(GridOffsetSet *set) {
+  const char *candidates[] = {
+      "amiga/gridoffs4.bin",
+#ifdef GLOOM_DOS_SDL3
+      "amiga/gridoff4.bin",
+#endif
+  };
   uint8_t *data = NULL;
   size_t file_size = 0;
   size_t count = 0;
   size_t i = 0;
+  size_t candidate_index = 0u;
   char resolved_path[1024] = {0};
 
   if (set == NULL) {
@@ -2021,7 +2084,13 @@ static bool load_grid_offset_set(GridOffsetSet *set) {
 
   free_grid_offset_set(set);
 
-  if (!resolve_runtime_file_path("amiga/gridoffs4.bin", resolved_path, sizeof(resolved_path))) {
+  for (candidate_index = 0u; candidate_index < sizeof(candidates) / sizeof(candidates[0]); ++candidate_index) {
+    if (resolve_runtime_file_path(candidates[candidate_index], resolved_path, sizeof(resolved_path))) {
+      break;
+    }
+  }
+
+  if (candidate_index == sizeof(candidates) / sizeof(candidates[0])) {
     fprintf(stderr, "[ERROR] Missing original grid search order amiga/gridoffs4.bin\n");
     return false;
   }
@@ -2294,7 +2363,7 @@ static bool load_hud_font(HudFont *font) {
   free_hud_font(font);
 
   if (!resolve_hud_font_path(resolved_path, sizeof(resolved_path))) {
-    fprintf(stderr, "Missing original HUD font amiga/misc/smallfont.bin\n");
+    fprintf(stderr, "Missing original HUD panel font amiga/misc/smallfont2.bin\n");
     return false;
   }
 
@@ -2462,19 +2531,23 @@ static bool load_menu_big_font(HudFont *font) {
 
   free_hud_font(font);
 
+  dos_logf("DOS checkpoint: menu big font resolve begin");
   if (!resolve_menu_big_font_path(resolved_path, sizeof(resolved_path))) {
     fprintf(stderr, "Missing original menu font amiga/misc/bigfont2.bin\n");
     return false;
   }
+  dos_logf("DOS checkpoint: menu big font resolved %s", resolved_path);
   if (!read_binary_blob(resolved_path, &data, &data_size)) {
     fprintf(stderr, "Failed to read menu font %s\n", resolved_path);
     return false;
   }
+  dos_logf("DOS checkpoint: menu big font read %zu bytes", data_size);
   if (!gloom_decrunch_crm_buffer(&data, &data_size, error, sizeof(error))) {
     fprintf(stderr, "Failed to decrunch menu font %s: %s\n", resolved_path, error[0] ? error : "unknown error");
     free(data);
     return false;
   }
+  dos_logf("DOS checkpoint: menu big font decrunched %zu bytes", data_size);
   if (data_size < 12u) {
     fprintf(stderr, "Menu font %s is too small after decrunch (%zu bytes)\n", resolved_path, data_size);
     free(data);
@@ -2588,6 +2661,7 @@ static bool load_menu_big_font(HudFont *font) {
   font->glyphs = glyphs;
   (void)snprintf(font->source_name, sizeof(font->source_name), "%s", resolved_path);
   free(data);
+  dos_logf("DOS checkpoint: menu big font loaded %zu glyphs", glyph_count);
   printf("Loaded %zu menu glyphs from original bigfont asset\n", glyph_count);
   return true;
 
@@ -8552,6 +8626,34 @@ static void end_render_framebuffer(RenderFramebuffer *framebuffer) {
   framebuffer->pitch_pixels = 0;
 }
 
+static void present_framebuffer_texture(SDL_Renderer *renderer, const RenderFramebuffer *framebuffer, int render_width,
+                                        int render_height) {
+  SDL_Rect dst = {0, 0, render_width, render_height};
+
+  if (renderer == NULL || framebuffer == NULL || framebuffer->texture == NULL) {
+    return;
+  }
+  SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+  SDL_RenderClear(renderer);
+  (void)SDL_RenderCopy(renderer, framebuffer->texture, NULL, &dst);
+  SDL_RenderPresent(renderer);
+}
+
+static bool runtime_menu_accepts_mouse(void) {
+#ifdef GLOOM_DOS_SDL3
+  return false;
+#else
+  return true;
+#endif
+}
+
+static void runtime_prepare_menu_input(void) {
+#ifdef GLOOM_DOS_SDL3
+  (void)SDL_ShowCursor(SDL_DISABLE);
+  SDL_FlushEvent(SDL_MOUSEMOTION);
+#endif
+}
+
 static void framebuffer_clear(RenderFramebuffer *framebuffer, uint32_t argb) {
   size_t count = 0u;
   size_t i = 0u;
@@ -10036,10 +10138,13 @@ static bool load_menu_title_image(MenuImage *out_image) {
     size_t pixel_index = 0u;
 
     memset(&image, 0, sizeof(image));
+    dos_logf("DOS checkpoint: menu title try %s", candidates[i]);
     if (!resolve_runtime_file_path(candidates[i], resolved_path, sizeof(resolved_path))) {
       continue;
     }
+    dos_logf("DOS checkpoint: menu title resolved %s", resolved_path);
     if (!gloom_iff_load(resolved_path, &image, error, sizeof(error))) {
+      dos_logf("DOS checkpoint: menu title decode failed %s", resolved_path);
       gloom_iff_free(&image);
       continue;
     }
@@ -10063,6 +10168,7 @@ static bool load_menu_title_image(MenuImage *out_image) {
     out_image->width = (int)image.width;
     out_image->height = (int)image.height;
     gloom_iff_free(&image);
+    dos_logf("DOS checkpoint: menu title loaded %dx%d", out_image->width, out_image->height);
     printf("Loaded original title image %s for menu\n", resolved_path);
     return true;
   }
@@ -10146,13 +10252,16 @@ static bool load_menu_assets(MenuAssets *assets) {
   }
 
   memset(assets, 0, sizeof(*assets));
+  dos_logf("DOS checkpoint: load_menu_assets begin");
   if (!load_menu_title_image(&assets->title)) {
     return false;
   }
+  dos_logf("DOS checkpoint: load_menu_assets title ok");
   if (!load_menu_big_font(&assets->big_font)) {
     free_menu_image(&assets->title);
     return false;
   }
+  dos_logf("DOS checkpoint: load_menu_assets big font ok");
   return true;
 }
 
@@ -10217,6 +10326,69 @@ static void render_menu_image(RenderFramebuffer *framebuffer, const MenuImage *i
   }
 }
 
+static int start_menu_item_count(void);
+
+static void copy_menu_background(RenderFramebuffer *framebuffer, const uint32_t *background, int render_width,
+                                 int render_height) {
+  int y = 0;
+
+  if (framebuffer == NULL || framebuffer->pixels == NULL || background == NULL || render_width <= 0 ||
+      render_height <= 0) {
+    return;
+  }
+
+  for (y = 0; y < render_height; ++y) {
+    memcpy(framebuffer->pixels + ((size_t)y * (size_t)framebuffer->pitch_pixels),
+           background + ((size_t)y * (size_t)render_width), (size_t)render_width * sizeof(*background));
+  }
+}
+
+static bool cache_start_menu_background(RenderFramebuffer *framebuffer, const MenuAssets *assets, int render_width,
+                                        int render_height, uint32_t **io_cache, size_t *io_capacity) {
+  int title_scale = 4;
+  int title_width = 0;
+  int scale = 0;
+  int y = 0;
+  int title_y = 0;
+  size_t required = 0u;
+
+  if (framebuffer == NULL || assets == NULL || io_cache == NULL || io_capacity == NULL || render_width <= 0 ||
+      render_height <= 0) {
+    return false;
+  }
+
+  required = (size_t)render_width * (size_t)render_height;
+  if (*io_capacity < required) {
+    uint32_t *new_cache = (uint32_t *)realloc(*io_cache, required * sizeof(**io_cache));
+
+    if (new_cache == NULL) {
+      return false;
+    }
+    *io_cache = new_cache;
+    *io_capacity = required;
+  }
+
+  framebuffer_clear(framebuffer, 0xFF000000u);
+  render_menu_image(framebuffer, &assets->title, render_width, render_height);
+
+  scale = menu_pixel_scale_for_viewport(render_width, render_height);
+  title_width = (int)(strlen("GLOOM WITH FRIENDS") * (size_t)GLOOM_MENU_BIG_FONT_WIDTH * (size_t)title_scale);
+  while (title_scale > 1 && title_width > render_width) {
+    title_scale /= 2;
+    title_width = (int)(strlen("GLOOM WITH FRIENDS") * (size_t)GLOOM_MENU_BIG_FONT_WIDTH * (size_t)title_scale);
+  }
+  y = (render_height / 2) - ((start_menu_item_count() * GLOOM_MENU_BIG_FONT_HEIGHT * scale) / 2);
+  title_y = y - (GLOOM_MENU_BIG_FONT_HEIGHT * title_scale) - ((GLOOM_MENU_BIG_FONT_HEIGHT * scale * 21) / 2);
+  if (title_y < GLOOM_MENU_BIG_FONT_HEIGHT) {
+    title_y = GLOOM_MENU_BIG_FONT_HEIGHT;
+  }
+  render_menu_text_brightness(framebuffer, &assets->big_font, "GLOOM WITH FRIENDS", render_width / 2, title_y,
+                              title_scale, 255u);
+  copy_menu_background(&(RenderFramebuffer){.pixels = *io_cache, .pitch_pixels = render_width}, framebuffer->pixels,
+                       render_width, render_height);
+  return true;
+}
+
 static int start_menu_item_count(void) {
 #ifdef __EMSCRIPTEN__
   return 4;
@@ -10241,6 +10413,22 @@ static int menu_row_at_point(int render_width, int render_height, int item_count
   }
   index = (y - menu_y) / row_height;
   return index >= 0 && index < item_count ? index : -1;
+}
+
+static int menu_row_at_event_point(SDL_Renderer *renderer, int render_width, int render_height, int item_count,
+                                   float window_x, float window_y) {
+#ifdef GLOOM_DOS_SDL3
+  float render_x = window_x;
+  float render_y = window_y;
+
+  if (renderer != NULL &&
+      SDL_RenderCoordinatesFromWindow(renderer, window_x, window_y, &render_x, &render_y)) {
+    return menu_row_at_point(render_width, render_height, item_count, (int)render_x, (int)render_y);
+  }
+#else
+  (void)renderer;
+#endif
+  return menu_row_at_point(render_width, render_height, item_count, (int)window_x, (int)window_y);
 }
 
 static int activate_start_menu_selection(int selected_index, GloomGameMode *out_game_mode,
@@ -10275,18 +10463,16 @@ static int activate_start_menu_selection(int selected_index, GloomGameMode *out_
   return 0;
 }
 
-static void render_start_menu_frame(RenderFramebuffer *framebuffer, const MenuAssets *assets, int render_width,
-                                    int render_height, int selected_index, bool selected_visible,
+static void render_start_menu_frame(RenderFramebuffer *framebuffer, const MenuAssets *assets,
+                                    const uint32_t *background, int render_width, int render_height,
+                                    int selected_index, bool selected_visible,
                                     uint8_t violence_mode, const RuntimeControlConfig *control_config) {
   const char *items[6];
   int item_count = start_menu_item_count();
   char player1_item[32];
   char player2_item[32];
   int scale = 1;
-  int title_scale = 4;
   int y = 0;
-  int title_y = 0;
-  int title_width = 0;
   int i = 0;
 
   if (framebuffer == NULL || assets == NULL) {
@@ -10304,22 +10490,15 @@ static void render_start_menu_frame(RenderFramebuffer *framebuffer, const MenuAs
   items[3] = player2_item;
   items[4] = "EXIT GLOOM";
 
-  framebuffer_clear(framebuffer, 0xFF000000u);
-  render_menu_image(framebuffer, &assets->title, render_width, render_height);
+  if (background != NULL) {
+    copy_menu_background(framebuffer, background, render_width, render_height);
+  } else {
+    framebuffer_clear(framebuffer, 0xFF000000u);
+    render_menu_image(framebuffer, &assets->title, render_width, render_height);
+  }
 
   scale = menu_pixel_scale_for_viewport(render_width, render_height);
-  title_width = (int)(strlen("GLOOM WITH FRIENDS") * (size_t)GLOOM_MENU_BIG_FONT_WIDTH * (size_t)title_scale);
-  while (title_scale > 1 && title_width > render_width) {
-    title_scale /= 2;
-    title_width = (int)(strlen("GLOOM WITH FRIENDS") * (size_t)GLOOM_MENU_BIG_FONT_WIDTH * (size_t)title_scale);
-  }
   y = (render_height / 2) - ((item_count * GLOOM_MENU_BIG_FONT_HEIGHT * scale) / 2);
-  title_y = y - (GLOOM_MENU_BIG_FONT_HEIGHT * title_scale) - ((GLOOM_MENU_BIG_FONT_HEIGHT * scale * 21) / 2);
-  if (title_y < GLOOM_MENU_BIG_FONT_HEIGHT) {
-    title_y = GLOOM_MENU_BIG_FONT_HEIGHT;
-  }
-  render_menu_text_brightness(framebuffer, &assets->big_font, "GLOOM WITH FRIENDS", render_width / 2, title_y,
-                              title_scale, 255u);
   for (i = 0; i < item_count; ++i) {
     uint8_t brightness = (i == selected_index && !selected_visible) ? 96u : 255u;
 
@@ -10331,21 +10510,33 @@ static void render_start_menu_frame(RenderFramebuffer *framebuffer, const MenuAs
 static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const MenuAssets *assets,
                           int render_width, int render_height, GloomGameMode *out_game_mode,
                           uint8_t *io_violence_mode, RuntimeControlConfig *io_control_config) {
+  static uint32_t *menu_background_cache = NULL;
+  static size_t menu_background_capacity = 0u;
   int selected_index = 0;
   int flash_ticks = GLOOM_MENU_FLASH_TICKS;
   bool selected_visible = false;
   bool running = true;
+  bool redraw = true;
   uint32_t last_tick = SDL_GetTicks();
+#ifdef GLOOM_DOS_SDL3
+  bool dos_logged_first_frame = false;
+#endif
 
   if (renderer == NULL || framebuffer == NULL || assets == NULL || out_game_mode == NULL ||
       io_violence_mode == NULL || io_control_config == NULL) {
     return -1;
   }
+  runtime_prepare_menu_input();
   normalize_control_config(io_control_config);
   if (*out_game_mode == GLOOM_GAME_MODE_TWO_PLAYER) {
     selected_index = 1;
   } else if (*out_game_mode == GLOOM_GAME_MODE_COMBAT) {
     selected_index = 1;
+  }
+  if (begin_render_framebuffer(framebuffer)) {
+    (void)cache_start_menu_background(framebuffer, assets, render_width, render_height, &menu_background_cache,
+                                      &menu_background_capacity);
+    end_render_framebuffer(framebuffer);
   }
 
   while (running) {
@@ -10366,12 +10557,14 @@ static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer
           if (selected_index < 0) selected_index = item_count - 1;
           selected_visible = false;
           flash_ticks = GLOOM_MENU_FLASH_TICKS;
+          redraw = true;
           audio_play_ui_move();
         } else if (sym == SDLK_DOWN || sym == SDLK_s) {
           selected_index += 1;
           if (selected_index >= item_count) selected_index = 0;
           selected_visible = false;
           flash_ticks = GLOOM_MENU_FLASH_TICKS;
+          redraw = true;
           audio_play_ui_move();
         } else if (sym == SDLK_RETURN || sym == SDLK_SPACE || sym == SDLK_LCTRL || sym == SDLK_RCTRL) {
           int result =
@@ -10384,6 +10577,7 @@ static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer
           if (result < 0) {
             return -1;
           }
+          redraw = true;
         } else if (sym == SDLK_ESCAPE) {
 #ifndef __EMSCRIPTEN__
           audio_play_ui_back();
@@ -10391,18 +10585,21 @@ static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer
 #endif
         }
       }
-      if (event.type == SDL_MOUSEMOTION) {
-        int hover_index = menu_row_at_point(render_width, render_height, item_count, event.motion.x, event.motion.y);
+      if (runtime_menu_accepts_mouse() && event.type == SDL_MOUSEMOTION) {
+        int hover_index =
+            menu_row_at_event_point(renderer, render_width, render_height, item_count, event.motion.x, event.motion.y);
 
         if (hover_index >= 0 && hover_index != selected_index) {
           selected_index = hover_index;
           selected_visible = false;
           flash_ticks = GLOOM_MENU_FLASH_TICKS;
+          redraw = true;
           audio_play_ui_move();
         }
       }
-      if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT) {
-        int click_index = menu_row_at_point(render_width, render_height, item_count, event.button.x, event.button.y);
+      if (runtime_menu_accepts_mouse() && event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT) {
+        int click_index =
+            menu_row_at_event_point(renderer, render_width, render_height, item_count, event.button.x, event.button.y);
 
         if (click_index >= 0) {
           int result = 0;
@@ -10418,6 +10615,7 @@ static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer
           if (result < 0) {
             return -1;
           }
+          redraw = true;
         }
       }
       if (event.type == SDL_CONTROLLERBUTTONDOWN) {
@@ -10426,12 +10624,14 @@ static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer
           if (selected_index < 0) selected_index = item_count - 1;
           selected_visible = false;
           flash_ticks = GLOOM_MENU_FLASH_TICKS;
+          redraw = true;
           audio_play_ui_move();
         } else if (event.cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_DOWN) {
           selected_index += 1;
           if (selected_index >= item_count) selected_index = 0;
           selected_visible = false;
           flash_ticks = GLOOM_MENU_FLASH_TICKS;
+          redraw = true;
           audio_play_ui_move();
         } else if (gamepad_menu_activate_event(&event)) {
           int result =
@@ -10444,6 +10644,7 @@ static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer
           if (result < 0) {
             return -1;
           }
+          redraw = true;
         } else if (gamepad_menu_back_event(&event)) {
 #ifndef __EMSCRIPTEN__
           audio_play_ui_back();
@@ -10459,22 +10660,30 @@ static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer
       if (flash_ticks <= 0) {
         selected_visible = !selected_visible;
         flash_ticks = GLOOM_MENU_FLASH_TICKS;
+        redraw = true;
       }
     }
 
-    if (begin_render_framebuffer(framebuffer)) {
-      render_start_menu_frame(framebuffer, assets, render_width, render_height, selected_index, selected_visible,
-                              *io_violence_mode, io_control_config);
+    if (redraw && begin_render_framebuffer(framebuffer)) {
+      render_start_menu_frame(framebuffer, assets, menu_background_cache, render_width, render_height, selected_index,
+                              selected_visible, *io_violence_mode, io_control_config);
       end_render_framebuffer(framebuffer);
-      SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
-      SDL_RenderClear(renderer);
-      {
-        SDL_Rect dst = {0, 0, render_width, render_height};
-        (void)SDL_RenderCopy(renderer, framebuffer->texture, NULL, &dst);
+      present_framebuffer_texture(renderer, framebuffer, render_width, render_height);
+#ifdef GLOOM_DOS_SDL3
+      if (!dos_logged_first_frame) {
+        dos_logf("DOS checkpoint: start menu first frame presented");
+        fprintf(stderr, "DOS checkpoint: start menu first frame presented\n");
+        fflush(stderr);
+        dos_logged_first_frame = true;
       }
-      SDL_RenderPresent(renderer);
+#endif
+      redraw = false;
     }
+#ifdef GLOOM_DOS_SDL3
+    SDL_Delay(redraw ? 1 : 8);
+#else
     SDL_Delay(1);
+#endif
   }
 
   return -1;
@@ -10525,6 +10734,7 @@ static int run_combat_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffe
   int selected_index = 0;
   int flash_ticks = GLOOM_MENU_FLASH_TICKS;
   bool selected_visible = false;
+  bool redraw = true;
   uint32_t last_tick = SDL_GetTicks();
   int16_t lives = 3;
 
@@ -10533,6 +10743,7 @@ static int run_combat_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffe
   if (renderer == NULL || framebuffer == NULL || out_series == NULL || out_lives == NULL) {
     return -1;
   }
+  runtime_prepare_menu_input();
   if (!load_combat_menu_image(&image) || !load_menu_big_font(&font)) {
     free_menu_image(&image);
     free_hud_font(&font);
@@ -10558,12 +10769,14 @@ static int run_combat_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffe
           if (selected_index < 0) selected_index = 3;
           selected_visible = false;
           flash_ticks = GLOOM_MENU_FLASH_TICKS;
+          redraw = true;
           audio_play_ui_move();
         } else if (sym == SDLK_DOWN || sym == SDLK_s) {
           selected_index += 1;
           if (selected_index > 3) selected_index = 0;
           selected_visible = false;
           flash_ticks = GLOOM_MENU_FLASH_TICKS;
+          redraw = true;
           audio_play_ui_move();
         } else if (sym == SDLK_RETURN || sym == SDLK_SPACE || sym == SDLK_LCTRL || sym == SDLK_RCTRL) {
           audio_play_ui_activate();
@@ -10578,6 +10791,7 @@ static int run_combat_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffe
           if (lives > 9) {
             lives = 2;
           }
+          redraw = true;
         } else if (sym == SDLK_ESCAPE) {
           audio_play_ui_back();
           free_menu_image(&image);
@@ -10591,12 +10805,14 @@ static int run_combat_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffe
           if (selected_index < 0) selected_index = 3;
           selected_visible = false;
           flash_ticks = GLOOM_MENU_FLASH_TICKS;
+          redraw = true;
           audio_play_ui_move();
         } else if (event.cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_DOWN) {
           selected_index += 1;
           if (selected_index > 3) selected_index = 0;
           selected_visible = false;
           flash_ticks = GLOOM_MENU_FLASH_TICKS;
+          redraw = true;
           audio_play_ui_move();
         } else if (gamepad_menu_activate_event(&event)) {
           audio_play_ui_activate();
@@ -10611,6 +10827,7 @@ static int run_combat_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffe
           if (lives > 9) {
             lives = 2;
           }
+          redraw = true;
         } else if (gamepad_menu_back_event(&event)) {
           audio_play_ui_back();
           free_menu_image(&image);
@@ -10626,22 +10843,22 @@ static int run_combat_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffe
       if (flash_ticks <= 0) {
         selected_visible = !selected_visible;
         flash_ticks = GLOOM_MENU_FLASH_TICKS;
+        redraw = true;
       }
     }
 
-    if (begin_render_framebuffer(framebuffer)) {
+    if (redraw && begin_render_framebuffer(framebuffer)) {
       render_combat_menu_frame(framebuffer, &image, &font, render_width, render_height, selected_index,
                                selected_visible, lives);
       end_render_framebuffer(framebuffer);
-      SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
-      SDL_RenderClear(renderer);
-      {
-        SDL_Rect dst = {0, 0, render_width, render_height};
-        (void)SDL_RenderCopy(renderer, framebuffer->texture, NULL, &dst);
-      }
-      SDL_RenderPresent(renderer);
+      present_framebuffer_texture(renderer, framebuffer, render_width, render_height);
+      redraw = false;
     }
+#ifdef GLOOM_DOS_SDL3
+    SDL_Delay(redraw ? 1 : 8);
+#else
     SDL_Delay(1);
+#endif
   }
 }
 
@@ -10656,6 +10873,7 @@ static bool run_combat_result_screen(SDL_Renderer *renderer, RenderFramebuffer *
   if (renderer == NULL || framebuffer == NULL || message == NULL) {
     return false;
   }
+  runtime_prepare_menu_input();
   if (!load_combat_menu_image(&image) || !load_menu_big_font(&font)) {
     free_menu_image(&image);
     free_hud_font(&font);
@@ -10672,7 +10890,8 @@ static bool run_combat_result_screen(SDL_Renderer *renderer, RenderFramebuffer *
         free_hud_font(&font);
         return false;
       }
-      if (event.type == SDL_KEYDOWN || event.type == SDL_MOUSEBUTTONDOWN || event.type == SDL_CONTROLLERBUTTONDOWN) {
+      if (event.type == SDL_KEYDOWN || (runtime_menu_accepts_mouse() && event.type == SDL_MOUSEBUTTONDOWN) ||
+          event.type == SDL_CONTROLLERBUTTONDOWN) {
         running = false;
       }
     }
@@ -10735,13 +10954,14 @@ static void render_pause_menu_frame(RenderFramebuffer *framebuffer, const HudFon
 
 static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer, RenderFramebuffer *framebuffer,
                                       int render_width, int render_height, bool *io_mouse_captured,
-                                      int *io_mouse_dx_accum, bool *io_suppress_mouse_fire_until_button_up) {
+                                      double *io_mouse_dx_accum, bool *io_suppress_mouse_fire_until_button_up) {
   static uint32_t *pause_background = NULL;
   static size_t pause_background_capacity = 0u;
   HudFont font;
   int selected_index = 0;
   int flash_ticks = GLOOM_MENU_FLASH_TICKS;
   bool selected_visible = true;
+  bool redraw = true;
   uint32_t last_tick = SDL_GetTicks();
   size_t required_pixels = 0u;
   bool pause_background_valid = false;
@@ -10751,6 +10971,7 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
       io_mouse_dx_accum == NULL || io_suppress_mouse_fire_until_button_up == NULL) {
     return PAUSE_MENU_QUIT;
   }
+  runtime_prepare_menu_input();
   if (!load_menu_big_font(&font)) {
     return PAUSE_MENU_QUIT;
   }
@@ -10788,7 +11009,7 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
     if (runtime_emscripten_consume_pointer_lock_lost()) {
       (void)set_runtime_mouse_capture(window, false);
       *io_mouse_captured = false;
-      *io_mouse_dx_accum = 0;
+      *io_mouse_dx_accum = 0.0;
       *io_suppress_mouse_fire_until_button_up = false;
       SDL_FlushEvent(SDL_MOUSEMOTION);
     }
@@ -10808,6 +11029,7 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
           selected_index = selected_index == 0 ? 1 : 0;
           selected_visible = false;
           flash_ticks = GLOOM_MENU_FLASH_TICKS;
+          redraw = true;
           audio_play_ui_move();
         } else if (sym == SDLK_RETURN || sym == SDLK_SPACE || sym == SDLK_LCTRL || sym == SDLK_RCTRL) {
           PauseMenuResult result = selected_index == 0 ? PAUSE_MENU_CONTINUE : PAUSE_MENU_MAIN_MENU;
@@ -10825,15 +11047,16 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
             audio_play_ui_back();
             (void)set_runtime_mouse_capture(window, false);
             *io_mouse_captured = false;
-            *io_mouse_dx_accum = 0;
+            *io_mouse_dx_accum = 0.0;
             *io_suppress_mouse_fire_until_button_up = false;
             SDL_FlushEvent(SDL_MOUSEMOTION);
           }
         }
       }
-      if (event.type == SDL_MOUSEBUTTONDOWN && event.button.clicks >= 2) {
+      if (runtime_menu_accepts_mouse() && event.type == SDL_MOUSEBUTTONDOWN && event.button.clicks >= 2) {
         if (event.button.button == SDL_BUTTON_LEFT) {
-          int click_index = menu_row_at_point(render_width, render_height, 2, event.button.x, event.button.y);
+          int click_index =
+              menu_row_at_event_point(renderer, render_width, render_height, 2, event.button.x, event.button.y);
 
           if (click_index >= 0) {
             PauseMenuResult result = click_index == 0 ? PAUSE_MENU_CONTINUE : PAUSE_MENU_MAIN_MENU;
@@ -10847,12 +11070,14 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
         }
         if (!*io_mouse_captured && set_runtime_mouse_capture(window, true)) {
           *io_mouse_captured = true;
-          *io_mouse_dx_accum = 0;
+          *io_mouse_dx_accum = 0.0;
           *io_suppress_mouse_fire_until_button_up = event.button.button == SDL_BUTTON_LEFT;
           SDL_FlushEvent(SDL_MOUSEMOTION);
         }
-      } else if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT) {
-        int click_index = menu_row_at_point(render_width, render_height, 2, event.button.x, event.button.y);
+      } else if (runtime_menu_accepts_mouse() && event.type == SDL_MOUSEBUTTONDOWN &&
+                 event.button.button == SDL_BUTTON_LEFT) {
+        int click_index =
+            menu_row_at_event_point(renderer, render_width, render_height, 2, event.button.x, event.button.y);
 
         if (click_index >= 0) {
           PauseMenuResult result = click_index == 0 ? PAUSE_MENU_CONTINUE : PAUSE_MENU_MAIN_MENU;
@@ -10864,17 +11089,19 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
           return result;
         }
       }
-      if (event.type == SDL_MOUSEMOTION) {
-        int hover_index = menu_row_at_point(render_width, render_height, 2, event.motion.x, event.motion.y);
+      if (runtime_menu_accepts_mouse() && event.type == SDL_MOUSEMOTION) {
+        int hover_index =
+            menu_row_at_event_point(renderer, render_width, render_height, 2, event.motion.x, event.motion.y);
 
         if (hover_index >= 0 && hover_index != selected_index) {
           selected_index = hover_index;
           selected_visible = false;
           flash_ticks = GLOOM_MENU_FLASH_TICKS;
+          redraw = true;
           audio_play_ui_move();
         }
       }
-      if (event.type == SDL_MOUSEBUTTONUP && event.button.button == SDL_BUTTON_LEFT) {
+      if (runtime_menu_accepts_mouse() && event.type == SDL_MOUSEBUTTONUP && event.button.button == SDL_BUTTON_LEFT) {
         *io_suppress_mouse_fire_until_button_up = false;
       }
       if (event.type == SDL_CONTROLLERBUTTONDOWN) {
@@ -10883,6 +11110,7 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
           selected_index = selected_index == 0 ? 1 : 0;
           selected_visible = false;
           flash_ticks = GLOOM_MENU_FLASH_TICKS;
+          redraw = true;
           audio_play_ui_move();
         } else if (gamepad_menu_activate_event(&event)) {
           PauseMenuResult result = selected_index == 0 ? PAUSE_MENU_CONTINUE : PAUSE_MENU_MAIN_MENU;
@@ -10905,10 +11133,11 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
       if (flash_ticks <= 0) {
         selected_visible = !selected_visible;
         flash_ticks = GLOOM_MENU_FLASH_TICKS;
+        redraw = true;
       }
     }
 
-    if (begin_render_framebuffer(framebuffer)) {
+    if (redraw && begin_render_framebuffer(framebuffer)) {
       render_pause_menu_frame(framebuffer, &font, pause_background_valid ? pause_background : NULL, render_width,
                               render_width, render_height, selected_index, selected_visible);
       end_render_framebuffer(framebuffer);
@@ -10919,8 +11148,13 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
         (void)SDL_RenderCopy(renderer, framebuffer->texture, NULL, &dst);
       }
       SDL_RenderPresent(renderer);
+      redraw = false;
     }
+#ifdef GLOOM_DOS_SDL3
+    SDL_Delay(redraw ? 1 : 8);
+#else
     SDL_Delay(1);
+#endif
   }
 }
 
@@ -10958,6 +11192,7 @@ static bool run_completion_screen(SDL_Renderer *renderer, RenderFramebuffer *fra
   if (renderer == NULL || framebuffer == NULL || completion == NULL) {
     return false;
   }
+  runtime_prepare_menu_input();
   if (!load_script_picture_image(completion->picture, &image)) {
     fprintf(stderr, "Cannot execute scriptdone completion screen: missing original pict_%s image\n",
             completion->picture);
@@ -10978,7 +11213,8 @@ static bool run_completion_screen(SDL_Renderer *renderer, RenderFramebuffer *fra
         free_menu_image(&image);
         return false;
       }
-      if (event.type == SDL_KEYDOWN || event.type == SDL_MOUSEBUTTONDOWN || event.type == SDL_CONTROLLERBUTTONDOWN) {
+      if (event.type == SDL_KEYDOWN || (runtime_menu_accepts_mouse() && event.type == SDL_MOUSEBUTTONDOWN) ||
+          event.type == SDL_CONTROLLERBUTTONDOWN) {
         running = false;
       }
     }
@@ -13758,6 +13994,49 @@ static void runtime_force_cursor_visible(void) {
   }
 }
 
+#ifdef GLOOM_DOS_SDL3
+static void dos_runtime_reset_absolute_mouse_capture(void) {
+  g_dos_mouse_absolute_capture = false;
+  g_dos_mouse_absolute_valid = false;
+  g_dos_mouse_absolute_x = 0.0f;
+}
+
+static void dos_runtime_center_mouse(SDL_Window *window) {
+  int window_width = 0;
+  int window_height = 0;
+
+  if (window == NULL) {
+    return;
+  }
+  if (!SDL_GetWindowSize(window, &window_width, &window_height) || window_width <= 0 || window_height <= 0) {
+    return;
+  }
+  SDL_WarpMouseInWindow(window, (float)(window_width / 2), (float)(window_height / 2));
+  g_dos_mouse_absolute_valid = false;
+}
+
+static double dos_runtime_mouse_motion_delta(SDL_Window *window, const SDL_MouseMotionEvent *motion) {
+  double dx = 0.0;
+
+  if (motion == NULL) {
+    return 0.0;
+  }
+  if (motion->xrel != 0.0f) {
+    return (double)motion->xrel;
+  }
+  if (!g_dos_mouse_absolute_capture) {
+    return 0.0;
+  }
+  if (g_dos_mouse_absolute_valid) {
+    dx = (double)(motion->x - g_dos_mouse_absolute_x);
+  }
+  g_dos_mouse_absolute_x = motion->x;
+  g_dos_mouse_absolute_valid = true;
+  dos_runtime_center_mouse(window);
+  return dx;
+}
+#endif
+
 static bool set_runtime_mouse_capture(SDL_Window *window, bool captured) {
   if (window == NULL) {
     return false;
@@ -13766,8 +14045,21 @@ static bool set_runtime_mouse_capture(SDL_Window *window, bool captured) {
   if (captured) {
     if (SDL_SetRelativeMouseMode(SDL_TRUE) != 0) {
       fprintf(stderr, "SDL_SetRelativeMouseMode(SDL_TRUE) failed: %s\n", SDL_GetError());
+#ifdef GLOOM_DOS_SDL3
+      dos_logf("DOS mouse: relative mode failed; using absolute motion capture: %s", SDL_GetError());
+      g_dos_mouse_absolute_capture = true;
+      g_dos_mouse_absolute_valid = false;
+      dos_runtime_center_mouse(window);
+#else
       return false;
+#endif
     }
+#ifdef GLOOM_DOS_SDL3
+    else {
+      dos_logf("DOS mouse: relative mode enabled");
+      dos_runtime_reset_absolute_mouse_capture();
+    }
+#endif
     SDL_SetWindowGrab(window, SDL_TRUE);
     g_runtime_mouse_capture_active = true;
     (void)SDL_ShowCursor(SDL_DISABLE);
@@ -13775,6 +14067,9 @@ static bool set_runtime_mouse_capture(SDL_Window *window, bool captured) {
     if (SDL_SetRelativeMouseMode(SDL_FALSE) != 0) {
       fprintf(stderr, "SDL_SetRelativeMouseMode(SDL_FALSE) failed: %s\n", SDL_GetError());
     }
+#ifdef GLOOM_DOS_SDL3
+    dos_runtime_reset_absolute_mouse_capture();
+#endif
     (void)SDL_CaptureMouse(SDL_FALSE);
     SDL_SetWindowGrab(window, SDL_FALSE);
     g_runtime_mouse_capture_active = false;
@@ -13814,7 +14109,7 @@ int main(int argc, char **argv) {
   bool running = true;
   bool mouse_captured = true;
   bool suppress_mouse_fire_until_button_up = false;
-  int mouse_dx_accum = 0;
+  double mouse_dx_accum = 0.0;
   int render_width = DEFAULT_WINDOW_WIDTH;
   int render_height = DEFAULT_WINDOW_HEIGHT;
   int render_scale = 1;
@@ -14133,7 +14428,12 @@ int main(int argc, char **argv) {
   }
 
   memset(&g_audio, 0, sizeof(g_audio));
+  dos_logf("DOS checkpoint: before SDL_Init");
+#ifdef GLOOM_DOS_SDL3
+  if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
+#else
   if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) {
+#endif
     fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
     free(previous_zones);
     free(render_zones);
@@ -14146,6 +14446,11 @@ int main(int argc, char **argv) {
     gloom_map_free(&state.map);
     return 1;
   }
+#ifdef GLOOM_DOS_SDL3
+  dos_logf("DOS checkpoint: SDL_Init video/events ok");
+  fprintf(stderr, "DOS checkpoint: SDL_Init video/events ok\n");
+  fflush(stderr);
+#endif
   if (!explicit_resolution) {
     if (classic_viewport) {
       render_width = BASE_WIDTH;
@@ -14162,7 +14467,12 @@ int main(int argc, char **argv) {
   }
   gamepad_init();
 
+#ifdef GLOOM_DOS_SDL3
+  /* TODO(port): amiga/gloom2.s Paula playback path needs a DOS Sound Blaster backend. */
+  if (!audio_start(&g_audio)) {
+#else
   if (!audio_load_sfx_bank(&g_audio) || !audio_start(&g_audio)) {
+#endif
     fprintf(stderr, "Failed to initialize SDL Paula SFX port from original amiga/sfxs assets\n");
     audio_shutdown(&g_audio);
     gamepad_shutdown();
@@ -14197,6 +14507,13 @@ int main(int argc, char **argv) {
     gloom_map_free(&state.map);
     return 1;
   }
+#ifdef GLOOM_DOS_SDL3
+  dos_logf("DOS checkpoint: SDL_CreateWindow ok %dx%d render=%dx%d", window_width, window_height, render_width,
+           render_height);
+  fprintf(stderr, "DOS checkpoint: SDL_CreateWindow ok %dx%d render=%dx%d\n", window_width, window_height,
+          render_width, render_height);
+  fflush(stderr);
+#endif
 
   renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
   if (renderer == NULL) {
@@ -14219,6 +14536,11 @@ int main(int argc, char **argv) {
     gloom_map_free(&state.map);
     return 1;
   }
+#ifdef GLOOM_DOS_SDL3
+  dos_logf("DOS checkpoint: SDL_CreateRenderer ok");
+  fprintf(stderr, "DOS checkpoint: SDL_CreateRenderer ok\n");
+  fflush(stderr);
+#endif
   runtime_emscripten_install_pointer_lock_listener();
   runtime_emscripten_install_fullscreen_listeners();
 
@@ -14241,6 +14563,11 @@ int main(int argc, char **argv) {
     gloom_map_free(&state.map);
     return 1;
   }
+#ifdef GLOOM_DOS_SDL3
+  dos_logf("DOS checkpoint: render framebuffer ok");
+  fprintf(stderr, "DOS checkpoint: render framebuffer ok\n");
+  fflush(stderr);
+#endif
 
   if (!skip_menu) {
     GloomGameMode menu_game_mode =
@@ -14268,6 +14595,11 @@ int main(int argc, char **argv) {
       gloom_map_free(&state.map);
       return 1;
     }
+#ifdef GLOOM_DOS_SDL3
+    dos_logf("DOS checkpoint: menu assets ok");
+    fprintf(stderr, "DOS checkpoint: menu assets ok\n");
+    fflush(stderr);
+#endif
 
     if (run_start_menu(renderer, &framebuffer, &menu_assets, render_width, render_height, &menu_game_mode,
                        &menu_violence_mode, &g_control_config) != 0) {
@@ -14392,7 +14724,7 @@ int main(int argc, char **argv) {
     if (runtime_emscripten_consume_pointer_lock_lost()) {
       (void)set_runtime_mouse_capture(window, false);
       mouse_captured = false;
-      mouse_dx_accum = 0;
+      mouse_dx_accum = 0.0;
       suppress_mouse_fire_until_button_up = false;
       pause_menu_requested = true;
       SDL_FlushEvent(SDL_MOUSEMOTION);
@@ -14414,7 +14746,7 @@ int main(int argc, char **argv) {
           if (mouse_captured || g_runtime_mouse_capture_active || SDL_GetRelativeMouseMode()) {
             (void)set_runtime_mouse_capture(window, false);
             mouse_captured = false;
-            mouse_dx_accum = 0;
+            mouse_dx_accum = 0.0;
             suppress_mouse_fire_until_button_up = false;
             SDL_FlushEvent(SDL_MOUSEMOTION);
           }
@@ -14439,7 +14771,7 @@ int main(int argc, char **argv) {
       if (event.type == SDL_MOUSEBUTTONDOWN && event.button.clicks >= 2) {
         if (!mouse_captured && set_runtime_mouse_capture(window, true)) {
           mouse_captured = true;
-          mouse_dx_accum = 0;
+          mouse_dx_accum = 0.0;
           suppress_mouse_fire_until_button_up = event.button.button == SDL_BUTTON_LEFT;
           SDL_FlushEvent(SDL_MOUSEMOTION);
         }
@@ -14448,7 +14780,11 @@ int main(int argc, char **argv) {
         suppress_mouse_fire_until_button_up = false;
       }
       if (event.type == SDL_MOUSEMOTION && mouse_captured) {
+#ifdef GLOOM_DOS_SDL3
+        mouse_dx_accum += dos_runtime_mouse_motion_delta(window, &event.motion);
+#else
         mouse_dx_accum += event.motion.xrel;
+#endif
       }
     }
 
@@ -14477,7 +14813,7 @@ int main(int argc, char **argv) {
       if (pause_result == PAUSE_MENU_MAIN_MENU) {
         if (mouse_captured && set_runtime_mouse_capture(window, false)) {
           mouse_captured = false;
-          mouse_dx_accum = 0;
+          mouse_dx_accum = 0.0;
           suppress_mouse_fire_until_button_up = false;
           SDL_FlushEvent(SDL_MOUSEMOTION);
         }
@@ -14500,13 +14836,14 @@ int main(int argc, char **argv) {
 
     {
       int gamepad_dx = player1_gamepad_look_delta();
-      int keyboard_dx = player1_receives_keyboard_input() ? mouse_dx_accum : 0;
+      bool keyboard_look_enabled = player1_receives_keyboard_input();
+      int keyboard_dx = keyboard_look_enabled ? (int)mouse_dx_accum : 0;
 
       if (keyboard_dx != 0 || gamepad_dx != 0) {
         apply_mouse_look(&state, keyboard_dx + gamepad_dx);
       }
+      mouse_dx_accum = keyboard_look_enabled ? mouse_dx_accum - (double)keyboard_dx : 0.0;
     }
-    mouse_dx_accum = 0;
 
     while (accumulator >= dt) {
       const uint8_t *keyboard = SDL_GetKeyboardState(NULL);
@@ -14565,7 +14902,7 @@ int main(int argc, char **argv) {
 
         if (mouse_captured && set_runtime_mouse_capture(window, false)) {
           mouse_captured = false;
-          mouse_dx_accum = 0;
+          mouse_dx_accum = 0.0;
           suppress_mouse_fire_until_button_up = false;
           SDL_FlushEvent(SDL_MOUSEMOTION);
         }
@@ -14640,7 +14977,7 @@ int main(int argc, char **argv) {
       if (next_result == SCRIPT_PLAY_NEXT_DONE) {
         if (mouse_captured && set_runtime_mouse_capture(window, false)) {
           mouse_captured = false;
-          mouse_dx_accum = 0;
+          mouse_dx_accum = 0.0;
           suppress_mouse_fire_until_button_up = false;
           SDL_FlushEvent(SDL_MOUSEMOTION);
         }
