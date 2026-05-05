@@ -36,14 +36,17 @@
          GLOOM1P.SAV
          GLOOM2P.SAV
 
-       The game autosaves every five campaign levels. When a save is
-       written, GAME SAVED appears on screen.
+       The game autosaves at every campaign level for save-game testing.
+       When a save is written, GAME SAVED appears on screen.
 
        The main menu shows LOAD ONE PLAYER AUTOSAVE and LOAD TWO PLAYER
        AUTOSAVE under the matching new-game options. Each load option is
        drawn dark until that autosave exists. The pause menu loads the
        autosave matching the current one-player or two-player game. Combat
        games are not autosaved.
+
+       New games and level transitions show the original Amiga script
+       text before the next level loads.
 
      RESOLUTION OPTIONS
 

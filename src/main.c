@@ -571,6 +571,10 @@ typedef struct {
   char text[192];
 } ScriptCompletion;
 
+typedef struct {
+  char text[192];
+} ScriptLevelIntro;
+
 typedef enum {
   SCRIPT_PLAY_NEXT_ERROR = 0,
   SCRIPT_PLAY_NEXT_MAP = 1,
@@ -4398,6 +4402,58 @@ static void free_flat_texture_set(FlatTextureSet *set) {
   memset(set, 0, sizeof(*set));
 }
 
+static bool clone_flat_texture(const FlatTexture *source, FlatTexture *destination) {
+  enum { FLAT_TEXEL_BYTES = GLOOM_FLAT_TEXTURE_SIZE * GLOOM_FLAT_TEXTURE_SIZE };
+
+  if (source == NULL || destination == NULL || !source->loaded || source->texels == NULL) {
+    return false;
+  }
+
+  free_flat_texture(destination);
+  *destination = *source;
+  destination->texels = NULL;
+#ifdef GLOOM_DOS_SDL3
+  destination->shaded_texels = NULL;
+#endif
+
+  destination->texels = (uint8_t *)malloc((size_t)FLAT_TEXEL_BYTES);
+  if (destination->texels == NULL) {
+    memset(destination, 0, sizeof(*destination));
+    return false;
+  }
+  memcpy(destination->texels, source->texels, (size_t)FLAT_TEXEL_BYTES);
+
+#ifdef GLOOM_DOS_SDL3
+  if (source->shaded_texels != NULL) {
+    size_t shaded_count = 16u * (size_t)FLAT_TEXEL_BYTES;
+
+    destination->shaded_texels = (uint8_t *)malloc(shaded_count);
+    if (destination->shaded_texels == NULL) {
+      free_flat_texture(destination);
+      return false;
+    }
+    memcpy(destination->shaded_texels, source->shaded_texels, shaded_count);
+  }
+#endif
+
+  return true;
+}
+
+static bool clone_flat_texture_set(const FlatTextureSet *source, FlatTextureSet *destination) {
+  if (source == NULL || destination == NULL || source->tile_tag[0] == '\0') {
+    return false;
+  }
+
+  free_flat_texture_set(destination);
+  if (!clone_flat_texture(&source->floor, &destination->floor) ||
+      !clone_flat_texture(&source->roof, &destination->roof)) {
+    free_flat_texture_set(destination);
+    return false;
+  }
+  (void)snprintf(destination->tile_tag, sizeof(destination->tile_tag), "%s", source->tile_tag);
+  return true;
+}
+
 static bool map_leaf_name(const char *path, char *out_name, size_t out_name_size) {
   const char *leaf = path;
   const char *p = path;
@@ -4444,14 +4500,13 @@ static bool copy_script_token(char *out, size_t out_size, const char *line, size
   return true;
 }
 
+static bool load_game_script_blob(uint8_t **out_script, size_t *out_script_size);
+
 static bool resolve_script_tile_tag_for_map(const char *map_path, char *out_tag, size_t out_tag_size) {
-  const char *script_candidates[2] = {"amiga/misc/script", "amiga/data/misc/script"};
   char map_name[64] = {0};
   char current_tile[32] = {0};
   uint8_t *script = NULL;
   size_t script_size = 0u;
-  size_t candidate_index = 0u;
-  char error[256] = {0};
 
   if (!map_leaf_name(map_path, map_name, sizeof(map_name)) || out_tag == NULL || out_tag_size == 0u) {
     return false;
@@ -4471,29 +4526,8 @@ static bool resolve_script_tile_tag_for_map(const char *map_path, char *out_tag,
     return true;
   }
 
-  for (candidate_index = 0u; candidate_index < sizeof(script_candidates) / sizeof(script_candidates[0]); ++candidate_index) {
-    char resolved_path[1024] = {0};
-
-    if (!resolve_runtime_file_path(script_candidates[candidate_index], resolved_path, sizeof(resolved_path))) {
-      continue;
-    }
-
-    if (!read_binary_blob(resolved_path, &script, &script_size)) {
-      continue;
-    }
-
-    if (!gloom_decrunch_crm_buffer(&script, &script_size, error, sizeof(error))) {
-      fprintf(stderr, "Failed to decrunch script %s: %s\n", resolved_path, error[0] ? error : "unknown error");
-      free(script);
-      return false;
-    }
-
-    break;
-  }
-
-  if (script == NULL || script_size == 0u) {
+  if (!load_game_script_blob(&script, &script_size)) {
     fprintf(stderr, "Unable to load game script for tile selection\n");
-    free(script);
     return false;
   }
 
@@ -4558,6 +4592,8 @@ static bool resolve_script_tile_tag_for_map(const char *map_path, char *out_tag,
 
 static bool load_game_script_blob(uint8_t **out_script, size_t *out_script_size) {
   const char *script_candidates[2] = {"amiga/misc/script", "amiga/data/misc/script"};
+  static uint8_t *cached_script = NULL;
+  static size_t cached_script_size = 0u;
   size_t candidate_index = 0u;
   char error[256] = {0};
 
@@ -4567,6 +4603,19 @@ static bool load_game_script_blob(uint8_t **out_script, size_t *out_script_size)
 
   *out_script = NULL;
   *out_script_size = 0u;
+
+  if (cached_script != NULL && cached_script_size > 0u) {
+    uint8_t *script_copy = (uint8_t *)malloc(cached_script_size);
+
+    if (script_copy == NULL) {
+      fprintf(stderr, "Unable to copy cached game script (%zu bytes)\n", cached_script_size);
+      return false;
+    }
+    memcpy(script_copy, cached_script, cached_script_size);
+    *out_script = script_copy;
+    *out_script_size = cached_script_size;
+    return true;
+  }
 
   for (candidate_index = 0u; candidate_index < sizeof(script_candidates) / sizeof(script_candidates[0]); ++candidate_index) {
     char resolved_path[1024] = {0};
@@ -4585,8 +4634,17 @@ static bool load_game_script_blob(uint8_t **out_script, size_t *out_script_size)
       return false;
     }
 
+    cached_script = script;
+    cached_script_size = script_size;
+
+    script = (uint8_t *)malloc(cached_script_size);
+    if (script == NULL) {
+      fprintf(stderr, "Unable to copy cached game script (%zu bytes)\n", cached_script_size);
+      return false;
+    }
+    memcpy(script, cached_script, cached_script_size);
     *out_script = script;
-    *out_script_size = script_size;
+    *out_script_size = cached_script_size;
     return true;
   }
 
@@ -4651,6 +4709,69 @@ static bool script_play_ordinal_for_map(const char *map_path, uint32_t *out_ordi
   return false;
 }
 
+static bool resolve_script_level_intro_for_map(const char *map_path, ScriptLevelIntro *out_intro) {
+  char map_name[64] = {0};
+  char current_text[sizeof(((ScriptLevelIntro *)0)->text)] = {0};
+  uint8_t *script = NULL;
+  size_t script_size = 0u;
+  size_t pos = 0u;
+
+  if (!map_leaf_name(map_path, map_name, sizeof(map_name)) || out_intro == NULL) {
+    return false;
+  }
+  memset(out_intro, 0, sizeof(*out_intro));
+
+  if (!load_game_script_blob(&script, &script_size)) {
+    return false;
+  }
+
+  while (pos < script_size) {
+    size_t line_start = pos;
+    size_t line_len = 0u;
+    const char *line = NULL;
+
+    while (pos < script_size && script[pos] != '\n') {
+      pos += 1u;
+    }
+
+    line = (const char *)script + line_start;
+    line_len = pos - line_start;
+    if (pos < script_size && script[pos] == '\n') {
+      pos += 1u;
+    }
+
+    while (line_len > 0u && (*line == ' ' || *line == '\t')) {
+      line += 1;
+      line_len -= 1u;
+    }
+    while (line_len > 0u && (line[line_len - 1u] == '\r' || line[line_len - 1u] == ' ' || line[line_len - 1u] == '\t')) {
+      line_len -= 1u;
+    }
+
+    if (line_len > 5u && memcmp(line, "text_", 5u) == 0) {
+      if (!copy_script_token(current_text, sizeof(current_text), line + 5u, line_len - 5u)) {
+        free(script);
+        return false;
+      }
+    } else if (line_len > 5u && memcmp(line, "play_", 5u) == 0) {
+      const char *script_map_name = line + 5u;
+      size_t script_map_len = line_len - 5u;
+
+      if (script_map_len == strlen(map_name) && memcmp(script_map_name, map_name, script_map_len) == 0) {
+        if (current_text[0] != '\0') {
+          (void)snprintf(out_intro->text, sizeof(out_intro->text), "%s", current_text);
+        }
+        free(script);
+        return out_intro->text[0] != '\0';
+      }
+    }
+  }
+
+  fprintf(stderr, "No script intro text found for map %s\n", map_name);
+  free(script);
+  return false;
+}
+
 #if GLOOM_RUNTIME_IS_BINARY
 #define GLOOM_AUTOSAVE_ONE_PLAYER_FILE "GLOOM1P.SAV"
 #define GLOOM_AUTOSAVE_TWO_PLAYER_FILE "GLOOM2P.SAV"
@@ -4699,18 +4820,18 @@ static void trim_autosave_line(char *line) {
   }
 }
 
-static bool write_gloom_autosave(const AppState *state, const char *resolved_map_path, uint32_t script_ordinal) {
+static bool write_gloom_autosave_record(const GloomAutosaveData *save) {
   const char *save_path = NULL;
   FILE *file = NULL;
 
-  if (state == NULL || resolved_map_path == NULL || resolved_map_path[0] == '\0') {
-    fprintf(stderr, "Cannot autosave: missing current game state or map path\n");
+  if (save == NULL || save->map_path[0] == '\0') {
+    fprintf(stderr, "Cannot autosave: missing save data or map path\n");
     return false;
   }
-  if (state->combat_mode) {
+  if (save->combat_mode) {
     return false;
   }
-  save_path = gloom_autosave_path_for_mode(state->two_player_mode);
+  save_path = gloom_autosave_path_for_mode(save->two_player_mode);
 
   file = fopen(save_path, "w");
   if (file == NULL) {
@@ -4719,22 +4840,82 @@ static bool write_gloom_autosave(const AppState *state, const char *resolved_map
   }
 
   fprintf(file, "GLOOM_AUTOSAVE 1\n");
-  fprintf(file, "map=%s\n", resolved_map_path);
-  fprintf(file, "script_ordinal=%lu\n", (unsigned long)script_ordinal);
-  fprintf(file, "two_player=%d\n", state->two_player_mode ? 1 : 0);
-  fprintf(file, "combat=%d\n", state->combat_mode ? 1 : 0);
-  fprintf(file, "violence=%u\n", (unsigned)state->violence_mode);
-  fprintf(file, "barrel_origin=%d\n", state->barrel_projectile_origin ? 1 : 0);
-  fprintf(file, "p1=%d,%d,%u,%u\n", (int)state->player_hitpoints, (int)state->player_lives,
-          (unsigned)state->player_weapon, (unsigned)state->player_reload);
-  fprintf(file, "p2=%d,%d,%u,%u\n", (int)state->player2.player_hitpoints, (int)state->player2.player_lives,
-          (unsigned)state->player2.player_weapon, (unsigned)state->player2.player_reload);
+  fprintf(file, "map=%s\n", save->map_path);
+  fprintf(file, "script_ordinal=%lu\n", (unsigned long)save->script_ordinal);
+  fprintf(file, "two_player=%d\n", save->two_player_mode ? 1 : 0);
+  fprintf(file, "combat=%d\n", save->combat_mode ? 1 : 0);
+  fprintf(file, "violence=%u\n", (unsigned)save->violence_mode);
+  fprintf(file, "barrel_origin=%d\n", save->barrel_projectile_origin ? 1 : 0);
+  fprintf(file, "p1=%d,%d,%u,%u\n", (int)save->player_hitpoints, (int)save->player_lives,
+          (unsigned)save->player_weapon, (unsigned)save->player_reload);
+  fprintf(file, "p2=%d,%d,%u,%u\n", (int)save->player2_hitpoints, (int)save->player2_lives,
+          (unsigned)save->player2_weapon, (unsigned)save->player2_reload);
 
   if (fclose(file) != 0) {
     fprintf(stderr, "Cannot finish autosave %s: %s\n", save_path, strerror(errno));
     return false;
   }
   return true;
+}
+
+static bool write_gloom_autosave(const AppState *state, const char *resolved_map_path, uint32_t script_ordinal) {
+  GloomAutosaveData save;
+
+  if (state == NULL || resolved_map_path == NULL || resolved_map_path[0] == '\0') {
+    fprintf(stderr, "Cannot autosave: missing current game state or map path\n");
+    return false;
+  }
+  if (state->combat_mode) {
+    return false;
+  }
+
+  memset(&save, 0, sizeof(save));
+  (void)snprintf(save.map_path, sizeof(save.map_path), "%s", resolved_map_path);
+  save.script_ordinal = script_ordinal;
+  save.two_player_mode = state->two_player_mode;
+  save.combat_mode = state->combat_mode;
+  save.violence_mode = state->violence_mode;
+  save.barrel_projectile_origin = state->barrel_projectile_origin;
+  save.player_hitpoints = state->player_hitpoints;
+  save.player_lives = state->player_lives;
+  save.player_weapon = state->player_weapon;
+  save.player_reload = state->player_reload;
+  save.player2_hitpoints = state->player2.player_hitpoints;
+  save.player2_lives = state->player2.player_lives;
+  save.player2_weapon = state->player2.player_weapon;
+  save.player2_reload = state->player2.player_reload;
+  return write_gloom_autosave_record(&save);
+}
+
+static bool write_gloom_autosave_for_scriptplay(const char *next_map_path, uint32_t script_ordinal,
+                                                bool two_player_mode, uint8_t violence_mode,
+                                                bool barrel_projectile_origin, int16_t player_hitpoints,
+                                                int16_t player_lives, uint8_t player_weapon, uint8_t player_reload,
+                                                int16_t player2_hitpoints, int16_t player2_lives,
+                                                uint8_t player2_weapon, uint8_t player2_reload) {
+  GloomAutosaveData save;
+
+  if (next_map_path == NULL || next_map_path[0] == '\0') {
+    fprintf(stderr, "Cannot autosave next script map: missing map path\n");
+    return false;
+  }
+
+  memset(&save, 0, sizeof(save));
+  (void)snprintf(save.map_path, sizeof(save.map_path), "%s", next_map_path);
+  save.script_ordinal = script_ordinal;
+  save.two_player_mode = two_player_mode;
+  save.combat_mode = false;
+  save.violence_mode = violence_mode;
+  save.barrel_projectile_origin = barrel_projectile_origin;
+  save.player_hitpoints = player_hitpoints;
+  save.player_lives = player_lives;
+  save.player_weapon = player_weapon;
+  save.player_reload = player_reload;
+  save.player2_hitpoints = player2_hitpoints;
+  save.player2_lives = player2_lives;
+  save.player2_weapon = player2_weapon;
+  save.player2_reload = player2_reload;
+  return write_gloom_autosave_record(&save);
 }
 
 static bool read_gloom_autosave(bool two_player_mode, GloomAutosaveData *out_save) {
@@ -5050,18 +5231,24 @@ static bool load_flat_texture(const char *kind, const char *tile_tag, FlatTextur
   return true;
 }
 
-static bool load_flat_texture_set_for_map(const char *map_path, FlatTextureSet *set) {
+static bool load_flat_texture_set_for_map_reusing(const char *map_path, FlatTextureSet *set,
+                                                  const FlatTextureSet *reuse_set) {
   char tile_tag[32] = {0};
 
   if (map_path == NULL || set == NULL) {
     return false;
   }
 
-  free_flat_texture_set(set);
-
   if (!resolve_script_tile_tag_for_map(map_path, tile_tag, sizeof(tile_tag))) {
     return false;
   }
+
+  if (reuse_set != NULL && strcmp(reuse_set->tile_tag, tile_tag) == 0 && clone_flat_texture_set(reuse_set, set)) {
+    printf("Reused script tile_%s floor/roof textures\n", set->tile_tag);
+    return true;
+  }
+
+  free_flat_texture_set(set);
 
   if (!load_flat_texture("floor", tile_tag, &set->floor)) {
     free_flat_texture_set(set);
@@ -5076,6 +5263,10 @@ static bool load_flat_texture_set_for_map(const char *map_path, FlatTextureSet *
   (void)snprintf(set->tile_tag, sizeof(set->tile_tag), "%s", tile_tag);
   printf("Loaded script tile_%s floor/roof textures\n", set->tile_tag);
   return true;
+}
+
+static bool load_flat_texture_set_for_map(const char *map_path, FlatTextureSet *set) {
+  return load_flat_texture_set_for_map_reusing(map_path, set, NULL);
 }
 
 static uint32_t sample_wall_texture_argb_ex(const WallTextureSet *set, uint8_t texture_index, float u, float v,
@@ -5440,6 +5631,63 @@ static void free_object_visual(ObjectVisual *visual) {
   memset(visual, 0, sizeof(*visual));
 }
 
+static bool clone_object_visual(const ObjectVisual *source, ObjectVisual *destination) {
+  size_t frame_index = 0u;
+
+  if (source == NULL || destination == NULL || !source->loaded || source->frames == NULL ||
+      source->frame_count == 0u) {
+    return false;
+  }
+
+  free_object_visual(destination);
+  *destination = *source;
+  destination->frames = NULL;
+
+  destination->frames = (ObjectFrame *)calloc(source->frame_count, sizeof(*destination->frames));
+  if (destination->frames == NULL) {
+    memset(destination, 0, sizeof(*destination));
+    return false;
+  }
+
+  for (frame_index = 0u; frame_index < source->frame_count; ++frame_index) {
+    const ObjectFrame *src_frame = &source->frames[frame_index];
+    ObjectFrame *dst_frame = &destination->frames[frame_index];
+    size_t pixel_count = 0u;
+
+    *dst_frame = *src_frame;
+    dst_frame->argb_pixels = NULL;
+#ifdef GLOOM_DOS_SDL3
+    dst_frame->indexed_pixels = NULL;
+#endif
+
+    if (src_frame->width <= 0 || src_frame->height <= 0 || src_frame->argb_pixels == NULL) {
+      free_object_visual(destination);
+      return false;
+    }
+    pixel_count = (size_t)src_frame->width * (size_t)src_frame->height;
+
+    dst_frame->argb_pixels = (uint32_t *)malloc(pixel_count * sizeof(*dst_frame->argb_pixels));
+    if (dst_frame->argb_pixels == NULL) {
+      free_object_visual(destination);
+      return false;
+    }
+    memcpy(dst_frame->argb_pixels, src_frame->argb_pixels, pixel_count * sizeof(*dst_frame->argb_pixels));
+
+#ifdef GLOOM_DOS_SDL3
+    if (src_frame->indexed_pixels != NULL) {
+      dst_frame->indexed_pixels = (uint8_t *)malloc(pixel_count * sizeof(*dst_frame->indexed_pixels));
+      if (dst_frame->indexed_pixels == NULL) {
+        free_object_visual(destination);
+        return false;
+      }
+      memcpy(dst_frame->indexed_pixels, src_frame->indexed_pixels, pixel_count * sizeof(*dst_frame->indexed_pixels));
+    }
+#endif
+  }
+
+  return true;
+}
+
 static void free_object_visual_set(ObjectVisualSet *set) {
   size_t i = 0u;
 
@@ -5632,7 +5880,8 @@ fail:
   return false;
 }
 
-static bool load_object_visual_set_for_map(const GloomMap *map, ObjectVisualSet *set) {
+static bool load_object_visual_set_for_map_reusing(const GloomMap *map, ObjectVisualSet *set,
+                                                   const ObjectVisualSet *reuse_set) {
   const ObjectVisualDefinition *definitions = object_visual_definitions();
   uint8_t needed[GLOOM_OBJECT_TYPE_COUNT] = {0};
   size_t i = 0u;
@@ -5663,7 +5912,12 @@ static bool load_object_visual_set_for_map(const GloomMap *map, ObjectVisualSet 
       continue;
     }
 
-    if (!load_object_visual_from_asset(asset_name, &definitions[i], &set->visuals[i])) {
+    if (reuse_set != NULL && reuse_set->visuals[i].loaded) {
+      if (!clone_object_visual(&reuse_set->visuals[i], &set->visuals[i])) {
+        free_object_visual_set(set);
+        return false;
+      }
+    } else if (!load_object_visual_from_asset(asset_name, &definitions[i], &set->visuals[i])) {
       free_object_visual_set(set);
       return false;
     }
@@ -5671,7 +5925,12 @@ static bool load_object_visual_set_for_map(const GloomMap *map, ObjectVisualSet 
       ObjectVisualDefinition chunk_definition = {object_chunk_asset_name((int16_t)i), false, definitions[i].scale, 0u,
                                                  false};
 
-      if (!load_object_visual_from_asset(chunk_definition.asset_name, &chunk_definition, &set->chunks[i])) {
+      if (reuse_set != NULL && reuse_set->chunks[i].loaded) {
+        if (!clone_object_visual(&reuse_set->chunks[i], &set->chunks[i])) {
+          free_object_visual_set(set);
+          return false;
+        }
+      } else if (!load_object_visual_from_asset(chunk_definition.asset_name, &chunk_definition, &set->chunks[i])) {
         free_object_visual_set(set);
         return false;
       }
@@ -5681,6 +5940,10 @@ static bool load_object_visual_set_for_map(const GloomMap *map, ObjectVisualSet 
 
   printf("Loaded %zu object visual bindings from real object assets\n", loaded_count);
   return true;
+}
+
+static bool load_object_visual_set_for_map(const GloomMap *map, ObjectVisualSet *set) {
+  return load_object_visual_set_for_map_reusing(map, set, NULL);
 }
 
 static void free_weapon_visual_set(WeaponVisualSet *set) {
@@ -13223,6 +13486,43 @@ static void render_menu_text_brightness(RenderFramebuffer *framebuffer, const Hu
   }
 }
 
+static size_t copy_wrapped_menu_line(char *out, size_t out_size, const char *text, size_t text_len,
+                                     size_t max_chars) {
+  size_t len = 0u;
+  size_t consumed = 0u;
+
+  if (out == NULL || out_size == 0u || text == NULL || text_len == 0u) {
+    return 0u;
+  }
+  if (max_chars == 0u) {
+    max_chars = 1u;
+  }
+
+  len = text_len;
+  if (len > max_chars) {
+    size_t break_pos = max_chars;
+
+    while (break_pos > 0u && text[break_pos] != ' ') {
+      break_pos -= 1u;
+    }
+    if (break_pos == 0u) {
+      break_pos = max_chars;
+    }
+    len = break_pos;
+  }
+  if (len >= out_size) {
+    len = out_size - 1u;
+  }
+  memcpy(out, text, len);
+  out[len] = '\0';
+
+  consumed = len;
+  while (consumed < text_len && text[consumed] == ' ') {
+    consumed += 1u;
+  }
+  return consumed;
+}
+
 static void render_player_weapon_status(RenderFramebuffer *framebuffer, const AppState *state, const HudFont *hud_font,
                                         int x, int y, int w, int h) {
   int slot = 0;
@@ -15275,6 +15575,219 @@ static bool run_completion_screen(SDL_Renderer *renderer, RenderFramebuffer *fra
   return true;
 }
 
+static void render_script_intro_text(RenderFramebuffer *framebuffer, const HudFont *font, const char *text,
+                                     int render_width, int render_height) {
+  char line[96];
+  const char *cursor = text;
+  int scale = 1;
+  size_t max_chars = 1u;
+  int line_count = 0;
+  int line_index = 0;
+  int start_y = 0;
+
+  if (framebuffer == NULL) {
+    return;
+  }
+  framebuffer_clear(framebuffer, 0xFF000000u);
+  if (font == NULL || text == NULL || text[0] == '\0') {
+    return;
+  }
+
+  scale = menu_pixel_scale_for_viewport(render_width, render_height);
+  while (scale > 1 && (GLOOM_MENU_BIG_FONT_HEIGHT * scale * 3) > render_height) {
+    scale -= 1;
+  }
+  if (render_width > GLOOM_MENU_BIG_FONT_WIDTH * scale * 2) {
+    max_chars = (size_t)((render_width - (GLOOM_MENU_BIG_FONT_WIDTH * scale * 2)) /
+                         (GLOOM_MENU_BIG_FONT_WIDTH * scale));
+  }
+
+  while (*cursor != '\0') {
+    size_t segment_len = 0u;
+    size_t segment_pos = 0u;
+
+    while (cursor[segment_len] != '\0' && cursor[segment_len] != '\\') {
+      segment_len += 1u;
+    }
+    while (segment_pos < segment_len) {
+      size_t consumed = copy_wrapped_menu_line(line, sizeof(line), cursor + segment_pos, segment_len - segment_pos,
+                                               max_chars);
+      if (consumed == 0u) {
+        break;
+      }
+      line_count += 1;
+      segment_pos += consumed;
+    }
+    cursor += segment_len;
+    if (*cursor == '\\') {
+      cursor += 1;
+    }
+  }
+  if (line_count <= 0) {
+    line_count = 1;
+  }
+  start_y = (render_height / 2) - ((line_count * GLOOM_MENU_BIG_FONT_HEIGHT * scale) / 2);
+  if (start_y < GLOOM_MENU_BIG_FONT_HEIGHT * scale) {
+    start_y = GLOOM_MENU_BIG_FONT_HEIGHT * scale;
+  }
+
+  cursor = text;
+  while (*cursor != '\0') {
+    size_t segment_len = 0u;
+    size_t segment_pos = 0u;
+
+    while (cursor[segment_len] != '\0' && cursor[segment_len] != '\\') {
+      segment_len += 1u;
+    }
+    while (segment_pos < segment_len) {
+      size_t consumed = copy_wrapped_menu_line(line, sizeof(line), cursor + segment_pos, segment_len - segment_pos,
+                                               max_chars);
+      if (consumed == 0u) {
+        break;
+      }
+      render_menu_text(framebuffer, font, line, render_width / 2,
+                       start_y + (line_index * GLOOM_MENU_BIG_FONT_HEIGHT * scale), scale);
+      line_index += 1;
+      segment_pos += consumed;
+    }
+    cursor += segment_len;
+    if (*cursor == '\\') {
+      cursor += 1;
+    }
+  }
+}
+
+static bool run_script_intro_screen(SDL_Renderer *renderer, RenderFramebuffer *framebuffer,
+                                    const ScriptLevelIntro *intro, int render_width, int render_height) {
+  static HudFont font;
+  static bool font_loaded = false;
+  bool running = true;
+  uint64_t intro_start = 0u;
+  uint64_t performance_frequency = 0u;
+#ifdef GLOOM_DOS_SDL3
+  const double minimum_seconds = 0.0;
+  const double auto_continue_seconds = 2.0;
+#else
+  const double minimum_seconds = 5.0;
+  const double auto_continue_seconds = 5.0;
+#endif
+
+  if (renderer == NULL || framebuffer == NULL || intro == NULL || intro->text[0] == '\0') {
+    return true;
+  }
+  runtime_prepare_menu_input();
+  if (!font_loaded) {
+    memset(&font, 0, sizeof(font));
+    if (!load_menu_big_font(&font)) {
+      return false;
+    }
+    font_loaded = true;
+  }
+#ifdef GLOOM_DOS_SDL3
+  apply_dos_menu_display_palette(framebuffer, NULL, NULL, &font);
+#endif
+  intro_start = SDL_GetPerformanceCounter();
+  performance_frequency = SDL_GetPerformanceFrequency();
+
+  while (running) {
+    SDL_Event event;
+    const uint8_t *keyboard = NULL;
+    double elapsed = 0.0;
+    bool can_continue = true;
+
+    if (performance_frequency > 0u) {
+      uint64_t now = SDL_GetPerformanceCounter();
+
+      elapsed = (double)(now - intro_start) / (double)performance_frequency;
+    }
+    can_continue = elapsed >= minimum_seconds;
+
+    while (SDL_PollEvent(&event) != 0) {
+      gamepad_handle_event(&event);
+      if (event.type == SDL_QUIT) {
+        return false;
+      }
+      if ((event.type == SDL_KEYDOWN && event.key.repeat == 0) ||
+          (runtime_menu_accepts_mouse() && event.type == SDL_MOUSEBUTTONDOWN) ||
+          event.type == SDL_CONTROLLERBUTTONDOWN) {
+        if (can_continue) {
+          running = false;
+        }
+      }
+    }
+    SDL_PumpEvents();
+    keyboard = SDL_GetKeyboardState(NULL);
+    if (can_continue && keyboard != NULL &&
+        (keyboard[SDL_SCANCODE_SPACE] || keyboard[SDL_SCANCODE_RETURN] || keyboard[SDL_SCANCODE_KP_ENTER] ||
+         keyboard[SDL_SCANCODE_LCTRL] || keyboard[SDL_SCANCODE_RCTRL] || keyboard[SDL_SCANCODE_ESCAPE])) {
+      running = false;
+    }
+    if (running && elapsed >= auto_continue_seconds) {
+      running = false;
+    }
+
+    if (begin_render_framebuffer(framebuffer)) {
+      render_script_intro_text(framebuffer, &font, intro->text, render_width, render_height);
+      end_render_framebuffer(framebuffer);
+      SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+      SDL_RenderClear(renderer);
+      {
+        SDL_Rect dst = {0, 0, render_width, render_height};
+        (void)SDL_RenderCopy(renderer, framebuffer->texture, NULL, &dst);
+      }
+      SDL_RenderPresent(renderer);
+    }
+    SDL_Delay(1);
+  }
+
+  return true;
+}
+
+#ifdef GLOOM_DOS_SDL3
+static void pixelate_dos_locked_framebuffer(RenderFramebuffer *framebuffer, int pixsize) {
+  int block = pixsize;
+  int y = 0;
+
+  if (framebuffer == NULL || framebuffer->index_pixels == NULL || framebuffer->width <= 0 || framebuffer->height <= 0 ||
+      framebuffer->index_pitch_pixels < framebuffer->width) {
+    return;
+  }
+  if (block <= 1) {
+    return;
+  }
+
+  for (y = 0; y < framebuffer->height; y += block) {
+    int h = block;
+    int sample_y = 0;
+    int x = 0;
+
+    if (y + h > framebuffer->height) {
+      h = framebuffer->height - y;
+    }
+    sample_y = y + (h / 2);
+
+    for (x = 0; x < framebuffer->width; x += block) {
+      int w = block;
+      int row = 0;
+      int sample_x = 0;
+      uint8_t sample = 0u;
+
+      if (x + w > framebuffer->width) {
+        w = framebuffer->width - x;
+      }
+      sample_x = x + (w / 2);
+      sample = framebuffer->index_pixels[((size_t)sample_y * (size_t)framebuffer->index_pitch_pixels) +
+                                         (size_t)sample_x];
+
+      for (row = 0; row < h; ++row) {
+        memset(framebuffer->index_pixels + (((size_t)y + (size_t)row) * (size_t)framebuffer->index_pitch_pixels) +
+                   (size_t)x,
+               sample, (size_t)w);
+      }
+    }
+  }
+}
+#else
 static bool render_pixelate_texture(SDL_Renderer *renderer, SDL_Texture *texture, int render_width, int render_height,
                                     int pixsize) {
   int block = pixsize;
@@ -15327,6 +15840,7 @@ static bool render_pixelate_texture(SDL_Renderer *renderer, SDL_Texture *texture
 
   return true;
 }
+#endif
 
 static void render(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const AppState *state,
                    const GridOffsetSet *grid_offsets,
@@ -15390,6 +15904,11 @@ static void render(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const
   (void)notice_text;
 #endif
   snapshot_render_framebuffer(framebuffer);
+#ifdef GLOOM_DOS_SDL3
+  if (pixsize > 1) {
+    pixelate_dos_locked_framebuffer(framebuffer, pixsize);
+  }
+#endif
   end_render_framebuffer(framebuffer);
 
   profile_start_ms = profile_now_ms();
@@ -15398,6 +15917,14 @@ static void render(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const
   SDL_RenderClear(renderer);
 #endif
 
+#ifdef GLOOM_DOS_SDL3
+  {
+    SDL_Rect dst = {0, 0, render_width, render_height};
+    if (SDL_RenderCopy(renderer, framebuffer->texture, NULL, &dst) != 0) {
+      fprintf(stderr, "Cannot render DOS indexed framebuffer texture: %s\n", SDL_GetError());
+    }
+  }
+#else
   if (pixsize > 1) {
     if (!render_pixelate_texture(renderer, framebuffer->texture, render_width, render_height, pixsize)) {
       fprintf(stderr, "Cannot render pixelate transition: SDL_RenderCopy failed: %s\n", SDL_GetError());
@@ -15408,6 +15935,7 @@ static void render(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const
       fprintf(stderr, "Cannot render PC framebuffer texture: %s\n", SDL_GetError());
     }
   }
+#endif
 
   SDL_RenderPresent(renderer);
   profile_add_elapsed(&g_profiler.render_present_ms, profile_start_ms);
@@ -17782,7 +18310,7 @@ static bool load_runtime_level(const char *map_path, AppState *state, WallTextur
     return false;
   }
 
-  if (!load_flat_texture_set_for_map(resolved, &next_flat_textures)) {
+  if (!load_flat_texture_set_for_map_reusing(resolved, &next_flat_textures, flat_textures)) {
     free_wall_texture_set(&next_wall_textures);
     gloom_map_free(&next_state->map);
     return false;
@@ -17795,7 +18323,7 @@ static bool load_runtime_level(const char *map_path, AppState *state, WallTextur
     return false;
   }
 
-  if (!load_object_visual_set_for_map(&next_state->map, &next_object_visuals)) {
+  if (!load_object_visual_set_for_map_reusing(&next_state->map, &next_object_visuals, object_visuals)) {
     free_flat_texture_set(&next_flat_textures);
     free_wall_texture_set(&next_wall_textures);
     gloom_map_free(&next_state->map);
@@ -17848,6 +18376,7 @@ static bool load_runtime_level(const char *map_path, AppState *state, WallTextur
   *flat_textures = next_flat_textures;
   *object_visuals = next_object_visuals;
 #ifdef GLOOM_DOS_SDL3
+  dos_restore_game_index_palette_tables();
   rebuild_dos_level_index_mappings(wall_textures, flat_textures, object_visuals);
 #endif
 
@@ -18025,6 +18554,7 @@ static int run_level_transition_selftest(void) {
   char next_map_path[1024] = {0};
   char resolved_map_path[1024] = {0};
   ScriptCompletion completion;
+  ScriptLevelIntro intro;
   MenuImage completion_image;
   int16_t preserved_lives = 1;
   int16_t preserved_p2_lives = 3;
@@ -18033,6 +18563,7 @@ static int run_level_transition_selftest(void) {
   int result = 1;
 
   memset(&completion, 0, sizeof(completion));
+  memset(&intro, 0, sizeof(intro));
   memset(&completion_image, 0, sizeof(completion_image));
   state = (AppState *)calloc(1u, sizeof(*state));
   wall_textures = (WallTextureSet *)calloc(1u, sizeof(*wall_textures));
@@ -18053,6 +18584,16 @@ static int run_level_transition_selftest(void) {
   if (strcmp(next_map_path, "amiga/data/maps/map1_2") != 0) {
     fprintf(stderr, "Level transition selftest failed: map1_1 advanced to %s instead of amiga/data/maps/map1_2\n",
             next_map_path);
+    goto cleanup;
+  }
+  if (!resolve_script_level_intro_for_map("amiga/maps/map1_1", &intro) ||
+      strcmp(intro.text, "simple stuff!\\watch out for ambushes though...") != 0) {
+    fprintf(stderr, "Level transition selftest failed: original map1_1 intro text was not resolved\n");
+    goto cleanup;
+  }
+  if (!resolve_script_level_intro_for_map(next_map_path, &intro) ||
+      strcmp(intro.text, "stay alert! watch out for aggro skinheads!") != 0) {
+    fprintf(stderr, "Level transition selftest failed: original map1_2 intro text was not resolved\n");
     goto cleanup;
   }
   if (resolve_next_script_play_map_or_done("amiga/maps/map4_7", next_map_path, sizeof(next_map_path), &completion) !=
@@ -18224,6 +18765,17 @@ static bool run_menu_and_restart_game(SDL_Renderer *renderer, RenderFramebuffer 
       fprintf(stderr, "Failed to pick original combat map\n");
       return false;
     }
+  }
+  if (!*io_combat_mode) {
+    ScriptLevelIntro intro;
+
+    if (!resolve_script_level_intro_for_map(first_map_path, &intro) ||
+        !run_script_intro_screen(renderer, framebuffer, &intro, render_width, render_height)) {
+      return false;
+    }
+#ifdef GLOOM_DOS_SDL3
+    refresh_dos_index_palette(framebuffer, gloom_dos_window);
+#endif
   }
   if (!load_runtime_level(first_map_path, state, wall_textures, flat_textures, object_visuals, previous_zones,
                           render_zones, false, 0, 0, 0u, 0u, 0, 0, 0u, 0u, barrel_projectile_origin,
@@ -19209,6 +19761,33 @@ int main(int argc, char **argv) {
         return 1;
       }
     }
+    if (!combat_mode && menu_game_mode != GLOOM_GAME_MODE_LOAD_ONE_PLAYER &&
+        menu_game_mode != GLOOM_GAME_MODE_LOAD_TWO_PLAYER) {
+      ScriptLevelIntro intro;
+
+      if (!resolve_script_level_intro_for_map(selected_map_path, &intro) ||
+          !run_script_intro_screen(renderer, &framebuffer, &intro, render_width, render_height)) {
+        free_render_framebuffer(&framebuffer);
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        audio_shutdown(&g_audio);
+        gamepad_shutdown();
+        SDL_Quit();
+        free(previous_zones);
+        free(render_zones);
+        free_hud_font(&hud_font);
+        free_weapon_visual_set(&weapon_visuals);
+        free_grid_offset_set(&grid_offsets);
+        free_object_visual_set(&object_visuals);
+        free_flat_texture_set(&flat_textures);
+        free_wall_texture_set(&wall_textures);
+        gloom_map_free(&state.map);
+        return 1;
+      }
+#ifdef GLOOM_DOS_SDL3
+      refresh_dos_index_palette(&framebuffer, window);
+#endif
+    }
     {
       if (menu_game_mode != GLOOM_GAME_MODE_LOAD_ONE_PLAYER && menu_game_mode != GLOOM_GAME_MODE_LOAD_TWO_PLAYER &&
           !load_runtime_level(selected_map_path, &state, &wall_textures, &flat_textures, &object_visuals,
@@ -19641,6 +20220,40 @@ int main(int argc, char **argv) {
         share_levelover_two_player_lives(&preserved_lives, &preserved_p2_lives);
       }
 
+      {
+        ScriptLevelIntro intro;
+
+        if (mouse_captured && set_runtime_mouse_capture(window, false)) {
+          mouse_captured = false;
+          mouse_dx_accum = 0.0;
+          suppress_mouse_fire_until_button_up = false;
+          SDL_FlushEvent(SDL_MOUSEMOTION);
+        }
+        if (!resolve_script_level_intro_for_map(next_map_path, &intro) ||
+            !run_script_intro_screen(renderer, &framebuffer, &intro, render_width, render_height)) {
+          running = false;
+          continue;
+        }
+      }
+#ifdef GLOOM_DOS_SDL3
+      refresh_dos_index_palette(&framebuffer, window);
+#endif
+#if GLOOM_RUNTIME_IS_BINARY
+      {
+        uint32_t script_ordinal = 0u;
+
+        if (script_play_ordinal_for_map(next_map_path, &script_ordinal) && script_ordinal > 0u &&
+            write_gloom_autosave_for_scriptplay(next_map_path, script_ordinal, transition_two_player_mode,
+                                                violence_mode, barrel_projectile_origin, preserved_hitpoints,
+                                                preserved_lives, preserved_weapon, preserved_reload,
+                                                preserved_p2_hitpoints, preserved_p2_lives, preserved_p2_weapon,
+                                                preserved_p2_reload)) {
+          (void)snprintf(autosave_notice, sizeof(autosave_notice), "GAME SAVED");
+          autosave_notice_timer = 2.0;
+        }
+      }
+#endif
+
       if (!load_runtime_level(next_map_path, &state, &wall_textures, &flat_textures, &object_visuals,
                                previous_zones, render_zones, true, preserved_hitpoints, preserved_lives,
                                preserved_weapon, preserved_reload, preserved_p2_hitpoints, preserved_p2_lives,
@@ -19652,20 +20265,10 @@ int main(int argc, char **argv) {
       }
 
       resolved_map_path = map_path_buffer;
-#if GLOOM_RUNTIME_IS_BINARY
-      {
-        uint32_t script_ordinal = 0u;
-
-        if (script_play_ordinal_for_map(resolved_map_path, &script_ordinal) && script_ordinal > 0u &&
-            (script_ordinal % 5u) == 0u && write_gloom_autosave(&state, resolved_map_path, script_ordinal)) {
-          (void)snprintf(autosave_notice, sizeof(autosave_notice), "GAME SAVED");
-          autosave_notice_timer = 2.0;
-        }
-      }
-#endif
 #ifdef GLOOM_DOS_SDL3
       refresh_dos_index_palette(&framebuffer, window);
 #endif
+      mouse_captured = set_gameplay_start_mouse_capture(window);
       previous_state = state;
       if (previous_zones != NULL) {
         previous_state.map.zones = previous_zones;
