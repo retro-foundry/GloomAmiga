@@ -18,6 +18,33 @@ if (-not (Test-Path -LiteralPath $sdlLib)) {
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 $env:Path = "$djgppBin;$env:Path"
 
+$runtimeDirs = @(
+  'maps',
+  'data\maps',
+  'txts',
+  'data\txts',
+  'objs',
+  'data\objs',
+  'prog\objs',
+  'misc',
+  'sfxs',
+  'ggfx'
+)
+
+foreach ($runtimeDir in $runtimeDirs) {
+  $sourceDir = Join-Path $repoRoot "amiga\$runtimeDir"
+  $destDir = Join-Path $outDir "amiga\$runtimeDir"
+  if (Test-Path -LiteralPath $sourceDir) {
+    New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+    Get-ChildItem -LiteralPath $sourceDir -Force | Copy-Item -Destination $destDir -Recurse -Force
+  }
+}
+
+$dosMiscDir = Join-Path $outDir 'amiga\misc'
+New-Item -ItemType Directory -Force -Path $dosMiscDir | Out-Null
+Copy-Item -LiteralPath (Join-Path $repoRoot 'amiga\misc\palette_8') -Destination (Join-Path $dosMiscDir 'PAL8.BIN') -Force
+Copy-Item -LiteralPath (Join-Path $repoRoot 'amiga\misc\remap_8') -Destination (Join-Path $dosMiscDir 'RMAP8.BIN') -Force
+
 Push-Location $repoRoot
 try {
   & (Join-Path $djgppBin 'i586-pc-msdosdjgpp-gcc.exe') `

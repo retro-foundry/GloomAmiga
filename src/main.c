@@ -70,8 +70,12 @@ enum {
   GLOOM_LEVEL_EXIT_EVENT_ID = 24,
   GLOOM_LEVEL_COMPLETE_FINISHED = 3,
   GLOOM_COMBAT_ROUND_FINISHED = 4,
-  GLOOM_AMIGA_FOCAL_SHIFT = 6,
+  GLOOM_AMIGA_FOCAL_SHIFT = 7,
   GLOOM_AMIGA_FOCAL = 1 << GLOOM_AMIGA_FOCAL_SHIFT,
+  /* The PC renderer scales from its established 106x80 viewport reference; keep it
+     separate from the Amiga internal focshft value above to avoid FOV drift. */
+  GLOOM_PC_VIEW_FOCAL_SHIFT = 6,
+  GLOOM_PC_VIEW_FOCAL = 1 << GLOOM_PC_VIEW_FOCAL_SHIFT,
   GLOOM_AMIGA_VIEW_COLUMNS = 106,
   GLOOM_AMIGA_VIEW_ROWS = 80,
   GLOOM_AMIGA_DARK_SHIFT = 7,
@@ -505,6 +509,7 @@ typedef struct {
 #ifdef GLOOM_DOS_SDL3
   SDL_Palette *index_palette;
   uint8_t *index_pixels;
+  uint8_t *index_coverage;
 #endif
   uint32_t *pixels;
   uint32_t *last_frame_pixels;
@@ -957,13 +962,9 @@ static uint8_t g_depth_subtract_values[GLOOM_AMIGA_MAX_Z];
 #ifdef GLOOM_DOS_SDL3
 static bool g_dos_index_palette_initialized = false;
 static bool g_dos_index_palette_dirty = false;
-static bool g_dos_index_palette_overflow_warned = false;
-static bool g_dos_rgb444_remap_dirty = true;
-static size_t g_dos_index_palette_count = 1u;
 static SDL_Color g_dos_index_palette_colors[256];
 static uint32_t g_dos_index_palette_argb[256];
 static uint8_t g_dos_rgb444_to_index[4096];
-static uint8_t g_dos_rgb444_to_opaque_index[4096];
 static uint8_t g_dos_red_palette_indices[256];
 #endif
 
@@ -2586,20 +2587,6 @@ static void dos_set_index_palette_entry(size_t index, uint32_t argb) {
   g_dos_index_palette_argb[index] = 0xFF000000u | ((uint32_t)r << 16u) | ((uint32_t)g << 8u) | (uint32_t)b;
 }
 
-static uint32_t dos_palette_distance(uint32_t a, uint32_t b) {
-  int ar = (int)((a >> 16u) & 0xFFu);
-  int ag = (int)((a >> 8u) & 0xFFu);
-  int ab = (int)(a & 0xFFu);
-  int br = (int)((b >> 16u) & 0xFFu);
-  int bg = (int)((b >> 8u) & 0xFFu);
-  int bb = (int)(b & 0xFFu);
-  int dr = ar - br;
-  int dg = ag - bg;
-  int db = ab - bb;
-
-  return (uint32_t)((dr * dr) + (dg * dg) + (db * db));
-}
-
 static uint16_t dos_argb_to_rgb444(uint32_t argb) {
   uint32_t r = (((argb >> 16u) & 0xFFu) + 8u) / 17u;
   uint32_t g = (((argb >> 8u) & 0xFFu) + 8u) / 17u;
@@ -2611,133 +2598,99 @@ static uint16_t dos_argb_to_rgb444(uint32_t argb) {
   return (uint16_t)((r << 8u) | (g << 4u) | b);
 }
 
+static void dos_fail_missing_original_palette_table(const char *path) {
+  dos_logf("Missing original AGA palette/remap table %s required by amiga/gloom2.s calcpalettes", path);
+  fprintf(stderr, "Missing original AGA palette/remap table %s required by amiga/gloom2.s calcpalettes\n", path);
+  exit(1);
+}
+
+static bool dos_read_original_table_candidates(const char *const *candidates, size_t candidate_count,
+                                               uint8_t **out_data, size_t *out_size) {
+  size_t i = 0u;
+
+  if (candidates == NULL || out_data == NULL || out_size == NULL) {
+    return false;
+  }
+
+  for (i = 0u; i < candidate_count; ++i) {
+    char resolved_path[1024] = {0};
+
+    if (candidates[i] == NULL) {
+      continue;
+    }
+    if (resolve_runtime_file_path(candidates[i], resolved_path, sizeof(resolved_path)) &&
+        read_binary_blob(resolved_path, out_data, out_size)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 static void initialize_dos_index_palette_tables(void) {
+  const char *palette_candidates[4] = {"amiga/misc/PAL8.BIN", "misc/PAL8.BIN", "amiga/misc/palette_8",
+                                       "misc/palette_8"};
+  const char *remap_candidates[4] = {"amiga/misc/RMAP8.BIN", "misc/RMAP8.BIN", "amiga/misc/remap_8",
+                                     "misc/remap_8"};
+  uint8_t *palette_data = NULL;
+  uint8_t *remap_data = NULL;
+  size_t palette_size = 0u;
+  size_t remap_size = 0u;
   size_t i = 0u;
 
   if (g_dos_index_palette_initialized) {
     return;
   }
 
+  if (!dos_read_original_table_candidates(palette_candidates, sizeof(palette_candidates) / sizeof(palette_candidates[0]),
+                                          &palette_data, &palette_size) ||
+      palette_size < 1024u) {
+    free(palette_data);
+    dos_fail_missing_original_palette_table("amiga/misc/palette_8");
+  }
+  if (!dos_read_original_table_candidates(remap_candidates, sizeof(remap_candidates) / sizeof(remap_candidates[0]),
+                                          &remap_data, &remap_size) ||
+      remap_size < 4096u) {
+    free(palette_data);
+    free(remap_data);
+    dos_fail_missing_original_palette_table("amiga/misc/remap_8");
+  }
+
   for (i = 0u; i < 256u; ++i) {
-    dos_set_index_palette_entry(i, 0xFF000000u);
+    const uint8_t *entry = palette_data + (i * 4u);
+    uint16_t hi = main_read_be16(entry);
+    uint16_t lo = main_read_be16(entry + 2u);
+    uint8_t r = (uint8_t)(((hi & 0x0F00u) >> 4u) | ((lo & 0x0F00u) >> 8u));
+    uint8_t g = (uint8_t)((hi & 0x00F0u) | ((lo & 0x00F0u) >> 4u));
+    uint8_t b = (uint8_t)(((hi & 0x000Fu) << 4u) | (lo & 0x000Fu));
+
+    dos_set_index_palette_entry(i, 0xFF000000u | ((uint32_t)r << 16u) | ((uint32_t)g << 8u) | (uint32_t)b);
     g_dos_red_palette_indices[i] = 0u;
   }
+  memcpy(g_dos_rgb444_to_index, remap_data, 4096u);
 
-  g_dos_index_palette_count = 1u;
   g_dos_index_palette_dirty = true;
-  g_dos_rgb444_remap_dirty = true;
-  g_dos_index_palette_overflow_warned = false;
   g_dos_index_palette_initialized = true;
-}
-
-static uint8_t dos_find_palette_index_slow(uint32_t argb, bool allow_zero) {
-  size_t first_index = allow_zero ? 0u : 1u;
-  size_t i = 0u;
-  size_t best_index = allow_zero ? 0u : 1u;
-  uint32_t best_distance = UINT32_MAX;
-
-  initialize_dos_index_palette_tables();
-  argb = dos_opaque_argb(argb);
-
-  if (first_index >= g_dos_index_palette_count) {
-    return 0u;
-  }
-
-  for (i = first_index; i < g_dos_index_palette_count; ++i) {
-    if (g_dos_index_palette_argb[i] == argb) {
-      return (uint8_t)i;
-    }
-  }
-
-  for (i = first_index; i < g_dos_index_palette_count; ++i) {
-    uint32_t distance = dos_palette_distance(argb, g_dos_index_palette_argb[i]);
-
-    if (distance < best_distance) {
-      best_distance = distance;
-      best_index = i;
-      if (distance == 0u) {
-        break;
-      }
-    }
-  }
-
-  return (uint8_t)best_index;
-}
-
-static void dos_rebuild_rgb444_remap(void) {
-  uint32_t code = 0u;
-
-  initialize_dos_index_palette_tables();
-  if (!g_dos_rgb444_remap_dirty) {
-    return;
-  }
-
-  for (code = 0u; code < 4096u; ++code) {
-    uint32_t r = ((code >> 8u) & 0x0Fu) * 17u;
-    uint32_t g = ((code >> 4u) & 0x0Fu) * 17u;
-    uint32_t b = (code & 0x0Fu) * 17u;
-    uint32_t argb = 0xFF000000u | (r << 16u) | (g << 8u) | b;
-
-    g_dos_rgb444_to_index[code] = dos_find_palette_index_slow(argb, true);
-    g_dos_rgb444_to_opaque_index[code] = dos_find_palette_index_slow(argb, false);
-  }
-  g_dos_rgb444_remap_dirty = false;
+  free(palette_data);
+  free(remap_data);
+  dos_logf("DOS indexed framebuffer: loaded original AGA misc/palette_8 and misc/remap_8");
 }
 
 static uint8_t dos_argb_to_index(uint32_t argb) {
   if ((uint8_t)(argb >> 24u) == 0u) {
     return 0u;
   }
-  dos_rebuild_rgb444_remap();
+  initialize_dos_index_palette_tables();
   return g_dos_rgb444_to_index[dos_argb_to_rgb444(argb)];
 }
 
 static uint8_t dos_argb_to_opaque_index(uint32_t argb) {
-  dos_rebuild_rgb444_remap();
-  return g_dos_rgb444_to_opaque_index[dos_argb_to_rgb444(argb)];
-}
-
-static uint8_t dos_register_palette_color(uint32_t argb) {
-  size_t i = 0u;
-
-  initialize_dos_index_palette_tables();
-  argb = dos_opaque_argb(argb);
-
-  for (i = 1u; i < g_dos_index_palette_count; ++i) {
-    if (g_dos_index_palette_argb[i] == argb) {
-      return (uint8_t)i;
-    }
-  }
-
-  if (g_dos_index_palette_count < 256u) {
-    size_t index = g_dos_index_palette_count++;
-
-    dos_set_index_palette_entry(index, argb);
-    g_dos_index_palette_dirty = true;
-    g_dos_rgb444_remap_dirty = true;
-    return (uint8_t)index;
-  }
-
-  if (!g_dos_index_palette_overflow_warned) {
-    dos_logf("DOS indexed framebuffer: original palette exceeded 255 opaque colors; nearest-match remap active");
-    g_dos_index_palette_overflow_warned = true;
-  }
-  return dos_find_palette_index_slow(argb, false);
+  return dos_argb_to_index(dos_opaque_argb(argb));
 }
 
 static void dos_register_source_palette(const uint32_t palette[256], const uint8_t palette_used[256]) {
-  size_t i = 0u;
-
-  if (palette == NULL) {
-    return;
-  }
-
-  for (i = 1u; i < 256u; ++i) {
-    if (palette_used != NULL && !palette_used[i]) {
-      continue;
-    }
-    (void)dos_register_palette_color(palette[i]);
-  }
+  (void)palette;
+  (void)palette_used;
 }
 
 static uint32_t dos_original_shade_palette_argb(uint32_t argb, int shade) {
@@ -2934,10 +2887,12 @@ static void build_dos_shaded_palette_indices(uint8_t shaded_indices[16][256], co
     size_t i = 0u;
 
     for (i = 0u; i < 256u; ++i) {
-      if (i == 0u || (palette_used != NULL && !palette_used[i])) {
+      if (palette_used != NULL && !palette_used[i]) {
         shaded_indices[shade][i] = 0u;
       } else {
-        shaded_indices[shade][i] = dos_argb_to_opaque_index(dos_original_shade_palette_argb(palette[i], (int)shade));
+        uint32_t argb = i == 0u ? 0xFFFFFFFFu : palette[i];
+
+        shaded_indices[shade][i] = dos_argb_to_index(dos_original_shade_palette_argb(argb, (int)shade));
       }
     }
   }
@@ -3040,34 +2995,11 @@ static void rebuild_dos_runtime_index_mappings(WallTextureSet *wall_textures, Fl
                                                ObjectVisualSet *object_visuals, WeaponVisualSet *weapon_visuals) {
   rebuild_dos_level_index_mappings(wall_textures, flat_textures, object_visuals);
   rebuild_dos_weapon_index_mappings(weapon_visuals);
-  dos_logf("DOS indexed framebuffer: original game palette has %u opaque colors",
-           (unsigned)(g_dos_index_palette_count > 0u ? g_dos_index_palette_count - 1u : 0u));
+  dos_logf("DOS indexed framebuffer: using original AGA misc/palette_8 and misc/remap_8 tables");
 }
 
 static void register_dos_hud_font_palette(const HudFont *font) {
-  size_t glyph_index = 0u;
-
-  if (font == NULL || !font->loaded) {
-    return;
-  }
-
-  for (glyph_index = 0u; glyph_index < font->glyph_count; ++glyph_index) {
-    const HudGlyph *glyph = &font->glyphs[glyph_index];
-    size_t pixel_count = 0u;
-    size_t pixel_index = 0u;
-
-    if (glyph->argb_pixels == NULL || glyph->width <= 0 || glyph->height <= 0) {
-      continue;
-    }
-    pixel_count = (size_t)glyph->width * (size_t)glyph->height;
-    for (pixel_index = 0u; pixel_index < pixel_count; ++pixel_index) {
-      uint32_t argb = glyph->argb_pixels[pixel_index];
-
-      if ((uint8_t)(argb >> 24u) != 0u) {
-        (void)dos_register_palette_color(argb);
-      }
-    }
-  }
+  (void)font;
 }
 #endif
 
@@ -4136,10 +4068,15 @@ static bool resolve_flat_texture_path(const char *kind, const char *tile_tag, ch
     return false;
   }
 
-  (void)snprintf(path0, sizeof(path0), "txts/%s%s", kind, tile_tag);
-  (void)snprintf(path1, sizeof(path1), "amiga/txts/%s%s", kind, tile_tag);
-  (void)snprintf(path2, sizeof(path2), "amiga/data/txts/%s%s", kind, tile_tag);
-  (void)snprintf(path3, sizeof(path3), "data/txts/%s%s", kind, tile_tag);
+  /*
+   * amiga/gloom2.s: scripttile builds "txts/floor<n>" and "txts/roof<n>".
+   * The shipped runtime data extracted from Disk 2 lives under amiga/data/txts;
+   * the top-level amiga/txts files are source/development copies for some tiles.
+   */
+  (void)snprintf(path0, sizeof(path0), "amiga/data/txts/%s%s", kind, tile_tag);
+  (void)snprintf(path1, sizeof(path1), "data/txts/%s%s", kind, tile_tag);
+  (void)snprintf(path2, sizeof(path2), "txts/%s%s", kind, tile_tag);
+  (void)snprintf(path3, sizeof(path3), "amiga/txts/%s%s", kind, tile_tag);
 
   candidates[0] = path0;
   candidates[1] = path1;
@@ -9667,6 +9604,7 @@ static void free_render_framebuffer(RenderFramebuffer *framebuffer) {
   if (framebuffer->index_palette != NULL) {
     SDL_DestroyPalette(framebuffer->index_palette);
   }
+  free(framebuffer->index_coverage);
 #endif
   free(framebuffer->last_frame_pixels);
   free(framebuffer->depth_buffer);
@@ -9691,6 +9629,7 @@ static bool ensure_render_framebuffer(SDL_Renderer *renderer, RenderFramebuffer 
   SDL_Texture *texture = NULL;
 #ifdef GLOOM_DOS_SDL3
   SDL_Palette *index_palette = NULL;
+  uint8_t *index_coverage = NULL;
 #endif
 
   if (renderer == NULL || framebuffer == NULL || width <= 0 || height <= 0) {
@@ -9707,13 +9646,14 @@ static bool ensure_render_framebuffer(SDL_Renderer *renderer, RenderFramebuffer 
 #else
   depth_buffer_int = (int32_t *)malloc((size_t)width * sizeof(*depth_buffer_int));
   sprite_depth_buffer_int = (int32_t *)malloc((size_t)width * sizeof(*sprite_depth_buffer_int));
+  index_coverage = (uint8_t *)calloc((size_t)width * (size_t)height, sizeof(*index_coverage));
 #endif
   filled_stamps = (uint32_t *)calloc((size_t)height, sizeof(*filled_stamps));
 #ifndef GLOOM_DOS_SDL3
   last_frame_pixels = (uint32_t *)malloc((size_t)width * (size_t)height * sizeof(*last_frame_pixels));
 #endif
 #ifdef GLOOM_DOS_SDL3
-  if (depth_buffer_int == NULL || sprite_depth_buffer_int == NULL || filled_stamps == NULL) {
+  if (depth_buffer_int == NULL || sprite_depth_buffer_int == NULL || filled_stamps == NULL || index_coverage == NULL) {
 #else
   if (depth_buffer == NULL || sprite_depth_buffer == NULL || filled_stamps == NULL || last_frame_pixels == NULL) {
 #endif
@@ -9723,6 +9663,7 @@ static bool ensure_render_framebuffer(SDL_Renderer *renderer, RenderFramebuffer 
 #ifdef GLOOM_DOS_SDL3
     free(depth_buffer_int);
     free(sprite_depth_buffer_int);
+    free(index_coverage);
 #endif
     free(filled_stamps);
     free(last_frame_pixels);
@@ -9741,6 +9682,7 @@ static bool ensure_render_framebuffer(SDL_Renderer *renderer, RenderFramebuffer 
 #ifdef GLOOM_DOS_SDL3
     free(depth_buffer_int);
     free(sprite_depth_buffer_int);
+    free(index_coverage);
 #endif
     free(filled_stamps);
     free(last_frame_pixels);
@@ -9753,6 +9695,7 @@ static bool ensure_render_framebuffer(SDL_Renderer *renderer, RenderFramebuffer 
     free(sprite_depth_buffer);
     free(depth_buffer_int);
     free(sprite_depth_buffer_int);
+    free(index_coverage);
     free(filled_stamps);
     free(last_frame_pixels);
     return false;
@@ -9765,6 +9708,7 @@ static bool ensure_render_framebuffer(SDL_Renderer *renderer, RenderFramebuffer 
   framebuffer->texture = texture;
 #ifdef GLOOM_DOS_SDL3
   framebuffer->index_palette = index_palette;
+  framebuffer->index_coverage = index_coverage;
 #endif
   framebuffer->last_frame_pixels = last_frame_pixels;
   framebuffer->depth_buffer = depth_buffer;
@@ -9908,6 +9852,9 @@ static void framebuffer_clear(RenderFramebuffer *framebuffer, uint32_t argb) {
     for (i = 0u; i < (size_t)framebuffer->height; ++i) {
       memset(framebuffer->index_pixels + (i * (size_t)framebuffer->index_pitch_pixels), index, count);
     }
+    if (framebuffer->index_coverage != NULL) {
+      memset(framebuffer->index_coverage, 0, (size_t)framebuffer->width * (size_t)framebuffer->height);
+    }
   }
 #else
   if (framebuffer->pixels == NULL || framebuffer->pitch_pixels < framebuffer->width) {
@@ -9954,6 +9901,9 @@ static void framebuffer_clear_row_span(RenderFramebuffer *framebuffer, int dst_y
   row = framebuffer->index_pixels + ((size_t)dst_y * (size_t)framebuffer->index_pitch_pixels) + (size_t)x;
   index = dos_argb_to_index(argb);
   memset(row, index, (size_t)w);
+  if (framebuffer->index_coverage != NULL) {
+    memset(framebuffer->index_coverage + ((size_t)dst_y * (size_t)framebuffer->width) + (size_t)x, 0, (size_t)w);
+  }
   (void)col;
 #else
   if (framebuffer->pixels == NULL || framebuffer->pitch_pixels < framebuffer->width) {
@@ -10063,7 +10013,7 @@ static float projection_focal_for_viewport(int w, int h) {
     scale = 0.01f;
   }
 
-  return (float)GLOOM_AMIGA_FOCAL * scale;
+  return (float)GLOOM_PC_VIEW_FOCAL * scale;
 }
 
 static void render_flat_textures(RenderFramebuffer *framebuffer, const AppState *state, const FlatTextureSet *flats, int x,
@@ -10159,6 +10109,7 @@ static void render_flat_textures(RenderFramebuffer *framebuffer, const AppState 
     int32_t world_x_step_fixed = 0;
     int32_t world_z_step_fixed = 0;
     uint8_t *dst_row = NULL;
+    uint8_t *coverage_row = NULL;
     int abs_centered_y = 0;
     int col = 0;
 
@@ -10197,10 +10148,14 @@ static void render_flat_textures(RenderFramebuffer *framebuffer, const AppState 
     world_x_step_fixed = ((view_x_step_fixed * cos_fixed) >> DOS_FLAT_TRIG_BITS);
     world_z_step_fixed = -((view_x_step_fixed * sin_fixed) >> DOS_FLAT_TRIG_BITS);
     dst_row = framebuffer->index_pixels + ((size_t)(y + row) * (size_t)framebuffer->index_pitch_pixels + (size_t)x);
+    coverage_row = framebuffer->index_coverage != NULL
+                       ? framebuffer->index_coverage +
+                             ((size_t)(y + row) * (size_t)framebuffer->width + (size_t)x)
+                       : NULL;
 
     if (skip_existing_pixels) {
       for (col = 0; col < w; ++col) {
-        if (dst_row[col] == 0u) {
+        if (coverage_row == NULL || coverage_row[col] == 0u) {
           int tx = (int)(world_x_fixed >> DOS_FLAT_FRAC_BITS) & (GLOOM_FLAT_TEXTURE_SIZE - 1);
           int tz = (int)(world_z_fixed >> DOS_FLAT_FRAC_BITS) & (GLOOM_FLAT_TEXTURE_SIZE - 1);
           uint8_t palette_index = texels[(tx * GLOOM_FLAT_TEXTURE_SIZE) + tz];
@@ -10217,6 +10172,9 @@ static void render_flat_textures(RenderFramebuffer *framebuffer, const AppState 
         uint8_t palette_index = texels[(tx * GLOOM_FLAT_TEXTURE_SIZE) + tz];
 
         dst_row[col] = palette[palette_index];
+        if (coverage_row != NULL) {
+          coverage_row[col] = 1u;
+        }
         world_x_fixed += world_x_step_fixed;
         world_z_fixed += world_z_step_fixed;
       }
@@ -10536,6 +10494,10 @@ static void render_wall_columns_dos_fixed(RenderFramebuffer *framebuffer, const 
           if (fast_wall_column) {
             uint8_t *dst = framebuffer->index_pixels + ((size_t)y0 * (size_t)framebuffer->index_pitch_pixels) +
                            (size_t)screen_x;
+            uint8_t *covered = framebuffer->index_coverage != NULL
+                                   ? framebuffer->index_coverage + ((size_t)y0 * (size_t)framebuffer->width) +
+                                         (size_t)screen_x
+                                   : NULL;
             uint32_t *stamp = filled_stamps + (y0 - y);
             bool column_drawn = false;
 
@@ -10549,8 +10511,14 @@ static void render_wall_columns_dos_fixed(RenderFramebuffer *framebuffer, const 
                 }
                 palette_index = wall_texels[wall_texel_base + ty];
                 *dst = wall_palette[palette_index];
+                if (covered != NULL) {
+                  *covered = 1u;
+                }
                 *stamp = filled_stamp;
                 dst += framebuffer->index_pitch_pixels;
+                if (covered != NULL) {
+                  covered += framebuffer->width;
+                }
                 stamp += 1;
                 tex_y_fixed += tex_y_step_fixed;
               }
@@ -10566,10 +10534,16 @@ static void render_wall_columns_dos_fixed(RenderFramebuffer *framebuffer, const 
                   }
                   palette_index = wall_texels[wall_texel_base + ty];
                   *dst = wall_palette[palette_index];
+                  if (covered != NULL) {
+                    *covered = 1u;
+                  }
                   *stamp = filled_stamp;
                   column_drawn = true;
                 }
                 dst += framebuffer->index_pitch_pixels;
+                if (covered != NULL) {
+                  covered += framebuffer->width;
+                }
                 stamp += 1;
                 tex_y_fixed += tex_y_step_fixed;
               }
@@ -10584,10 +10558,16 @@ static void render_wall_columns_dos_fixed(RenderFramebuffer *framebuffer, const 
                 palette_index = wall_texels[wall_texel_base + ty];
                 if (palette_index != 0u) {
                   *dst = wall_palette[palette_index];
+                  if (covered != NULL) {
+                    *covered = 1u;
+                  }
                   *stamp = filled_stamp;
                   column_drawn = true;
                 }
                 dst += framebuffer->index_pitch_pixels;
+                if (covered != NULL) {
+                  covered += framebuffer->width;
+                }
                 stamp += 1;
                 tex_y_fixed += tex_y_step_fixed;
               }
@@ -10603,11 +10583,17 @@ static void render_wall_columns_dos_fixed(RenderFramebuffer *framebuffer, const 
                   palette_index = wall_texels[wall_texel_base + ty];
                   if (palette_index != 0u) {
                     *dst = wall_palette[palette_index];
+                    if (covered != NULL) {
+                      *covered = 1u;
+                    }
                     *stamp = filled_stamp;
                     column_drawn = true;
                   }
                 }
                 dst += framebuffer->index_pitch_pixels;
+                if (covered != NULL) {
+                  covered += framebuffer->width;
+                }
                 stamp += 1;
                 tex_y_fixed += tex_y_step_fixed;
               }
@@ -10644,6 +10630,9 @@ static void render_wall_columns_dos_fixed(RenderFramebuffer *framebuffer, const 
 
               framebuffer->index_pixels[(size_t)draw_y * (size_t)framebuffer->index_pitch_pixels + (size_t)screen_x] =
                   color_index;
+              if (framebuffer->index_coverage != NULL) {
+                framebuffer->index_coverage[(size_t)draw_y * (size_t)framebuffer->width + (size_t)screen_x] = 1u;
+              }
               filled_stamps[draw_y - y] = filled_stamp;
 
               if (hit->depth < depth_buffer[i]) {
@@ -10832,6 +10821,10 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
   for (i = 0u; i < (size_t)h; ++i) {
     memset(framebuffer->index_pixels + ((size_t)(y + (int)i) * (size_t)framebuffer->index_pitch_pixels) + (size_t)x,
            0, (size_t)w);
+    if (framebuffer->index_coverage != NULL) {
+      memset(framebuffer->index_coverage + ((size_t)(y + (int)i) * (size_t)framebuffer->width) + (size_t)x, 0,
+             (size_t)w);
+    }
   }
   profile_add_elapsed(&g_profiler.render_lock_clear_ms, profile_start_ms);
 
@@ -14863,6 +14856,187 @@ static int run_menu_selftest(void) {
   return 0;
 }
 
+static int verify_texture_source_flat_selftest(const char *kind, const char *tag, size_t expected_raw_size,
+                                               size_t expected_decrunched_size, uint16_t expected_palette_count) {
+  enum { FLAT_TEXEL_BYTES = GLOOM_FLAT_TEXTURE_SIZE * GLOOM_FLAT_TEXTURE_SIZE };
+  char resolved_path[1024] = {0};
+  char expected_path[64] = {0};
+  uint8_t *data = NULL;
+  size_t raw_size = 0u;
+  size_t data_size = 0u;
+  char error[256] = {0};
+  uint16_t palette_count = 0u;
+
+  if (kind == NULL || tag == NULL) {
+    return 1;
+  }
+
+  (void)snprintf(expected_path, sizeof(expected_path), "amiga/data/txts/%s%s", kind, tag);
+  if (!resolve_flat_texture_path(kind, tag, resolved_path, sizeof(resolved_path)) ||
+      strstr(resolved_path, expected_path) == NULL) {
+    fprintf(stderr, "Texture source selftest failed: %s tile_%s did not prefer shipped amiga/data/txts\n", kind,
+            tag);
+    return 1;
+  }
+
+  if (!read_binary_blob(resolved_path, &data, &data_size)) {
+    fprintf(stderr, "Texture source selftest failed: could not read %s tile_%s\n", kind, tag);
+    free(data);
+    return 1;
+  }
+  raw_size = data_size;
+  if (!gloom_decrunch_crm_buffer(&data, &data_size, error, sizeof(error))) {
+    fprintf(stderr, "Texture source selftest failed: could not decrunch %s tile_%s: %s\n", kind, tag,
+            error[0] ? error : "unknown error");
+    free(data);
+    return 1;
+  }
+  if (data_size < (size_t)FLAT_TEXEL_BYTES + 2u) {
+    fprintf(stderr, "Texture source selftest failed: %s tile_%s is too small after decrunch\n", kind, tag);
+    free(data);
+    return 1;
+  }
+
+  palette_count = main_read_be16(data + (size_t)FLAT_TEXEL_BYTES);
+  if (raw_size != expected_raw_size || data_size != expected_decrunched_size ||
+      palette_count != expected_palette_count) {
+    fprintf(stderr,
+            "Texture source selftest failed: %s tile_%s is not the shipped Disk 2 flat "
+            "(raw=%zu decrunched=%zu palette=%u)\n",
+            kind, tag, raw_size, data_size, (unsigned)palette_count);
+    free(data);
+    return 1;
+  }
+
+  free(data);
+  return 0;
+}
+
+static int verify_script_tile_selftest(const char *map_path, const char *expected_tag) {
+  char tile_tag[32] = {0};
+
+  if (!resolve_script_tile_tag_for_map(map_path, tile_tag, sizeof(tile_tag)) ||
+      strcmp(tile_tag, expected_tag) != 0) {
+    fprintf(stderr, "Texture source selftest failed: %s resolved tile_%s instead of tile_%s\n", map_path,
+            tile_tag[0] ? tile_tag : "?", expected_tag);
+    return 1;
+  }
+
+  return 0;
+}
+
+static int run_texture_source_selftest(void) {
+  typedef struct {
+    const char *tag;
+    size_t floor_raw_size;
+    size_t roof_raw_size;
+    size_t decrunched_size;
+    uint16_t palette_count;
+  } ExpectedFlatTile;
+  static const ExpectedFlatTile expected_tiles[] = {
+      {"1", 3076u, 1754u, 16512u, 63u},
+      {"2", 1610u, 1674u, 16448u, 31u},
+      {"3", 1806u, 1642u, 16448u, 31u},
+  };
+  static const struct {
+    const char *map_path;
+    const char *tag;
+  } expected_script_tiles[] = {
+      {"amiga/data/maps/map1_1", "1"}, {"amiga/data/maps/map1_2", "1"}, {"amiga/data/maps/map1_3", "1"},
+      {"amiga/data/maps/map1_4", "1"}, {"amiga/data/maps/map1_5", "1"}, {"amiga/data/maps/map1_6", "1"},
+      {"amiga/data/maps/map1_7", "1"}, {"amiga/data/maps/map3_1", "2"}, {"amiga/data/maps/map3_2", "2"},
+      {"amiga/data/maps/map3_3", "2"}, {"amiga/data/maps/map3_4", "2"}, {"amiga/data/maps/map3_5", "2"},
+      {"amiga/data/maps/map3_6", "2"}, {"amiga/data/maps/map3_7", "2"}, {"amiga/data/maps/map4_1", "3"},
+      {"amiga/data/maps/map4_2", "3"}, {"amiga/data/maps/map4_3", "3"}, {"amiga/data/maps/map4_4", "3"},
+      {"amiga/data/maps/map4_5", "3"}, {"amiga/data/maps/map4_6", "3"}, {"amiga/data/maps/map4_7", "3"},
+  };
+  size_t i = 0u;
+
+  for (i = 0u; i < sizeof(expected_tiles) / sizeof(expected_tiles[0]); ++i) {
+    const ExpectedFlatTile *tile = &expected_tiles[i];
+
+    if (verify_texture_source_flat_selftest("floor", tile->tag, tile->floor_raw_size, tile->decrunched_size,
+                                            tile->palette_count) != 0 ||
+        verify_texture_source_flat_selftest("roof", tile->tag, tile->roof_raw_size, tile->decrunched_size,
+                                            tile->palette_count) != 0) {
+      return 1;
+    }
+  }
+
+  /*
+   * amiga/gloom2.s: scripttile/fetchrest chooses the active tile for scripted
+   * maps; pickcombat copies comseriesnum into floortag before loadtile.
+   */
+  for (i = 0u; i < sizeof(expected_script_tiles) / sizeof(expected_script_tiles[0]); ++i) {
+    if (verify_script_tile_selftest(expected_script_tiles[i].map_path, expected_script_tiles[i].tag) != 0) {
+      return 1;
+    }
+  }
+  {
+    int series = 0;
+    int map_index = 0;
+
+    for (series = 1; series <= 3; ++series) {
+      char expected_tag[2] = {(char)('0' + series), '\0'};
+
+      for (map_index = 1; map_index <= 7; ++map_index) {
+        char map_path[64] = {0};
+
+        (void)snprintf(map_path, sizeof(map_path), "amiga/data/maps/com%d_%d", series, map_index);
+        if (verify_script_tile_selftest(map_path, expected_tag) != 0) {
+          return 1;
+        }
+      }
+    }
+  }
+  for (i = 0u; i < sizeof(expected_script_tiles) / sizeof(expected_script_tiles[0]); ++i) {
+    FlatTextureSet flat_textures;
+
+    memset(&flat_textures, 0, sizeof(flat_textures));
+    if (!load_flat_texture_set_for_map(expected_script_tiles[i].map_path, &flat_textures)) {
+      fprintf(stderr, "Texture source selftest failed: could not load flats for %s\n",
+              expected_script_tiles[i].map_path);
+      free_flat_texture_set(&flat_textures);
+      return 1;
+    }
+    if (strcmp(flat_textures.tile_tag, expected_script_tiles[i].tag) != 0 || !flat_textures.floor.loaded ||
+        !flat_textures.roof.loaded) {
+      fprintf(stderr, "Texture source selftest failed: loaded wrong flat set for %s\n",
+              expected_script_tiles[i].map_path);
+      free_flat_texture_set(&flat_textures);
+      return 1;
+    }
+    free_flat_texture_set(&flat_textures);
+  }
+  {
+    int series = 0;
+
+    for (series = 1; series <= 3; ++series) {
+      char map_path[64] = {0};
+      char expected_tag[2] = {(char)('0' + series), '\0'};
+      FlatTextureSet flat_textures;
+
+      (void)snprintf(map_path, sizeof(map_path), "amiga/data/maps/com%d_1", series);
+      memset(&flat_textures, 0, sizeof(flat_textures));
+      if (!load_flat_texture_set_for_map(map_path, &flat_textures)) {
+        fprintf(stderr, "Texture source selftest failed: could not load combat flats for %s\n", map_path);
+        free_flat_texture_set(&flat_textures);
+        return 1;
+      }
+      if (strcmp(flat_textures.tile_tag, expected_tag) != 0 || !flat_textures.floor.loaded ||
+          !flat_textures.roof.loaded) {
+        fprintf(stderr, "Texture source selftest failed: loaded wrong combat flat set for %s\n", map_path);
+        free_flat_texture_set(&flat_textures);
+        return 1;
+      }
+      free_flat_texture_set(&flat_textures);
+    }
+  }
+
+  printf("Texture source selftest passed\n");
+  return 0;
+}
+
 static int run_wall_selftest(void) {
   static AppState state;
   GloomAnim anim;
@@ -14875,6 +15049,19 @@ static int run_wall_selftest(void) {
 
   memset(&state, 0, sizeof(state));
   memset(&anim, 0, sizeof(anim));
+  {
+    int expected_amiga_focal = 1 << 7;
+    int expected_pc_view_focal = 1 << 6;
+
+    if (GLOOM_AMIGA_FOCAL != expected_amiga_focal) {
+      fprintf(stderr, "Wall selftest failed: projection focal does not match amiga/gloom2.s focshft=7\n");
+      return 1;
+    }
+    if (GLOOM_PC_VIEW_FOCAL != expected_pc_view_focal) {
+      fprintf(stderr, "Wall selftest failed: PC viewport focal no longer matches the 106x80 FOV reference\n");
+      return 1;
+    }
+  }
   initialize_wall_texture_remap(&state);
   anim.frame_count = 3u;
   anim.first_frame = 10u;
@@ -16416,6 +16603,10 @@ int main(int argc, char **argv) {
 
   if (argc > 1 && strcmp(argv[1], "--menu-selftest") == 0) {
     return run_menu_selftest();
+  }
+
+  if (argc > 1 && strcmp(argv[1], "--texture-source-selftest") == 0) {
+    return run_texture_source_selftest();
   }
 
   if (argc > 1 && strcmp(argv[1], "--input-selftest") == 0) {
