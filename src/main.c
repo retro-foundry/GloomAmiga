@@ -15972,7 +15972,7 @@ static void render(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const
 #if GLOOM_RUNTIME_IS_BINARY
   if (notice_text != NULL && notice_text[0] != '\0') {
     int scale = menu_pixel_scale_for_viewport(render_width, render_height);
-    int y = (GLOOM_MENU_BIG_FONT_HEIGHT * scale) / 2;
+    int y = (render_height / 2) - ((GLOOM_MENU_BIG_FONT_HEIGHT * scale) / 2);
 
     render_menu_text_brightness(framebuffer, hud_font, notice_text, render_width / 2, y, scale, 255u);
   }
@@ -18485,21 +18485,30 @@ static bool load_runtime_level(const char *map_path, AppState *state, WallTextur
 }
 
 #if GLOOM_RUNTIME_IS_BINARY
-static bool load_autosaved_runtime_game(bool two_player_save, AppState *state, WallTextureSet *wall_textures,
-                                        FlatTextureSet *flat_textures,
+static bool load_autosaved_runtime_game(bool two_player_save, SDL_Renderer *renderer, RenderFramebuffer *framebuffer,
+                                        int render_width, int render_height, AppState *state,
+                                        WallTextureSet *wall_textures, FlatTextureSet *flat_textures,
                                         ObjectVisualSet *object_visuals, GloomZone *previous_zones,
                                         GloomZone *render_zones, bool *io_two_player_mode, bool *io_combat_mode,
                                         uint8_t *io_violence_mode, char *resolved_map_buffer,
                                         size_t resolved_map_buffer_size, const char **io_resolved_map_path) {
   GloomAutosaveData save;
+  ScriptLevelIntro intro;
 
-  if (state == NULL || wall_textures == NULL || flat_textures == NULL || object_visuals == NULL ||
-      previous_zones == NULL || render_zones == NULL || io_two_player_mode == NULL || io_combat_mode == NULL ||
-      io_violence_mode == NULL || resolved_map_buffer == NULL || resolved_map_buffer_size == 0u ||
+  if (renderer == NULL || framebuffer == NULL || state == NULL || wall_textures == NULL || flat_textures == NULL ||
+      object_visuals == NULL || previous_zones == NULL || render_zones == NULL || io_two_player_mode == NULL ||
+      io_combat_mode == NULL || io_violence_mode == NULL || resolved_map_buffer == NULL || resolved_map_buffer_size == 0u ||
       io_resolved_map_path == NULL) {
     return false;
   }
+  memset(&intro, 0, sizeof(intro));
   if (!read_gloom_autosave(two_player_save, &save)) {
+    return false;
+  }
+  if (!resolve_script_level_intro_for_map(save.map_path, &intro) ||
+      !run_script_intro_screen(renderer, framebuffer, &intro, render_width, render_height)) {
+    fprintf(stderr, "Cannot load autosave %s: failed to show original script intro for saved map %s\n",
+            gloom_autosave_path_for_mode(two_player_save), save.map_path);
     return false;
   }
 
@@ -18863,10 +18872,10 @@ static bool run_menu_and_restart_game(SDL_Renderer *renderer, RenderFramebuffer 
   if (menu_game_mode == GLOOM_GAME_MODE_LOAD_ONE_PLAYER || menu_game_mode == GLOOM_GAME_MODE_LOAD_TWO_PLAYER) {
     bool load_two_player = menu_game_mode == GLOOM_GAME_MODE_LOAD_TWO_PLAYER;
 
-    if (!load_autosaved_runtime_game(load_two_player, state, wall_textures, flat_textures, object_visuals,
-                                     previous_zones, render_zones, io_two_player_mode, io_combat_mode,
-                                     io_violence_mode, resolved_map_buffer, resolved_map_buffer_size,
-                                     io_resolved_map_path)) {
+    if (!load_autosaved_runtime_game(load_two_player, renderer, framebuffer, render_width, render_height, state,
+                                     wall_textures, flat_textures, object_visuals, previous_zones, render_zones,
+                                     io_two_player_mode, io_combat_mode, io_violence_mode, resolved_map_buffer,
+                                     resolved_map_buffer_size, io_resolved_map_path)) {
       return false;
     }
     return true;
@@ -19813,10 +19822,10 @@ int main(int argc, char **argv) {
     if (menu_game_mode == GLOOM_GAME_MODE_LOAD_ONE_PLAYER || menu_game_mode == GLOOM_GAME_MODE_LOAD_TWO_PLAYER) {
       bool load_two_player = menu_game_mode == GLOOM_GAME_MODE_LOAD_TWO_PLAYER;
 
-      if (!load_autosaved_runtime_game(load_two_player, &state, &wall_textures, &flat_textures, &object_visuals,
-                                       previous_zones, render_zones, &two_player_mode, &combat_mode,
-                                       &violence_mode, map_path_buffer, sizeof(map_path_buffer),
-                                       &resolved_map_path)) {
+      if (!load_autosaved_runtime_game(load_two_player, renderer, &framebuffer, render_width, render_height, &state,
+                                       &wall_textures, &flat_textures, &object_visuals, previous_zones, render_zones,
+                                       &two_player_mode, &combat_mode, &violence_mode, map_path_buffer,
+                                       sizeof(map_path_buffer), &resolved_map_path)) {
         fprintf(stderr, "Failed to load autosave from menu\n");
         free_render_framebuffer(&framebuffer);
         SDL_DestroyRenderer(renderer);
@@ -20122,10 +20131,10 @@ int main(int argc, char **argv) {
           suppress_mouse_fire_until_button_up = false;
           SDL_FlushEvent(SDL_MOUSEMOTION);
         }
-        if (!load_autosaved_runtime_game(state.two_player_mode, &state, &wall_textures, &flat_textures,
-                                         &object_visuals, previous_zones, render_zones, &two_player_mode,
-                                         &combat_mode, &violence_mode, map_path_buffer, sizeof(map_path_buffer),
-                                         &resolved_map_path)) {
+        if (!load_autosaved_runtime_game(state.two_player_mode, renderer, &framebuffer, render_width, render_height,
+                                         &state, &wall_textures, &flat_textures, &object_visuals, previous_zones,
+                                         render_zones, &two_player_mode, &combat_mode, &violence_mode,
+                                         map_path_buffer, sizeof(map_path_buffer), &resolved_map_path)) {
           running = false;
           continue;
         }
