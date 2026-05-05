@@ -53,7 +53,11 @@ enum {
   DEFAULT_WINDOW_WIDTH = 1280,
   DEFAULT_WINDOW_HEIGHT = 720,
   GLOOM_AMIGA_GAME_TICK_HZ = 25,
+#ifdef GLOOM_DOS_SDL3
+  FIXED_TICK_HZ = 25,
+#else
   FIXED_TICK_HZ = 60,
+#endif
   GLOOM_TEXTURE_SCREENS = 8,
   GLOOM_TEXTURES_PER_SCREEN = 20,
   GLOOM_TOTAL_WALL_TEXTURES = GLOOM_TEXTURE_SCREENS * GLOOM_TEXTURES_PER_SCREEN,
@@ -498,6 +502,10 @@ typedef struct {
 
 typedef struct {
   SDL_Texture *texture;
+#ifdef GLOOM_DOS_SDL3
+  SDL_Palette *index_palette;
+  uint8_t *index_pixels;
+#endif
   uint32_t *pixels;
   uint32_t *last_frame_pixels;
   float *depth_buffer;
@@ -508,6 +516,9 @@ typedef struct {
 #endif
   uint32_t *filled_stamps;
   uint32_t filled_stamp;
+#ifdef GLOOM_DOS_SDL3
+  int index_pitch_pixels;
+#endif
   int pitch_pixels;
   int width;
   int height;
@@ -615,6 +626,11 @@ typedef struct {
   char source_name[64];
   uint32_t palette[256];
   uint32_t shaded_palette[16][256];
+#ifdef GLOOM_DOS_SDL3
+  uint8_t shaded_indices[16][256];
+  uint8_t palette_used[256];
+  uint8_t *column_texels;
+#endif
   uint8_t *texels;
   uint8_t *column_flags;
   size_t texture_count;
@@ -630,6 +646,10 @@ typedef struct {
   char source_name[64];
   uint32_t palette[256];
   uint32_t shaded_palette[16][256];
+#ifdef GLOOM_DOS_SDL3
+  uint8_t shaded_indices[16][256];
+  uint8_t palette_used[256];
+#endif
   uint8_t *texels;
 } FlatTexture;
 
@@ -663,6 +683,8 @@ typedef struct {
   char source_name[64];
 #ifdef GLOOM_DOS_SDL3
   uint32_t shaded_palette[16][256];
+  uint8_t shaded_indices[16][256];
+  uint8_t palette_used[256];
 #endif
   ObjectFrame *frames;
 } ObjectVisual;
@@ -802,7 +824,7 @@ typedef struct {
   int source_pad;
   const ObjectFrame *frame;
 #ifdef GLOOM_DOS_SDL3
-  const uint32_t (*shaded_palette)[256];
+  const uint8_t (*shaded_indices)[256];
 #endif
 } DebugSprite;
 
@@ -811,12 +833,36 @@ typedef struct {
   SDL_JoystickID instance_id;
 } RuntimeGamepad;
 
+typedef struct {
+  bool enabled;
+  uint32_t target_frames;
+  uint32_t frames;
+  uint64_t update_steps;
+  uint64_t wall_candidates;
+  uint64_t sprites;
+  double frame_ms;
+  double events_ms;
+  double update_ms;
+  double interpolate_ms;
+  double render_ms;
+  double render_lock_clear_ms;
+  double render_flat_ms;
+  double render_wall_ms;
+  double render_wall_search_ms;
+  double render_wall_draw_ms;
+  double render_sprites_ms;
+  double render_weapon_ms;
+  double render_hud_ms;
+  double render_red_ms;
+  double render_present_ms;
+} RuntimeProfiler;
+
 static float clampf(float value, float lo, float hi);
 #ifdef GLOOM_DOS_SDL3
 static int32_t dos_float_to_fixed16(float value);
-static int dos_fixed16_floor_to_int(int32_t value);
-static int32_t dos_div_fixed16(int64_t numerator_fixed, int32_t denominator_fixed);
-static int32_t dos_fixed16_clamp_unit(int32_t value);
+static inline int dos_fixed16_floor_to_int(int32_t value);
+static inline int32_t dos_div_fixed16(int64_t numerator_fixed, int32_t denominator_fixed);
+static inline int32_t dos_fixed16_clamp_unit(int32_t value);
 #endif
 static int32_t amiga_rotation_to_fixed(int16_t rotation);
 static float amiga_rotation_to_radians(int16_t rotation);
@@ -904,9 +950,22 @@ static bool g_dos_mouse_absolute_capture = false;
 static bool g_dos_mouse_absolute_valid = false;
 static float g_dos_mouse_absolute_x = 0.0f;
 #endif
+static RuntimeProfiler g_profiler;
 static bool g_depth_tables_initialized = false;
 static uint8_t g_depth_dark_indices[GLOOM_AMIGA_MAX_Z];
 static uint8_t g_depth_subtract_values[GLOOM_AMIGA_MAX_Z];
+#ifdef GLOOM_DOS_SDL3
+static bool g_dos_index_palette_initialized = false;
+static bool g_dos_index_palette_dirty = false;
+static bool g_dos_index_palette_overflow_warned = false;
+static bool g_dos_rgb444_remap_dirty = true;
+static size_t g_dos_index_palette_count = 1u;
+static SDL_Color g_dos_index_palette_colors[256];
+static uint32_t g_dos_index_palette_argb[256];
+static uint8_t g_dos_rgb444_to_index[4096];
+static uint8_t g_dos_rgb444_to_opaque_index[4096];
+static uint8_t g_dos_red_palette_indices[256];
+#endif
 
 static uint64_t sim_ticks_to_amiga_ticks(uint64_t ticks) {
   return (ticks * (uint64_t)GLOOM_AMIGA_GAME_TICK_HZ) / (uint64_t)FIXED_TICK_HZ;
@@ -2360,6 +2419,9 @@ static void free_wall_texture_set(WallTextureSet *set) {
   for (i = 0; i < GLOOM_TEXTURE_SCREENS; ++i) {
     free(set->screens[i].texels);
     free(set->screens[i].column_flags);
+#ifdef GLOOM_DOS_SDL3
+    free(set->screens[i].column_texels);
+#endif
   }
 
   memset(set, 0, sizeof(*set));
@@ -2376,9 +2438,15 @@ static bool clone_wall_texture_screen(const WallTextureScreen *source, WallTextu
 
   free(destination->texels);
   free(destination->column_flags);
+#ifdef GLOOM_DOS_SDL3
+  free(destination->column_texels);
+#endif
   *destination = *source;
   destination->texels = NULL;
   destination->column_flags = NULL;
+#ifdef GLOOM_DOS_SDL3
+  destination->column_texels = NULL;
+#endif
 
   texel_count = source->texture_count * (size_t)GLOOM_TEXTURE_WIDTH * (size_t)GLOOM_TEXTURE_HEIGHT;
   flag_count = source->texture_count * (size_t)GLOOM_TEXTURE_WIDTH;
@@ -2390,10 +2458,25 @@ static bool clone_wall_texture_screen(const WallTextureScreen *source, WallTextu
   }
   memcpy(destination->texels, source->texels, texel_count * sizeof(*destination->texels));
 
+#ifdef GLOOM_DOS_SDL3
+  if (source->column_texels != NULL) {
+    destination->column_texels = (uint8_t *)malloc(texel_count * sizeof(*destination->column_texels));
+    if (destination->column_texels == NULL) {
+      free(destination->texels);
+      memset(destination, 0, sizeof(*destination));
+      return false;
+    }
+    memcpy(destination->column_texels, source->column_texels, texel_count * sizeof(*destination->column_texels));
+  }
+#endif
+
   if (source->column_flags != NULL) {
     destination->column_flags = (uint8_t *)malloc(flag_count * sizeof(*destination->column_flags));
     if (destination->column_flags == NULL) {
       free(destination->texels);
+#ifdef GLOOM_DOS_SDL3
+      free(destination->column_texels);
+#endif
       memset(destination, 0, sizeof(*destination));
       return false;
     }
@@ -2412,13 +2495,19 @@ static void set_default_texture_palette(uint32_t palette[256]) {
   }
 }
 
-static void load_packed_palette(uint32_t palette[256], const uint8_t *data, size_t data_size, size_t palette_offset) {
+static size_t load_packed_palette_with_used(uint32_t palette[256], const uint8_t *data, size_t data_size,
+                                            size_t palette_offset, uint8_t palette_used[256]) {
   size_t color_count = 0u;
   size_t entry_offset = palette_offset + 2u;
   size_t color_index = 1u;
 
+  if (palette_used != NULL) {
+    memset(palette_used, 0, 256u * sizeof(*palette_used));
+    palette_used[0] = 1u;
+  }
+
   if (palette == NULL || data == NULL || palette_offset + 2u > data_size) {
-    return;
+    return 1u;
   }
 
   color_count = (size_t)main_read_be16(data + palette_offset);
@@ -2430,11 +2519,20 @@ static void load_packed_palette(uint32_t palette[256], const uint8_t *data, size
       uint8_t g = (uint8_t)(((packed >> 4) & 0x0Fu) * 17u);
       uint8_t b = (uint8_t)((packed & 0x0Fu) * 17u);
       palette[color_index] = 0xFF000000u | ((uint32_t)r << 16u) | ((uint32_t)g << 8u) | (uint32_t)b;
+      if (palette_used != NULL) {
+        palette_used[color_index] = 1u;
+      }
     }
 
     entry_offset += 2u;
     color_index += 1u;
   }
+
+  return color_index > 0u ? color_index : 1u;
+}
+
+static void load_packed_palette(uint32_t palette[256], const uint8_t *data, size_t data_size, size_t palette_offset) {
+  (void)load_packed_palette_with_used(palette, data, data_size, palette_offset, NULL);
 }
 
 static uint32_t shade_palette_argb(uint32_t argb, int subtract) {
@@ -2466,6 +2564,512 @@ static void build_shaded_palette(uint32_t shaded_palette[16][256], const uint32_
     }
   }
 }
+
+#ifdef GLOOM_DOS_SDL3
+static uint32_t dos_opaque_argb(uint32_t argb) {
+  return 0xFF000000u | (argb & 0x00FFFFFFu);
+}
+
+static void dos_set_index_palette_entry(size_t index, uint32_t argb) {
+  uint8_t r = (uint8_t)((argb >> 16u) & 0xFFu);
+  uint8_t g = (uint8_t)((argb >> 8u) & 0xFFu);
+  uint8_t b = (uint8_t)(argb & 0xFFu);
+
+  if (index >= 256u) {
+    return;
+  }
+
+  g_dos_index_palette_colors[index].r = r;
+  g_dos_index_palette_colors[index].g = g;
+  g_dos_index_palette_colors[index].b = b;
+  g_dos_index_palette_colors[index].a = 255u;
+  g_dos_index_palette_argb[index] = 0xFF000000u | ((uint32_t)r << 16u) | ((uint32_t)g << 8u) | (uint32_t)b;
+}
+
+static uint32_t dos_palette_distance(uint32_t a, uint32_t b) {
+  int ar = (int)((a >> 16u) & 0xFFu);
+  int ag = (int)((a >> 8u) & 0xFFu);
+  int ab = (int)(a & 0xFFu);
+  int br = (int)((b >> 16u) & 0xFFu);
+  int bg = (int)((b >> 8u) & 0xFFu);
+  int bb = (int)(b & 0xFFu);
+  int dr = ar - br;
+  int dg = ag - bg;
+  int db = ab - bb;
+
+  return (uint32_t)((dr * dr) + (dg * dg) + (db * db));
+}
+
+static uint16_t dos_argb_to_rgb444(uint32_t argb) {
+  uint32_t r = (((argb >> 16u) & 0xFFu) + 8u) / 17u;
+  uint32_t g = (((argb >> 8u) & 0xFFu) + 8u) / 17u;
+  uint32_t b = ((argb & 0xFFu) + 8u) / 17u;
+
+  if (r > 15u) r = 15u;
+  if (g > 15u) g = 15u;
+  if (b > 15u) b = 15u;
+  return (uint16_t)((r << 8u) | (g << 4u) | b);
+}
+
+static void initialize_dos_index_palette_tables(void) {
+  size_t i = 0u;
+
+  if (g_dos_index_palette_initialized) {
+    return;
+  }
+
+  for (i = 0u; i < 256u; ++i) {
+    dos_set_index_palette_entry(i, 0xFF000000u);
+    g_dos_red_palette_indices[i] = 0u;
+  }
+
+  g_dos_index_palette_count = 1u;
+  g_dos_index_palette_dirty = true;
+  g_dos_rgb444_remap_dirty = true;
+  g_dos_index_palette_overflow_warned = false;
+  g_dos_index_palette_initialized = true;
+}
+
+static uint8_t dos_find_palette_index_slow(uint32_t argb, bool allow_zero) {
+  size_t first_index = allow_zero ? 0u : 1u;
+  size_t i = 0u;
+  size_t best_index = allow_zero ? 0u : 1u;
+  uint32_t best_distance = UINT32_MAX;
+
+  initialize_dos_index_palette_tables();
+  argb = dos_opaque_argb(argb);
+
+  if (first_index >= g_dos_index_palette_count) {
+    return 0u;
+  }
+
+  for (i = first_index; i < g_dos_index_palette_count; ++i) {
+    if (g_dos_index_palette_argb[i] == argb) {
+      return (uint8_t)i;
+    }
+  }
+
+  for (i = first_index; i < g_dos_index_palette_count; ++i) {
+    uint32_t distance = dos_palette_distance(argb, g_dos_index_palette_argb[i]);
+
+    if (distance < best_distance) {
+      best_distance = distance;
+      best_index = i;
+      if (distance == 0u) {
+        break;
+      }
+    }
+  }
+
+  return (uint8_t)best_index;
+}
+
+static void dos_rebuild_rgb444_remap(void) {
+  uint32_t code = 0u;
+
+  initialize_dos_index_palette_tables();
+  if (!g_dos_rgb444_remap_dirty) {
+    return;
+  }
+
+  for (code = 0u; code < 4096u; ++code) {
+    uint32_t r = ((code >> 8u) & 0x0Fu) * 17u;
+    uint32_t g = ((code >> 4u) & 0x0Fu) * 17u;
+    uint32_t b = (code & 0x0Fu) * 17u;
+    uint32_t argb = 0xFF000000u | (r << 16u) | (g << 8u) | b;
+
+    g_dos_rgb444_to_index[code] = dos_find_palette_index_slow(argb, true);
+    g_dos_rgb444_to_opaque_index[code] = dos_find_palette_index_slow(argb, false);
+  }
+  g_dos_rgb444_remap_dirty = false;
+}
+
+static uint8_t dos_argb_to_index(uint32_t argb) {
+  if ((uint8_t)(argb >> 24u) == 0u) {
+    return 0u;
+  }
+  dos_rebuild_rgb444_remap();
+  return g_dos_rgb444_to_index[dos_argb_to_rgb444(argb)];
+}
+
+static uint8_t dos_argb_to_opaque_index(uint32_t argb) {
+  dos_rebuild_rgb444_remap();
+  return g_dos_rgb444_to_opaque_index[dos_argb_to_rgb444(argb)];
+}
+
+static uint8_t dos_register_palette_color(uint32_t argb) {
+  size_t i = 0u;
+
+  initialize_dos_index_palette_tables();
+  argb = dos_opaque_argb(argb);
+
+  for (i = 1u; i < g_dos_index_palette_count; ++i) {
+    if (g_dos_index_palette_argb[i] == argb) {
+      return (uint8_t)i;
+    }
+  }
+
+  if (g_dos_index_palette_count < 256u) {
+    size_t index = g_dos_index_palette_count++;
+
+    dos_set_index_palette_entry(index, argb);
+    g_dos_index_palette_dirty = true;
+    g_dos_rgb444_remap_dirty = true;
+    return (uint8_t)index;
+  }
+
+  if (!g_dos_index_palette_overflow_warned) {
+    dos_logf("DOS indexed framebuffer: original palette exceeded 255 opaque colors; nearest-match remap active");
+    g_dos_index_palette_overflow_warned = true;
+  }
+  return dos_find_palette_index_slow(argb, false);
+}
+
+static void dos_register_source_palette(const uint32_t palette[256], const uint8_t palette_used[256]) {
+  size_t i = 0u;
+
+  if (palette == NULL) {
+    return;
+  }
+
+  for (i = 1u; i < 256u; ++i) {
+    if (palette_used != NULL && !palette_used[i]) {
+      continue;
+    }
+    (void)dos_register_palette_color(palette[i]);
+  }
+}
+
+static uint32_t dos_original_shade_palette_argb(uint32_t argb, int shade) {
+  int r = (int)(((argb >> 16u) & 0xFFu) / 17u) - shade;
+  int g = (int)(((argb >> 8u) & 0xFFu) / 17u) - shade;
+  int b = (int)((argb & 0xFFu) / 17u) - shade;
+
+  if (r <= 0) r = 1;
+  if (g < 0) g = 0;
+  if (b < 0) b = 0;
+  if (r > 15) r = 15;
+  if (g > 15) g = 15;
+  if (b > 15) b = 15;
+
+  return 0xFF000000u | ((uint32_t)(r * 17) << 16u) | ((uint32_t)(g * 17) << 8u) | (uint32_t)(b * 17);
+}
+
+static void dos_rebuild_red_palette_indices(void) {
+  size_t i = 0u;
+
+  initialize_dos_index_palette_tables();
+  g_dos_red_palette_indices[0] = 0u;
+  for (i = 1u; i < 256u; ++i) {
+    uint32_t argb = g_dos_index_palette_argb[i];
+    int r = (int)((argb >> 16u) & 0xFFu);
+    int g = (int)((argb >> 8u) & 0xFFu);
+    int b = (int)(argb & 0xFFu);
+    int red = (r + g + b + (16 * 17)) / 3;
+
+    if (red > 255) {
+      red = 255;
+    }
+    g_dos_red_palette_indices[i] = dos_argb_to_opaque_index(0xFF000000u | ((uint32_t)red << 16u));
+  }
+}
+
+static bool attach_dos_index_palette(SDL_Texture *texture, SDL_Palette **out_palette) {
+  SDL_Palette *palette = NULL;
+
+  if (texture == NULL || out_palette == NULL) {
+    return false;
+  }
+
+  initialize_dos_index_palette_tables();
+  palette = SDL_CreatePalette(256);
+  if (palette == NULL) {
+    fprintf(stderr, "Cannot create DOS indexed framebuffer palette: %s\n", SDL_GetError());
+    return false;
+  }
+  if (!SDL_SetPaletteColors(palette, g_dos_index_palette_colors, 0, 256)) {
+    fprintf(stderr, "Cannot populate DOS indexed framebuffer palette: %s\n", SDL_GetError());
+    SDL_DestroyPalette(palette);
+    return false;
+  }
+  if (!SDL_SetTexturePalette(texture, palette)) {
+    fprintf(stderr, "Cannot attach DOS indexed framebuffer palette: %s\n", SDL_GetError());
+    SDL_DestroyPalette(palette);
+    return false;
+  }
+
+  *out_palette = palette;
+  return true;
+}
+
+static void apply_dos_index_palette_to_window(SDL_Window *window) {
+  SDL_Surface *surface = NULL;
+  SDL_Palette *palette = NULL;
+
+  if (window == NULL) {
+    return;
+  }
+
+  initialize_dos_index_palette_tables();
+  surface = SDL_GetWindowSurface(window);
+  if (surface == NULL) {
+    dos_logf("DOS indexed framebuffer: SDL_GetWindowSurface failed: %s", SDL_GetError());
+    return;
+  }
+  if (surface->format != SDL_PIXELFORMAT_INDEX8) {
+    dos_logf("DOS indexed framebuffer: window surface format is 0x%lx, not INDEX8", (unsigned long)surface->format);
+    return;
+  }
+
+  palette = SDL_GetSurfacePalette(surface);
+  if (palette == NULL) {
+    palette = SDL_CreateSurfacePalette(surface);
+  }
+  if (palette == NULL) {
+    dos_logf("DOS indexed framebuffer: cannot get/create window surface palette: %s", SDL_GetError());
+    return;
+  }
+  if (!SDL_SetPaletteColors(palette, g_dos_index_palette_colors, 0, 256)) {
+    dos_logf("DOS indexed framebuffer: cannot set window surface palette: %s", SDL_GetError());
+    return;
+  }
+  (void)SDL_SetWindowSurfaceVSync(window, 0);
+}
+
+static void refresh_dos_index_palette(RenderFramebuffer *framebuffer, SDL_Window *window) {
+  initialize_dos_index_palette_tables();
+  dos_rebuild_red_palette_indices();
+
+  if (framebuffer != NULL && framebuffer->index_palette != NULL) {
+    if (!SDL_SetPaletteColors(framebuffer->index_palette, g_dos_index_palette_colors, 0, 256)) {
+      dos_logf("DOS indexed framebuffer: cannot refresh texture palette: %s", SDL_GetError());
+    }
+  }
+  apply_dos_index_palette_to_window(window);
+  g_dos_index_palette_dirty = false;
+}
+
+static void configure_dos_index_display_mode(SDL_Window *window, int render_width, int render_height) {
+  SDL_DisplayID display_id = 0;
+  SDL_DisplayMode **modes = NULL;
+  const SDL_DisplayMode *best = NULL;
+  int mode_count = 0;
+  int i = 0;
+
+  if (window == NULL || render_width <= 0 || render_height <= 0) {
+    return;
+  }
+
+  display_id = SDL_GetDisplayForWindow(window);
+  modes = SDL_GetFullscreenDisplayModes(display_id, &mode_count);
+  if (modes == NULL || mode_count <= 0) {
+    dos_logf("DOS indexed framebuffer: no fullscreen modes found: %s", SDL_GetError());
+    SDL_free(modes);
+    return;
+  }
+
+  for (i = 0; i < mode_count; ++i) {
+    const SDL_DisplayMode *mode = modes[i];
+    int mode_area = 0;
+    int best_area = 0;
+
+    if (mode == NULL || mode->format != SDL_PIXELFORMAT_INDEX8 || mode->w < render_width ||
+        mode->h < render_height) {
+      continue;
+    }
+    if (best == NULL) {
+      best = mode;
+      continue;
+    }
+    mode_area = mode->w * mode->h;
+    best_area = best->w * best->h;
+    if (mode_area < best_area || (mode_area == best_area && mode->w < best->w)) {
+      best = mode;
+    }
+  }
+
+  if (best == NULL) {
+    for (i = 0; i < mode_count; ++i) {
+      const SDL_DisplayMode *mode = modes[i];
+
+      if (mode != NULL && mode->format == SDL_PIXELFORMAT_INDEX8) {
+        best = mode;
+        break;
+      }
+    }
+  }
+
+  if (best == NULL) {
+    dos_logf("DOS indexed framebuffer: no INDEX8 fullscreen mode available");
+    SDL_free(modes);
+    return;
+  }
+
+  if (!SDL_SetWindowFullscreenMode(window, best)) {
+    dos_logf("DOS indexed framebuffer: failed to select %dx%d INDEX8 mode: %s", best->w, best->h, SDL_GetError());
+    SDL_free(modes);
+    return;
+  }
+  dos_logf("DOS indexed framebuffer: selected %dx%d INDEX8 display mode", best->w, best->h);
+  if (!SDL_SetWindowFullscreen(window, true)) {
+    const char *error = SDL_GetError();
+
+    if (error != NULL && error[0] != '\0') {
+      dos_logf("DOS indexed framebuffer: fullscreen request returned false: %s", error);
+    }
+  }
+  SDL_free(modes);
+}
+
+static void build_dos_shaded_palette_indices(uint8_t shaded_indices[16][256], const uint32_t palette[256],
+                                             const uint8_t palette_used[256]) {
+  size_t shade = 0u;
+
+  if (shaded_indices == NULL || palette == NULL) {
+    return;
+  }
+
+  dos_register_source_palette(palette, palette_used);
+  for (shade = 0u; shade < 16u; ++shade) {
+    size_t i = 0u;
+
+    for (i = 0u; i < 256u; ++i) {
+      if (i == 0u || (palette_used != NULL && !palette_used[i])) {
+        shaded_indices[shade][i] = 0u;
+      } else {
+        shaded_indices[shade][i] = dos_argb_to_opaque_index(dos_original_shade_palette_argb(palette[i], (int)shade));
+      }
+    }
+  }
+  dos_rebuild_red_palette_indices();
+}
+
+static void rebuild_dos_object_visual_indices(ObjectVisual *visual) {
+  if (visual == NULL || !visual->loaded) {
+    return;
+  }
+  build_dos_shaded_palette_indices(visual->shaded_indices, visual->shaded_palette[0], visual->palette_used);
+}
+
+static void rebuild_dos_level_index_mappings(WallTextureSet *wall_textures, FlatTextureSet *flat_textures,
+                                             ObjectVisualSet *object_visuals) {
+  size_t i = 0u;
+
+  if (wall_textures != NULL) {
+    for (i = 0u; i < GLOOM_TEXTURE_SCREENS; ++i) {
+      WallTextureScreen *screen = &wall_textures->screens[i];
+
+      if (screen->loaded) {
+        dos_register_source_palette(screen->palette, screen->palette_used);
+      }
+    }
+  }
+  if (flat_textures != NULL) {
+    if (flat_textures->floor.loaded) {
+      dos_register_source_palette(flat_textures->floor.palette, flat_textures->floor.palette_used);
+    }
+    if (flat_textures->roof.loaded) {
+      dos_register_source_palette(flat_textures->roof.palette, flat_textures->roof.palette_used);
+    }
+  }
+  if (object_visuals != NULL) {
+    for (i = 0u; i < GLOOM_OBJECT_TYPE_COUNT; ++i) {
+      if (object_visuals->visuals[i].loaded) {
+        dos_register_source_palette(object_visuals->visuals[i].shaded_palette[0], object_visuals->visuals[i].palette_used);
+      }
+      if (object_visuals->chunks[i].loaded) {
+        dos_register_source_palette(object_visuals->chunks[i].shaded_palette[0], object_visuals->chunks[i].palette_used);
+      }
+    }
+  }
+
+  if (wall_textures != NULL) {
+    for (i = 0u; i < GLOOM_TEXTURE_SCREENS; ++i) {
+      WallTextureScreen *screen = &wall_textures->screens[i];
+
+      if (screen->loaded) {
+        build_dos_shaded_palette_indices(screen->shaded_indices, screen->palette, screen->palette_used);
+      }
+    }
+  }
+  if (flat_textures != NULL) {
+    if (flat_textures->floor.loaded) {
+      build_dos_shaded_palette_indices(flat_textures->floor.shaded_indices, flat_textures->floor.palette,
+                                       flat_textures->floor.palette_used);
+    }
+    if (flat_textures->roof.loaded) {
+      build_dos_shaded_palette_indices(flat_textures->roof.shaded_indices, flat_textures->roof.palette,
+                                       flat_textures->roof.palette_used);
+    }
+  }
+  if (object_visuals != NULL) {
+    for (i = 0u; i < GLOOM_OBJECT_TYPE_COUNT; ++i) {
+      rebuild_dos_object_visual_indices(&object_visuals->visuals[i]);
+      rebuild_dos_object_visual_indices(&object_visuals->chunks[i]);
+    }
+  }
+}
+
+static void rebuild_dos_weapon_index_mappings(WeaponVisualSet *weapon_visuals) {
+  size_t i = 0u;
+
+  if (weapon_visuals == NULL) {
+    return;
+  }
+
+  for (i = 0u; i < GLOOM_WEAPON_COUNT; ++i) {
+    if (weapon_visuals->bullets[i].loaded) {
+      dos_register_source_palette(weapon_visuals->bullets[i].shaded_palette[0], weapon_visuals->bullets[i].palette_used);
+    }
+    if (weapon_visuals->sparks[i].loaded) {
+      dos_register_source_palette(weapon_visuals->sparks[i].shaded_palette[0], weapon_visuals->sparks[i].palette_used);
+    }
+  }
+  if (weapon_visuals->gun.loaded) {
+    dos_register_source_palette(weapon_visuals->gun.shaded_palette[0], weapon_visuals->gun.palette_used);
+  }
+
+  for (i = 0u; i < GLOOM_WEAPON_COUNT; ++i) {
+    rebuild_dos_object_visual_indices(&weapon_visuals->bullets[i]);
+    rebuild_dos_object_visual_indices(&weapon_visuals->sparks[i]);
+  }
+  rebuild_dos_object_visual_indices(&weapon_visuals->gun);
+}
+
+static void rebuild_dos_runtime_index_mappings(WallTextureSet *wall_textures, FlatTextureSet *flat_textures,
+                                               ObjectVisualSet *object_visuals, WeaponVisualSet *weapon_visuals) {
+  rebuild_dos_level_index_mappings(wall_textures, flat_textures, object_visuals);
+  rebuild_dos_weapon_index_mappings(weapon_visuals);
+  dos_logf("DOS indexed framebuffer: original game palette has %u opaque colors",
+           (unsigned)(g_dos_index_palette_count > 0u ? g_dos_index_palette_count - 1u : 0u));
+}
+
+static void register_dos_hud_font_palette(const HudFont *font) {
+  size_t glyph_index = 0u;
+
+  if (font == NULL || !font->loaded) {
+    return;
+  }
+
+  for (glyph_index = 0u; glyph_index < font->glyph_count; ++glyph_index) {
+    const HudGlyph *glyph = &font->glyphs[glyph_index];
+    size_t pixel_count = 0u;
+    size_t pixel_index = 0u;
+
+    if (glyph->argb_pixels == NULL || glyph->width <= 0 || glyph->height <= 0) {
+      continue;
+    }
+    pixel_count = (size_t)glyph->width * (size_t)glyph->height;
+    for (pixel_index = 0u; pixel_index < pixel_count; ++pixel_index) {
+      uint32_t argb = glyph->argb_pixels[pixel_index];
+
+      if ((uint8_t)(argb >> 24u) != 0u) {
+        (void)dos_register_palette_color(argb);
+      }
+    }
+  }
+}
+#endif
 
 static void free_hud_font(HudFont *font) {
   size_t i = 0u;
@@ -2907,6 +3511,9 @@ static bool load_wall_texture_screen(const char *path, const char *source_name, 
   uint8_t *data = NULL;
   size_t file_size = 0;
   uint8_t *texels = NULL;
+#ifdef GLOOM_DOS_SDL3
+  uint8_t *column_texels = NULL;
+#endif
   uint8_t *column_flags = NULL;
   uint32_t palette_offset = 0u;
   size_t texture_data_end = 0u;
@@ -2932,9 +3539,23 @@ static bool load_wall_texture_screen(const char *path, const char *source_name, 
     return false;
   }
 
+#ifdef GLOOM_DOS_SDL3
+  column_texels = (uint8_t *)calloc((size_t)GLOOM_TEXTURES_PER_SCREEN * (size_t)GLOOM_TEXTURE_WIDTH *
+                                       (size_t)GLOOM_TEXTURE_HEIGHT,
+                                   sizeof(*column_texels));
+  if (column_texels == NULL) {
+    free(texels);
+    free(data);
+    return false;
+  }
+#endif
+
   column_flags = (uint8_t *)calloc((size_t)GLOOM_TEXTURES_PER_SCREEN * (size_t)GLOOM_TEXTURE_WIDTH,
                                    sizeof(*column_flags));
   if (column_flags == NULL) {
+#ifdef GLOOM_DOS_SDL3
+    free(column_texels);
+#endif
     free(texels);
     free(data);
     return false;
@@ -2974,15 +3595,30 @@ static bool load_wall_texture_screen(const char *path, const char *source_name, 
         size_t dst = texture_index * ((size_t)GLOOM_TEXTURE_WIDTH * (size_t)GLOOM_TEXTURE_HEIGHT) +
                      y * (size_t)GLOOM_TEXTURE_WIDTH + x;
         texels[dst] = column_pixels[y];
+#ifdef GLOOM_DOS_SDL3
+        column_texels[texture_index * ((size_t)GLOOM_TEXTURE_WIDTH * (size_t)GLOOM_TEXTURE_HEIGHT) +
+                      x * (size_t)GLOOM_TEXTURE_HEIGHT + y] = column_pixels[y];
+#endif
       }
     }
   }
 
+#ifdef GLOOM_DOS_SDL3
+  (void)load_packed_palette_with_used(out_screen->palette, data, file_size, (size_t)palette_offset,
+                                      out_screen->palette_used);
+#else
   load_packed_palette(out_screen->palette, data, file_size, (size_t)palette_offset);
+#endif
   build_shaded_palette(out_screen->shaded_palette, out_screen->palette);
+#ifdef GLOOM_DOS_SDL3
+  build_dos_shaded_palette_indices(out_screen->shaded_indices, out_screen->palette, out_screen->palette_used);
+#endif
 
   out_screen->loaded = true;
   out_screen->texels = texels;
+#ifdef GLOOM_DOS_SDL3
+  out_screen->column_texels = column_texels;
+#endif
   out_screen->column_flags = column_flags;
   out_screen->texture_count = available_textures;
   (void)snprintf(out_screen->source_name, sizeof(out_screen->source_name), "%s", source_name != NULL ? source_name : path);
@@ -3563,8 +4199,16 @@ static bool load_flat_texture(const char *kind, const char *tile_tag, FlatTextur
 
   memcpy(texels, data, (size_t)FLAT_TEXEL_BYTES);
   set_default_texture_palette(out_texture->palette);
+#ifdef GLOOM_DOS_SDL3
+  (void)load_packed_palette_with_used(out_texture->palette, data, data_size, (size_t)FLAT_TEXEL_BYTES,
+                                      out_texture->palette_used);
+#else
   load_packed_palette(out_texture->palette, data, data_size, (size_t)FLAT_TEXEL_BYTES);
+#endif
   build_shaded_palette(out_texture->shaded_palette, out_texture->palette);
+#ifdef GLOOM_DOS_SDL3
+  build_dos_shaded_palette_indices(out_texture->shaded_indices, out_texture->palette, out_texture->palette_used);
+#endif
 
   out_texture->texels = texels;
   out_texture->loaded = true;
@@ -4051,9 +4695,14 @@ static bool load_object_visual_from_asset(const char *asset_name, const ObjectVi
   }
 
   set_default_texture_palette(palette);
+#ifdef GLOOM_DOS_SDL3
+  (void)load_packed_palette_with_used(palette, data, data_size, (size_t)palette_offset, out_visual->palette_used);
+#else
   load_packed_palette(palette, data, data_size, (size_t)palette_offset);
+#endif
 #ifdef GLOOM_DOS_SDL3
   build_shaded_palette(out_visual->shaded_palette, palette);
+  build_dos_shaded_palette_indices(out_visual->shaded_indices, palette, out_visual->palette_used);
 #endif
 
   for (frame_index = 0u; frame_index < frame_count; ++frame_index) {
@@ -4328,7 +4977,7 @@ static void bind_debug_sprite_frame(DebugSprite *sprite, const ObjectVisual *vis
 
   sprite->frame = frame;
 #ifdef GLOOM_DOS_SDL3
-  sprite->shaded_palette = visual != NULL ? visual->shaded_palette : NULL;
+  sprite->shaded_indices = visual != NULL ? visual->shaded_indices : NULL;
 #else
   (void)visual;
 #endif
@@ -7837,6 +8486,77 @@ static int floor_to_int(float value) {
   return as_int;
 }
 
+static double profile_now_ms(void) {
+  static uint64_t frequency = 0u;
+  uint64_t counter = 0u;
+
+  if (!g_profiler.enabled) {
+    return 0.0;
+  }
+
+  if (frequency == 0u) {
+    frequency = SDL_GetPerformanceFrequency();
+    if (frequency == 0u) {
+      return 0.0;
+    }
+  }
+
+  counter = SDL_GetPerformanceCounter();
+  return ((double)counter * 1000.0) / (double)frequency;
+}
+
+static void profile_add_elapsed(double *bucket, double start_ms) {
+  if (!g_profiler.enabled || bucket == NULL || start_ms <= 0.0) {
+    return;
+  }
+
+  *bucket += profile_now_ms() - start_ms;
+}
+
+static void profile_logf(const char *fmt, ...) {
+  char line[256];
+  va_list args;
+
+  if (fmt == NULL) {
+    return;
+  }
+
+  va_start(args, fmt);
+  (void)vsnprintf(line, sizeof(line), fmt, args);
+  va_end(args);
+  line[sizeof(line) - 1u] = '\0';
+
+  printf("%s\n", line);
+#ifdef GLOOM_DOS_SDL3
+  dos_logf("%s", line);
+#endif
+}
+
+static void profile_report(int render_width, int render_height) {
+  double frames = (double)g_profiler.frames;
+
+  if (!g_profiler.enabled || g_profiler.frames == 0u) {
+    return;
+  }
+
+  profile_logf("PROFILE frames=%u resolution=%dx%d avg_frame_ms=%.3f approx_fps=%.2f updates/frame=%.2f",
+               (unsigned)g_profiler.frames, render_width, render_height, g_profiler.frame_ms / frames,
+               g_profiler.frame_ms > 0.0 ? (frames * 1000.0) / g_profiler.frame_ms : 0.0,
+               (double)g_profiler.update_steps / frames);
+  profile_logf("PROFILE loop_ms events=%.3f update=%.3f interpolate=%.3f render_call=%.3f",
+               g_profiler.events_ms / frames, g_profiler.update_ms / frames, g_profiler.interpolate_ms / frames,
+               g_profiler.render_ms / frames);
+  profile_logf("PROFILE render_ms lock_clear=%.3f flats=%.3f walls=%.3f sprites=%.3f weapon=%.3f hud=%.3f red=%.3f present=%.3f",
+               g_profiler.render_lock_clear_ms / frames, g_profiler.render_flat_ms / frames,
+               g_profiler.render_wall_ms / frames, g_profiler.render_sprites_ms / frames,
+               g_profiler.render_weapon_ms / frames, g_profiler.render_hud_ms / frames,
+               g_profiler.render_red_ms / frames, g_profiler.render_present_ms / frames);
+  profile_logf("PROFILE wall_ms search=%.3f draw=%.3f",
+               g_profiler.render_wall_search_ms / frames, g_profiler.render_wall_draw_ms / frames);
+  profile_logf("PROFILE counts wall_candidates/frame=%.2f sprites/frame=%.2f",
+               (double)g_profiler.wall_candidates / frames, (double)g_profiler.sprites / frames);
+}
+
 #ifdef GLOOM_DOS_SDL3
 static int32_t dos_float_to_fixed16(float value) {
   float scaled = 0.0f;
@@ -7853,11 +8573,11 @@ static int32_t dos_float_to_fixed16(float value) {
   return fixed;
 }
 
-static int dos_fixed16_floor_to_int(int32_t value) {
+static inline int dos_fixed16_floor_to_int(int32_t value) {
   return (int)(value >> 16);
 }
 
-static int32_t dos_div_fixed16(int64_t numerator_fixed, int32_t denominator_fixed) {
+static inline int32_t dos_div_fixed16(int64_t numerator_fixed, int32_t denominator_fixed) {
   int64_t value = 0;
 
   if (denominator_fixed == 0) {
@@ -7870,7 +8590,7 @@ static int32_t dos_div_fixed16(int64_t numerator_fixed, int32_t denominator_fixe
   return (int32_t)value;
 }
 
-static int32_t dos_fixed16_clamp_unit(int32_t value) {
+static inline int32_t dos_fixed16_clamp_unit(int32_t value) {
   if (value < 0) return 0;
   if (value > 0x10000) return 0x10000;
   return value;
@@ -7962,6 +8682,7 @@ static uint8_t amiga_depth_dark_index_int(int32_t depth) {
 
   return g_depth_dark_indices[z];
 }
+
 #endif
 
 static int depth_subtract_for_depth(float depth) {
@@ -8942,6 +9663,11 @@ static void free_render_framebuffer(RenderFramebuffer *framebuffer) {
   if (framebuffer->texture != NULL) {
     SDL_DestroyTexture(framebuffer->texture);
   }
+#ifdef GLOOM_DOS_SDL3
+  if (framebuffer->index_palette != NULL) {
+    SDL_DestroyPalette(framebuffer->index_palette);
+  }
+#endif
   free(framebuffer->last_frame_pixels);
   free(framebuffer->depth_buffer);
   free(framebuffer->sprite_depth_buffer);
@@ -8963,6 +9689,9 @@ static bool ensure_render_framebuffer(SDL_Renderer *renderer, RenderFramebuffer 
   uint32_t *filled_stamps = NULL;
   uint32_t *last_frame_pixels = NULL;
   SDL_Texture *texture = NULL;
+#ifdef GLOOM_DOS_SDL3
+  SDL_Palette *index_palette = NULL;
+#endif
 
   if (renderer == NULL || framebuffer == NULL || width <= 0 || height <= 0) {
     return false;
@@ -9000,7 +9729,11 @@ static bool ensure_render_framebuffer(SDL_Renderer *renderer, RenderFramebuffer 
     return false;
   }
 
+#ifdef GLOOM_DOS_SDL3
+  texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_INDEX8, SDL_TEXTUREACCESS_STREAMING, width, height);
+#else
   texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STREAMING, width, height);
+#endif
   if (texture == NULL) {
     fprintf(stderr, "Cannot create PC renderer framebuffer texture %dx%d: %s\n", width, height, SDL_GetError());
     free(depth_buffer);
@@ -9013,11 +9746,26 @@ static bool ensure_render_framebuffer(SDL_Renderer *renderer, RenderFramebuffer 
     free(last_frame_pixels);
     return false;
   }
+#ifdef GLOOM_DOS_SDL3
+  if (!attach_dos_index_palette(texture, &index_palette)) {
+    SDL_DestroyTexture(texture);
+    free(depth_buffer);
+    free(sprite_depth_buffer);
+    free(depth_buffer_int);
+    free(sprite_depth_buffer_int);
+    free(filled_stamps);
+    free(last_frame_pixels);
+    return false;
+  }
+#endif
   (void)SDL_SetTextureScaleMode(texture, SDL_ScaleModeNearest);
   (void)SDL_SetTextureBlendMode(texture, SDL_BLENDMODE_NONE);
 
   free_render_framebuffer(framebuffer);
   framebuffer->texture = texture;
+#ifdef GLOOM_DOS_SDL3
+  framebuffer->index_palette = index_palette;
+#endif
   framebuffer->last_frame_pixels = last_frame_pixels;
   framebuffer->depth_buffer = depth_buffer;
   framebuffer->sprite_depth_buffer = sprite_depth_buffer;
@@ -9044,7 +9792,37 @@ static bool begin_render_framebuffer(RenderFramebuffer *framebuffer) {
     fprintf(stderr, "Cannot lock PC renderer framebuffer texture: %s\n", SDL_GetError());
     return false;
   }
-  if (pixels == NULL || pitch_bytes < framebuffer->width * (int)sizeof(uint32_t) ||
+  if (pixels == NULL) {
+    fprintf(stderr, "Cannot render: SDL framebuffer lock returned no pixels for %dx%d\n", framebuffer->width,
+            framebuffer->height);
+    SDL_UnlockTexture(framebuffer->texture);
+#ifdef GLOOM_DOS_SDL3
+    framebuffer->index_pixels = NULL;
+    framebuffer->index_pitch_pixels = 0;
+#endif
+    framebuffer->pixels = NULL;
+    framebuffer->pitch_pixels = 0;
+    return false;
+  }
+
+#ifdef GLOOM_DOS_SDL3
+  if (pitch_bytes < framebuffer->width) {
+    fprintf(stderr, "Cannot render: SDL framebuffer pitch %d is invalid for %dx%d indexed pixels\n", pitch_bytes,
+            framebuffer->width, framebuffer->height);
+    SDL_UnlockTexture(framebuffer->texture);
+    framebuffer->index_pixels = NULL;
+    framebuffer->index_pitch_pixels = 0;
+    framebuffer->pixels = NULL;
+    framebuffer->pitch_pixels = 0;
+    return false;
+  }
+
+  framebuffer->index_pixels = (uint8_t *)pixels;
+  framebuffer->index_pitch_pixels = pitch_bytes;
+  framebuffer->pixels = NULL;
+  framebuffer->pitch_pixels = 0;
+#else
+  if (pitch_bytes < framebuffer->width * (int)sizeof(uint32_t) ||
       (pitch_bytes % (int)sizeof(uint32_t)) != 0) {
     fprintf(stderr, "Cannot render: SDL framebuffer pitch %d is invalid for %dx%d ARGB pixels\n", pitch_bytes,
             framebuffer->width, framebuffer->height);
@@ -9056,15 +9834,29 @@ static bool begin_render_framebuffer(RenderFramebuffer *framebuffer) {
 
   framebuffer->pixels = (uint32_t *)pixels;
   framebuffer->pitch_pixels = pitch_bytes / (int)sizeof(uint32_t);
+#endif
   return true;
 }
 
 static void end_render_framebuffer(RenderFramebuffer *framebuffer) {
-  if (framebuffer == NULL || framebuffer->texture == NULL || framebuffer->pixels == NULL) {
+  if (framebuffer == NULL || framebuffer->texture == NULL) {
     return;
   }
+#ifdef GLOOM_DOS_SDL3
+  if (framebuffer->index_pixels == NULL) {
+    return;
+  }
+#else
+  if (framebuffer->pixels == NULL) {
+    return;
+  }
+#endif
 
   SDL_UnlockTexture(framebuffer->texture);
+#ifdef GLOOM_DOS_SDL3
+  framebuffer->index_pixels = NULL;
+  framebuffer->index_pitch_pixels = 0;
+#endif
   framebuffer->pixels = NULL;
   framebuffer->pitch_pixels = 0;
 }
@@ -9101,11 +9893,26 @@ static void framebuffer_clear(RenderFramebuffer *framebuffer, uint32_t argb) {
   size_t count = 0u;
   size_t i = 0u;
 
-  if (framebuffer == NULL || framebuffer->pixels == NULL || framebuffer->width <= 0 || framebuffer->height <= 0) {
+  if (framebuffer == NULL || framebuffer->width <= 0 || framebuffer->height <= 0) {
     return;
   }
 
   count = (size_t)framebuffer->width;
+#ifdef GLOOM_DOS_SDL3
+  if (framebuffer->index_pixels == NULL || framebuffer->index_pitch_pixels < framebuffer->width) {
+    return;
+  }
+  {
+    uint8_t index = dos_argb_to_index(argb);
+
+    for (i = 0u; i < (size_t)framebuffer->height; ++i) {
+      memset(framebuffer->index_pixels + (i * (size_t)framebuffer->index_pitch_pixels), index, count);
+    }
+  }
+#else
+  if (framebuffer->pixels == NULL || framebuffer->pitch_pixels < framebuffer->width) {
+    return;
+  }
   for (i = 0u; i < (size_t)framebuffer->height; ++i) {
     uint32_t *row = framebuffer->pixels + (i * (size_t)framebuffer->pitch_pixels);
     size_t x = 0u;
@@ -9114,13 +9921,19 @@ static void framebuffer_clear(RenderFramebuffer *framebuffer, uint32_t argb) {
       row[x] = argb;
     }
   }
+#endif
 }
 
 static void framebuffer_clear_row_span(RenderFramebuffer *framebuffer, int dst_y, int x, int w, uint32_t argb) {
+#ifdef GLOOM_DOS_SDL3
+  uint8_t *row = NULL;
+  uint8_t index = 0u;
+#else
   uint32_t *row = NULL;
+#endif
   int col = 0;
 
-  if (framebuffer == NULL || framebuffer->pixels == NULL || dst_y < 0 || dst_y >= framebuffer->height || w <= 0) {
+  if (framebuffer == NULL || dst_y < 0 || dst_y >= framebuffer->height || w <= 0) {
     return;
   }
   if (x < 0) {
@@ -9134,10 +9947,23 @@ static void framebuffer_clear_row_span(RenderFramebuffer *framebuffer, int dst_y
     return;
   }
 
+#ifdef GLOOM_DOS_SDL3
+  if (framebuffer->index_pixels == NULL || framebuffer->index_pitch_pixels < framebuffer->width) {
+    return;
+  }
+  row = framebuffer->index_pixels + ((size_t)dst_y * (size_t)framebuffer->index_pitch_pixels) + (size_t)x;
+  index = dos_argb_to_index(argb);
+  memset(row, index, (size_t)w);
+  (void)col;
+#else
+  if (framebuffer->pixels == NULL || framebuffer->pitch_pixels < framebuffer->width) {
+    return;
+  }
   row = framebuffer->pixels + ((size_t)dst_y * (size_t)framebuffer->pitch_pixels) + (size_t)x;
   for (col = 0; col < w; ++col) {
     row[col] = argb;
   }
+#endif
 }
 
 #ifndef GLOOM_DOS_SDL3
@@ -9161,7 +9987,7 @@ static void apply_player_red_palette_rect(RenderFramebuffer *framebuffer, const 
                                           int h) {
   int row_index = 0;
 
-  if (framebuffer == NULL || framebuffer->pixels == NULL || state == NULL || state->player_palette_timer <= 0.0f) {
+  if (framebuffer == NULL || state == NULL || state->player_palette_timer <= 0.0f) {
     return;
   }
 
@@ -9183,6 +10009,24 @@ static void apply_player_red_palette_rect(RenderFramebuffer *framebuffer, const 
     return;
   }
 
+#ifdef GLOOM_DOS_SDL3
+  if (framebuffer->index_pixels == NULL || framebuffer->index_pitch_pixels < framebuffer->width) {
+    return;
+  }
+
+  for (row_index = 0; row_index < h; ++row_index) {
+    uint8_t *row = framebuffer->index_pixels + ((size_t)(y + row_index) * (size_t)framebuffer->index_pitch_pixels);
+    int col = 0;
+
+    for (col = 0; col < w; ++col) {
+      row[x + col] = g_dos_red_palette_indices[row[x + col]];
+    }
+  }
+#else
+  if (framebuffer->pixels == NULL || framebuffer->pitch_pixels < framebuffer->width) {
+    return;
+  }
+
   for (row_index = 0; row_index < h; ++row_index) {
     uint32_t *row = framebuffer->pixels + ((size_t)(y + row_index) * (size_t)framebuffer->pitch_pixels);
     int col = 0;
@@ -9200,6 +10044,7 @@ static void apply_player_red_palette_rect(RenderFramebuffer *framebuffer, const 
       row[x + col] = 0xFF000000u | ((uint32_t)red << 16);
     }
   }
+#endif
 }
 
 static void apply_player_red_palette(RenderFramebuffer *framebuffer, const AppState *state) {
@@ -9223,8 +10068,19 @@ static float projection_focal_for_viewport(int w, int h) {
 
 static void render_flat_textures(RenderFramebuffer *framebuffer, const AppState *state, const FlatTextureSet *flats, int x,
                                  int y, int w, int h, float focal, float far_depth, float view_cos,
-                                 float view_sin) {
+                                 float view_sin
 #ifdef GLOOM_DOS_SDL3
+                                 ,
+                                 bool skip_existing_pixels
+#endif
+) {
+#ifdef GLOOM_DOS_SDL3
+  enum {
+    DOS_FLAT_FRAC_BITS = 9,
+    DOS_FLAT_FRAC_SCALE = 1 << DOS_FLAT_FRAC_BITS,
+    DOS_FLAT_TRIG_BITS = 9,
+    DOS_FLAT_TRIG_SCALE = 1 << DOS_FLAT_TRIG_BITS
+  };
   int32_t eye_height = 0;
   int32_t ceiling_delta = 0;
   int32_t cam_x_fixed = 0;
@@ -9243,14 +10099,23 @@ static void render_flat_textures(RenderFramebuffer *framebuffer, const AppState 
   if (framebuffer == NULL || state == NULL || flats == NULL || !flats->floor.loaded || !flats->roof.loaded) {
     return;
   }
+#ifdef GLOOM_DOS_SDL3
+  if (framebuffer->index_pixels == NULL || framebuffer->index_pitch_pixels < framebuffer->width) {
+    return;
+  }
+#else
+  if (framebuffer->pixels == NULL || framebuffer->pitch_pixels < framebuffer->width) {
+    return;
+  }
+#endif
 
 #ifdef GLOOM_DOS_SDL3
   eye_height = round_float_to_int32(-state->camera_y);
   ceiling_delta = round_float_to_int32(255.0f + state->camera_y);
-  cam_x_fixed = dos_float_to_fixed16(state->camera_x);
-  cam_z_fixed = dos_float_to_fixed16(state->camera_z);
-  cos_fixed = round_float_to_int32(view_cos * 32767.0f);
-  sin_fixed = round_float_to_int32(view_sin * 32767.0f);
+  cam_x_fixed = round_float_to_int32(state->camera_x * (float)DOS_FLAT_FRAC_SCALE);
+  cam_z_fixed = round_float_to_int32(state->camera_z * (float)DOS_FLAT_FRAC_SCALE);
+  cos_fixed = round_float_to_int32(view_cos * (float)DOS_FLAT_TRIG_SCALE);
+  sin_fixed = round_float_to_int32(view_sin * (float)DOS_FLAT_TRIG_SCALE);
   focal_int = round_float_to_int32(focal);
   far_depth_int = round_float_to_int32(far_depth);
 
@@ -9283,7 +10148,7 @@ static void render_flat_textures(RenderFramebuffer *framebuffer, const AppState 
     int centered_y = row - (h / 2);
     const FlatTexture *texture = NULL;
     const uint8_t *texels = NULL;
-    const uint32_t *palette = NULL;
+    const uint8_t *palette = NULL;
     int32_t plane_distance = 0;
     int32_t depth = 0;
     int32_t depth_fixed = 0;
@@ -9293,7 +10158,7 @@ static void render_flat_textures(RenderFramebuffer *framebuffer, const AppState 
     int32_t world_z_fixed = 0;
     int32_t world_x_step_fixed = 0;
     int32_t world_z_step_fixed = 0;
-    uint32_t *dst_row = NULL;
+    uint8_t *dst_row = NULL;
     int abs_centered_y = 0;
     int col = 0;
 
@@ -9306,37 +10171,55 @@ static void render_flat_textures(RenderFramebuffer *framebuffer, const AppState 
       plane_distance = ceiling_delta;
       abs_centered_y = -centered_y;
     } else {
-      framebuffer_clear_row_span(framebuffer, y + row, x, w, 0xFF000000u);
+      if (!skip_existing_pixels) {
+        framebuffer_clear_row_span(framebuffer, y + row, x, w, 0xFF000000u);
+      }
       continue;
     }
 
     depth = (int32_t)(((int64_t)plane_distance * (int64_t)focal_int) / (int64_t)abs_centered_y);
     if (depth < 1 || depth >= far_depth_int) {
-      framebuffer_clear_row_span(framebuffer, y + row, x, w, 0xFF000000u);
+      if (!skip_existing_pixels) {
+        framebuffer_clear_row_span(framebuffer, y + row, x, w, 0xFF000000u);
+      }
       continue;
     }
 
     texels = texture->texels;
-    palette = texture->shaded_palette[amiga_depth_dark_index_int(depth)];
-    depth_fixed = depth << 16;
-    view_x_fixed = (int32_t)((((int64_t)(0 - (w / 2)) * (int64_t)depth) << 16) / (int64_t)focal_int);
-    view_x_step_fixed = (int32_t)(((int64_t)depth << 16) / (int64_t)focal_int);
-    world_x_fixed = cam_x_fixed + (int32_t)(((int64_t)view_x_fixed * (int64_t)cos_fixed) >> 15) +
-                    (int32_t)(((int64_t)depth_fixed * (int64_t)sin_fixed) >> 15);
-    world_z_fixed = cam_z_fixed - (int32_t)(((int64_t)view_x_fixed * (int64_t)sin_fixed) >> 15) +
-                    (int32_t)(((int64_t)depth_fixed * (int64_t)cos_fixed) >> 15);
-    world_x_step_fixed = (int32_t)(((int64_t)view_x_step_fixed * (int64_t)cos_fixed) >> 15);
-    world_z_step_fixed = -(int32_t)(((int64_t)view_x_step_fixed * (int64_t)sin_fixed) >> 15);
-    dst_row = framebuffer->pixels + ((size_t)(y + row) * (size_t)framebuffer->pitch_pixels + (size_t)x);
+    palette = texture->shaded_indices[amiga_depth_dark_index_int(depth)];
+    depth_fixed = depth << DOS_FLAT_FRAC_BITS;
+    view_x_fixed = ((((0 - (w / 2)) * depth) << DOS_FLAT_FRAC_BITS) / focal_int);
+    view_x_step_fixed = ((depth << DOS_FLAT_FRAC_BITS) / focal_int);
+    world_x_fixed = cam_x_fixed + ((view_x_fixed * cos_fixed) >> DOS_FLAT_TRIG_BITS) +
+                    ((depth_fixed * sin_fixed) >> DOS_FLAT_TRIG_BITS);
+    world_z_fixed = cam_z_fixed - ((view_x_fixed * sin_fixed) >> DOS_FLAT_TRIG_BITS) +
+                    ((depth_fixed * cos_fixed) >> DOS_FLAT_TRIG_BITS);
+    world_x_step_fixed = ((view_x_step_fixed * cos_fixed) >> DOS_FLAT_TRIG_BITS);
+    world_z_step_fixed = -((view_x_step_fixed * sin_fixed) >> DOS_FLAT_TRIG_BITS);
+    dst_row = framebuffer->index_pixels + ((size_t)(y + row) * (size_t)framebuffer->index_pitch_pixels + (size_t)x);
 
-    for (col = 0; col < w; ++col) {
-      int tx = dos_fixed16_floor_to_int(world_x_fixed) & (GLOOM_FLAT_TEXTURE_SIZE - 1);
-      int tz = dos_fixed16_floor_to_int(world_z_fixed) & (GLOOM_FLAT_TEXTURE_SIZE - 1);
-      uint8_t palette_index = texels[(tx * GLOOM_FLAT_TEXTURE_SIZE) + tz];
+    if (skip_existing_pixels) {
+      for (col = 0; col < w; ++col) {
+        if (dst_row[col] == 0u) {
+          int tx = (int)(world_x_fixed >> DOS_FLAT_FRAC_BITS) & (GLOOM_FLAT_TEXTURE_SIZE - 1);
+          int tz = (int)(world_z_fixed >> DOS_FLAT_FRAC_BITS) & (GLOOM_FLAT_TEXTURE_SIZE - 1);
+          uint8_t palette_index = texels[(tx * GLOOM_FLAT_TEXTURE_SIZE) + tz];
 
-      dst_row[col] = palette[palette_index];
-      world_x_fixed += world_x_step_fixed;
-      world_z_fixed += world_z_step_fixed;
+          dst_row[col] = palette[palette_index];
+        }
+        world_x_fixed += world_x_step_fixed;
+        world_z_fixed += world_z_step_fixed;
+      }
+    } else {
+      for (col = 0; col < w; ++col) {
+        int tx = (int)(world_x_fixed >> DOS_FLAT_FRAC_BITS) & (GLOOM_FLAT_TEXTURE_SIZE - 1);
+        int tz = (int)(world_z_fixed >> DOS_FLAT_FRAC_BITS) & (GLOOM_FLAT_TEXTURE_SIZE - 1);
+        uint8_t palette_index = texels[(tx * GLOOM_FLAT_TEXTURE_SIZE) + tz];
+
+        dst_row[col] = palette[palette_index];
+        world_x_fixed += world_x_step_fixed;
+        world_z_fixed += world_z_step_fixed;
+      }
     }
 #else
     float centered_y = (float)(row - (h / 2));
@@ -9414,17 +10297,28 @@ static void render_wall_columns_dos_fixed(RenderFramebuffer *framebuffer, const 
                                           int y, int w, int h, int horizon_y, float view_cos, float view_sin,
                                           float focal) {
   DosSceneWall scene_walls[GLOOM_MAX_WALL_CANDIDATES];
-  int32_t *depth_buffer = framebuffer->depth_buffer_int;
-  uint32_t *filled_stamps = framebuffer->filled_stamps;
+  int32_t *depth_buffer = NULL;
+  uint32_t *filled_stamps = NULL;
   size_t scene_wall_count = 0u;
   size_t i = 0u;
   int focal_int = round_float_to_int32(focal);
   int half_width = w / 2;
-  int32_t cam_x = round_float_to_int32(state->camera_x);
-  int32_t cam_z = round_float_to_int32(state->camera_z);
-  int32_t cam_y = round_float_to_int32(state->camera_y);
+  int32_t cam_x = 0;
+  int32_t cam_z = 0;
+  int32_t cam_y = 0;
   int32_t cos_fixed = round_float_to_int32(view_cos * 32767.0f);
   int32_t sin_fixed = round_float_to_int32(view_sin * 32767.0f);
+
+  if (framebuffer == NULL || state == NULL || framebuffer->index_pixels == NULL ||
+      framebuffer->index_pitch_pixels < framebuffer->width || framebuffer->depth_buffer_int == NULL ||
+      framebuffer->filled_stamps == NULL) {
+    return;
+  }
+  depth_buffer = framebuffer->depth_buffer_int;
+  filled_stamps = framebuffer->filled_stamps;
+  cam_x = round_float_to_int32(state->camera_x);
+  cam_z = round_float_to_int32(state->camera_z);
+  cam_y = round_float_to_int32(state->camera_y);
 
   if (focal_int < 1) {
     focal_int = 1;
@@ -9496,6 +10390,7 @@ static void render_wall_columns_dos_fixed(RenderFramebuffer *framebuffer, const 
       size_t wall_index = 0u;
       size_t hit_index = 0u;
       uint32_t filled_stamp = 0u;
+      double profile_column_start_ms = 0.0;
 
       framebuffer->filled_stamp += 1u;
       if (framebuffer->filled_stamp == 0u) {
@@ -9504,6 +10399,7 @@ static void render_wall_columns_dos_fixed(RenderFramebuffer *framebuffer, const 
       }
       filled_stamp = framebuffer->filled_stamp;
 
+      profile_column_start_ms = profile_now_ms();
       for (wall_index = 0u; wall_index < scene_wall_count; ++wall_index) {
         const DosSceneWall *wall = &scene_walls[wall_index];
         int32_t side1 = wall->vx1 - ((wall->vz1 * ray_x) >> 16);
@@ -9561,7 +10457,9 @@ static void render_wall_columns_dos_fixed(RenderFramebuffer *framebuffer, const 
           }
         }
       }
+      profile_add_elapsed(&g_profiler.render_wall_search_ms, profile_column_start_ms);
 
+      profile_column_start_ms = profile_now_ms();
       for (hit_index = 0u; hit_index < hit_count; ++hit_index) {
         const DosRayWallHit *hit = &hits[hit_index];
         int32_t wall_top = horizon_y + (((GLOOM_WALL_TOP_Y - cam_y) * focal_int) / hit->depth);
@@ -9575,7 +10473,7 @@ static void render_wall_columns_dos_fixed(RenderFramebuffer *framebuffer, const 
         bool fast_wall_column = false;
         bool transparent_wall_column = false;
         const uint8_t *wall_texels = NULL;
-        const uint32_t *wall_palette = NULL;
+        const uint8_t *wall_palette = NULL;
         size_t wall_texel_base = 0u;
 
         if (wall_height < 1) {
@@ -9612,12 +10510,15 @@ static void render_wall_columns_dos_fixed(RenderFramebuffer *framebuffer, const 
             local_index = texture_index % (uint8_t)GLOOM_TEXTURES_PER_SCREEN;
             if (screen_index < (size_t)GLOOM_TEXTURE_SCREENS && wall_textures->screens[screen_index].loaded &&
                 wall_textures->screens[screen_index].texels != NULL &&
+                wall_textures->screens[screen_index].column_texels != NULL &&
                 local_index < wall_textures->screens[screen_index].texture_count) {
               const WallTextureScreen *screen = &wall_textures->screens[screen_index];
 
-              wall_texels = screen->texels;
-              wall_palette = screen->shaded_palette[dark_index];
-              wall_texel_base = local_index * ((size_t)GLOOM_TEXTURE_WIDTH * (size_t)GLOOM_TEXTURE_HEIGHT) + tx;
+              wall_texels = screen->column_texels;
+              wall_palette = screen->shaded_indices[dark_index];
+              wall_texel_base =
+                  local_index * ((size_t)GLOOM_TEXTURE_WIDTH * (size_t)GLOOM_TEXTURE_HEIGHT) +
+                  tx * (size_t)GLOOM_TEXTURE_HEIGHT;
               transparent_wall_column =
                   screen->column_flags != NULL &&
                   screen->column_flags[(local_index * (size_t)GLOOM_TEXTURE_WIDTH) + tx] != 0u;
@@ -9632,47 +10533,104 @@ static void render_wall_columns_dos_fixed(RenderFramebuffer *framebuffer, const 
           int32_t tex_y_fixed = wall_v_fixed * (GLOOM_TEXTURE_HEIGHT - 1);
           int32_t tex_y_step_fixed = wall_v_step_fixed * (GLOOM_TEXTURE_HEIGHT - 1);
 
-          for (draw_y = y0; draw_y <= y1; ++draw_y) {
-            int32_t wall_v_current_fixed = wall_v_fixed;
-            uint32_t argb = 0u;
+          if (fast_wall_column) {
+            uint8_t *dst = framebuffer->index_pixels + ((size_t)y0 * (size_t)framebuffer->index_pitch_pixels) +
+                           (size_t)screen_x;
+            uint32_t *stamp = filled_stamps + (y0 - y);
+            bool column_drawn = false;
 
-            wall_v_fixed += wall_v_step_fixed;
-            if (filled_stamps[draw_y - y] == filled_stamp) {
-              tex_y_fixed += tex_y_step_fixed;
-              continue;
+            if (!transparent_wall_column && hit_index == 0u) {
+              for (draw_y = y0; draw_y <= y1; ++draw_y) {
+                size_t ty = (size_t)(tex_y_fixed >> 16);
+                uint8_t palette_index = 0u;
+
+                if (ty >= (size_t)GLOOM_TEXTURE_HEIGHT) {
+                  ty = (size_t)GLOOM_TEXTURE_HEIGHT - 1u;
+                }
+                palette_index = wall_texels[wall_texel_base + ty];
+                *dst = wall_palette[palette_index];
+                *stamp = filled_stamp;
+                dst += framebuffer->index_pitch_pixels;
+                stamp += 1;
+                tex_y_fixed += tex_y_step_fixed;
+              }
+              column_drawn = true;
+            } else if (!transparent_wall_column) {
+              for (draw_y = y0; draw_y <= y1; ++draw_y) {
+                if (*stamp != filled_stamp) {
+                  size_t ty = (size_t)(tex_y_fixed >> 16);
+                  uint8_t palette_index = 0u;
+
+                  if (ty >= (size_t)GLOOM_TEXTURE_HEIGHT) {
+                    ty = (size_t)GLOOM_TEXTURE_HEIGHT - 1u;
+                  }
+                  palette_index = wall_texels[wall_texel_base + ty];
+                  *dst = wall_palette[palette_index];
+                  *stamp = filled_stamp;
+                  column_drawn = true;
+                }
+                dst += framebuffer->index_pitch_pixels;
+                stamp += 1;
+                tex_y_fixed += tex_y_step_fixed;
+              }
+            } else if (hit_index == 0u) {
+              for (draw_y = y0; draw_y <= y1; ++draw_y) {
+                size_t ty = (size_t)(tex_y_fixed >> 16);
+                uint8_t palette_index = 0u;
+
+                if (ty >= (size_t)GLOOM_TEXTURE_HEIGHT) {
+                  ty = (size_t)GLOOM_TEXTURE_HEIGHT - 1u;
+                }
+                palette_index = wall_texels[wall_texel_base + ty];
+                if (palette_index != 0u) {
+                  *dst = wall_palette[palette_index];
+                  *stamp = filled_stamp;
+                  column_drawn = true;
+                }
+                dst += framebuffer->index_pitch_pixels;
+                stamp += 1;
+                tex_y_fixed += tex_y_step_fixed;
+              }
+            } else {
+              for (draw_y = y0; draw_y <= y1; ++draw_y) {
+                if (*stamp != filled_stamp) {
+                  size_t ty = (size_t)(tex_y_fixed >> 16);
+                  uint8_t palette_index = 0u;
+
+                  if (ty >= (size_t)GLOOM_TEXTURE_HEIGHT) {
+                    ty = (size_t)GLOOM_TEXTURE_HEIGHT - 1u;
+                  }
+                  palette_index = wall_texels[wall_texel_base + ty];
+                  if (palette_index != 0u) {
+                    *dst = wall_palette[palette_index];
+                    *stamp = filled_stamp;
+                    column_drawn = true;
+                  }
+                }
+                dst += framebuffer->index_pitch_pixels;
+                stamp += 1;
+                tex_y_fixed += tex_y_step_fixed;
+              }
             }
+            if (column_drawn && hit->depth < depth_buffer[i]) {
+              depth_buffer[i] = hit->depth;
+            }
+            if (!transparent_wall_column) {
+              break;
+            }
+          } else {
+            for (draw_y = y0; draw_y <= y1; ++draw_y) {
+              uint8_t alpha = 0u;
+              float wall_u = (float)hit->wall_u / 65536.0f;
+              float wall_v = (float)wall_v_fixed / 65536.0f;
+              uint32_t argb = 0u;
+              uint8_t color_index = 0u;
 
-            if (fast_wall_column) {
-              int32_t tex_y_clamped = tex_y_fixed;
-              size_t ty = 0u;
-              uint8_t palette_index = 0u;
-
-              if (tex_y_clamped < 0) {
-                tex_y_clamped = 0;
-              }
-              if (tex_y_clamped > ((GLOOM_TEXTURE_HEIGHT - 1) << 16)) {
-                tex_y_clamped = (GLOOM_TEXTURE_HEIGHT - 1) << 16;
-              }
-              ty = (size_t)(tex_y_clamped >> 16);
-              palette_index = wall_texels[wall_texel_base + (ty * (size_t)GLOOM_TEXTURE_WIDTH)];
-
-              if (transparent_wall_column && palette_index == 0u) {
+              wall_v_fixed += wall_v_step_fixed;
+              if (filled_stamps[draw_y - y] == filled_stamp) {
                 tex_y_fixed += tex_y_step_fixed;
                 continue;
               }
-              argb = wall_palette[palette_index];
-              framebuffer->pixels[(size_t)draw_y * (size_t)framebuffer->pitch_pixels + (size_t)screen_x] =
-                  0xFF000000u | (argb & 0x00FFFFFFu);
-              filled_stamps[draw_y - y] = filled_stamp;
-              if (hit->depth < depth_buffer[i]) {
-                depth_buffer[i] = hit->depth;
-              }
-              tex_y_fixed += tex_y_step_fixed;
-              continue;
-            } else {
-              uint8_t alpha = 0u;
-              float wall_u = (float)hit->wall_u / 65536.0f;
-              float wall_v = (float)wall_v_current_fixed / 65536.0f;
 
               argb = sample_zone_wall_texture_argb(wall_textures, state, hit->wall->zone, wall_u, wall_v);
               argb = shade_argb_subtract(argb, subtract);
@@ -9682,18 +10640,20 @@ static void render_wall_columns_dos_fixed(RenderFramebuffer *framebuffer, const 
               if (alpha == 0u) {
                 continue;
               }
-            }
+              color_index = dos_argb_to_opaque_index(argb);
 
-            framebuffer->pixels[(size_t)draw_y * (size_t)framebuffer->pitch_pixels + (size_t)screen_x] =
-                0xFF000000u | (argb & 0x00FFFFFFu);
-            filled_stamps[draw_y - y] = filled_stamp;
+              framebuffer->index_pixels[(size_t)draw_y * (size_t)framebuffer->index_pitch_pixels + (size_t)screen_x] =
+                  color_index;
+              filled_stamps[draw_y - y] = filled_stamp;
 
-            if (hit->depth < depth_buffer[i]) {
-              depth_buffer[i] = hit->depth;
+              if (hit->depth < depth_buffer[i]) {
+                depth_buffer[i] = hit->depth;
+              }
             }
           }
         }
       }
+      profile_add_elapsed(&g_profiler.render_wall_draw_ms, profile_column_start_ms);
     }
   }
 }
@@ -9817,6 +10777,7 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
   size_t sprite_write = 0;
   size_t i = 0;
   int horizon_y = y + (h / 2);
+  double profile_start_ms = 0.0;
 
   if (w <= 0 || h <= 0) {
     return;
@@ -9835,7 +10796,8 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
 #endif
   filled_stamps = framebuffer != NULL ? framebuffer->filled_stamps : NULL;
 #ifdef GLOOM_DOS_SDL3
-  if (depth_buffer_int == NULL || sprite_depth_buffer_int == NULL || filled_stamps == NULL) {
+  if (depth_buffer_int == NULL || sprite_depth_buffer_int == NULL || filled_stamps == NULL ||
+      framebuffer->index_pixels == NULL || framebuffer->index_pitch_pixels < framebuffer->width) {
 #else
   if (depth_buffer == NULL || sprite_depth_buffer == NULL || filled_stamps == NULL) {
 #endif
@@ -9848,11 +10810,12 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
                                         sizeof(wall_candidates) / sizeof(wall_candidates[0]));
   append_runtime_rotpoly_wall_candidates(state, wall_candidates, &wall_candidate_count,
                                          sizeof(wall_candidates) / sizeof(wall_candidates[0]), cam_x, cam_z);
+  if (g_profiler.enabled) {
+    g_profiler.wall_candidates += (uint64_t)wall_candidate_count;
+  }
 #ifndef GLOOM_DOS_SDL3
   sort_wall_candidates(wall_candidates, wall_candidate_count);
 #endif
-
-  render_flat_textures(framebuffer, state, flats, x, y, w, h, focal, far_depth, view_cos, view_sin);
 
   for (i = 0; i < (size_t)w; ++i) {
 #ifdef GLOOM_DOS_SDL3
@@ -9865,9 +10828,27 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
   }
 
 #ifdef GLOOM_DOS_SDL3
+  profile_start_ms = profile_now_ms();
+  for (i = 0u; i < (size_t)h; ++i) {
+    memset(framebuffer->index_pixels + ((size_t)(y + (int)i) * (size_t)framebuffer->index_pitch_pixels) + (size_t)x,
+           0, (size_t)w);
+  }
+  profile_add_elapsed(&g_profiler.render_lock_clear_ms, profile_start_ms);
+
+  profile_start_ms = profile_now_ms();
   render_wall_columns_dos_fixed(framebuffer, state, wall_textures, wall_candidates, wall_candidate_count, x, y, w, h,
                                 horizon_y, view_cos, view_sin, focal);
+  profile_add_elapsed(&g_profiler.render_wall_ms, profile_start_ms);
+
+  profile_start_ms = profile_now_ms();
+  render_flat_textures(framebuffer, state, flats, x, y, w, h, focal, far_depth, view_cos, view_sin, true);
+  profile_add_elapsed(&g_profiler.render_flat_ms, profile_start_ms);
 #else
+  profile_start_ms = profile_now_ms();
+  render_flat_textures(framebuffer, state, flats, x, y, w, h, focal, far_depth, view_cos, view_sin);
+  profile_add_elapsed(&g_profiler.render_flat_ms, profile_start_ms);
+
+  profile_start_ms = profile_now_ms();
   for (i = 0; i < wall_candidate_count; ++i) {
     const GloomZone *z = &state->map.zones[wall_candidates[i].zone_index];
     float x1 = (float)z->x1 - cam_x;
@@ -10151,8 +11132,10 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
 #endif
     }
   }
+  profile_add_elapsed(&g_profiler.render_wall_ms, profile_start_ms);
 #endif
 
+  profile_start_ms = profile_now_ms();
   if (state->map.object_spawn_count > 0u && object_visuals != NULL) {
     for (i = 0; i < state->map.object_spawn_count && sprite_write < GLOOM_MAX_DEBUG_SPRITES; ++i) {
       const GloomObjectSpawn *spawn = &state->map.object_spawns[i];
@@ -10511,8 +11494,13 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
     }
 
     argb = amiga_blood_argb(blood->color_mask, svz);
+#ifdef GLOOM_DOS_SDL3
+    framebuffer->index_pixels[(size_t)screen_y * (size_t)framebuffer->index_pitch_pixels + (size_t)screen_x] =
+        dos_argb_to_opaque_index(argb);
+#else
     framebuffer->pixels[(size_t)screen_y * (size_t)framebuffer->pitch_pixels + (size_t)screen_x] =
         0xFF000000u | (argb & 0x00FFFFFFu);
+#endif
   }
 
   for (i = 0; i < (size_t)w; ++i) {
@@ -10614,7 +11602,7 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
           sp->source_pad > 0 ? tv_step_fixed * padded_height : tv_step_fixed * (frame->height - 1);
       int dark_index = (int)amiga_depth_dark_index_int(sp->depth_int);
       const uint8_t *indexed_pixels = frame->indexed_pixels;
-      const uint32_t *sprite_palette = sp->shaded_palette != NULL ? sp->shaded_palette[dark_index] : NULL;
+      const uint8_t *sprite_palette = sp->shaded_indices != NULL ? sp->shaded_indices[dark_index] : NULL;
 
       if (indexed_pixels == NULL || sprite_palette == NULL) {
         continue;
@@ -10645,7 +11633,6 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
 
         for (draw_y = y0; draw_y <= y1; ++draw_y, source_y_fixed += source_y_step_fixed) {
           uint8_t palette_index = 0u;
-          uint32_t argb = 0;
           int sy = 0;
 
           if (sp->source_pad > 0) {
@@ -10665,9 +11652,8 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
             continue;
           }
 
-          argb = sprite_palette[palette_index];
-          framebuffer->pixels[(size_t)draw_y * (size_t)framebuffer->pitch_pixels + (size_t)screen_x] =
-              0xFF000000u | (argb & 0x00FFFFFFu);
+          framebuffer->index_pixels[(size_t)draw_y * (size_t)framebuffer->index_pitch_pixels + (size_t)screen_x] =
+              sprite_palette[palette_index];
           column_drawn = true;
         }
 
@@ -10736,6 +11722,10 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
 #endif
   }
 
+  if (g_profiler.enabled) {
+    g_profiler.sprites += (uint64_t)sprite_write;
+  }
+  profile_add_elapsed(&g_profiler.render_sprites_ms, profile_start_ms);
 }
 
 static int ui_double_scale_for_viewport(int w, int h) {
@@ -10756,10 +11746,18 @@ static void render_argb_pixels_scaled(RenderFramebuffer *framebuffer, const uint
                                       int src_height, int x, int y, int scale) {
   int sy = 0;
 
-  if (framebuffer == NULL || framebuffer->pixels == NULL || pixels == NULL || src_width <= 0 || src_height <= 0 ||
-      scale <= 0) {
+  if (framebuffer == NULL || pixels == NULL || src_width <= 0 || src_height <= 0 || scale <= 0) {
     return;
   }
+#ifdef GLOOM_DOS_SDL3
+  if (framebuffer->index_pixels == NULL || framebuffer->index_pitch_pixels < framebuffer->width) {
+    return;
+  }
+#else
+  if (framebuffer->pixels == NULL || framebuffer->pitch_pixels < framebuffer->width) {
+    return;
+  }
+#endif
 
   if (x + (src_width * scale) <= 0 || y + (src_height * scale) <= 0 || x >= framebuffer->width ||
       y >= framebuffer->height) {
@@ -10795,11 +11793,20 @@ static void render_argb_pixels_scaled(RenderFramebuffer *framebuffer, const uint
       if (dst_x1 > framebuffer->width) dst_x1 = framebuffer->width;
 
       for (draw_y = dst_y0; draw_y < dst_y1; ++draw_y) {
+#ifdef GLOOM_DOS_SDL3
+        uint8_t *row = framebuffer->index_pixels + ((size_t)draw_y * (size_t)framebuffer->index_pitch_pixels);
+        uint8_t color_index = dos_argb_to_opaque_index(argb);
+#else
         uint32_t *row = framebuffer->pixels + ((size_t)draw_y * (size_t)framebuffer->pitch_pixels);
+#endif
         int draw_x = 0;
 
         for (draw_x = dst_x0; draw_x < dst_x1; ++draw_x) {
+#ifdef GLOOM_DOS_SDL3
+          row[draw_x] = color_index;
+#else
           row[draw_x] = 0xFF000000u | (argb & 0x00FFFFFFu);
+#endif
         }
       }
     }
@@ -10820,10 +11827,11 @@ static void render_object_frame_scaled(RenderFramebuffer *framebuffer, const Obj
 #ifdef GLOOM_DOS_SDL3
 static void render_object_frame_scaled_dos_indexed(RenderFramebuffer *framebuffer, const ObjectVisual *visual,
                                                    const ObjectFrame *frame, int screen_x, int screen_y, int scale) {
-  const uint32_t *palette = visual != NULL ? visual->shaded_palette[0] : NULL;
+  const uint8_t *palette = visual != NULL ? visual->shaded_indices[0] : NULL;
   int sy = 0;
 
-  if (framebuffer == NULL || framebuffer->pixels == NULL || visual == NULL || frame == NULL ||
+  if (framebuffer == NULL || framebuffer->index_pixels == NULL ||
+      framebuffer->index_pitch_pixels < framebuffer->width || visual == NULL || frame == NULL ||
       frame->indexed_pixels == NULL || palette == NULL || frame->width <= 0 || frame->height <= 0 || scale <= 0) {
     return;
   }
@@ -10846,7 +11854,7 @@ static void render_object_frame_scaled_dos_indexed(RenderFramebuffer *framebuffe
 
     for (sx = 0; sx < frame->width; ++sx) {
       uint8_t palette_index = frame->indexed_pixels[(size_t)sy * (size_t)frame->width + (size_t)sx];
-      uint32_t argb = 0u;
+      uint8_t color_index = 0u;
       int dst_x0 = screen_x + (sx * scale);
       int dst_x1 = dst_x0 + scale;
       int draw_y = 0;
@@ -10857,13 +11865,13 @@ static void render_object_frame_scaled_dos_indexed(RenderFramebuffer *framebuffe
       if (dst_x0 < 0) dst_x0 = 0;
       if (dst_x1 > framebuffer->width) dst_x1 = framebuffer->width;
 
-      argb = palette[palette_index];
+      color_index = palette[palette_index];
       for (draw_y = dst_y0; draw_y < dst_y1; ++draw_y) {
-        uint32_t *row = framebuffer->pixels + ((size_t)draw_y * (size_t)framebuffer->pitch_pixels);
+        uint8_t *row = framebuffer->index_pixels + ((size_t)draw_y * (size_t)framebuffer->index_pitch_pixels);
         int draw_x = 0;
 
         for (draw_x = dst_x0; draw_x < dst_x1; ++draw_x) {
-          row[draw_x] = argb;
+          row[draw_x] = color_index;
         }
       }
     }
@@ -10998,10 +12006,18 @@ static void render_hud_glyph_scaled_brightness(RenderFramebuffer *framebuffer, c
                                                int scale, uint8_t brightness) {
   int sy = 0;
 
-  if (framebuffer == NULL || framebuffer->pixels == NULL || glyph == NULL || glyph->argb_pixels == NULL ||
-      scale <= 0) {
+  if (framebuffer == NULL || glyph == NULL || glyph->argb_pixels == NULL || scale <= 0) {
     return;
   }
+#ifdef GLOOM_DOS_SDL3
+  if (framebuffer->index_pixels == NULL || framebuffer->index_pitch_pixels < framebuffer->width) {
+    return;
+  }
+#else
+  if (framebuffer->pixels == NULL || framebuffer->pitch_pixels < framebuffer->width) {
+    return;
+  }
+#endif
 
   if (brightness >= 255u) {
     render_hud_glyph_scaled(framebuffer, glyph, x, y, scale);
@@ -11035,8 +12051,13 @@ static void render_hud_glyph_scaled_brightness(RenderFramebuffer *framebuffer, c
           if (px < 0 || px >= framebuffer->width) {
             continue;
           }
+#ifdef GLOOM_DOS_SDL3
+          framebuffer->index_pixels[(size_t)py * (size_t)framebuffer->index_pitch_pixels + (size_t)px] =
+              dos_argb_to_opaque_index(0xFF000000u | (r << 16u) | (g << 8u) | b);
+#else
           framebuffer->pixels[(size_t)py * (size_t)framebuffer->pitch_pixels + (size_t)px] =
               0xff000000u | (r << 16) | (g << 8) | b;
+#endif
         }
       }
     }
@@ -11223,10 +12244,16 @@ static void render_scene_contents(RenderFramebuffer *framebuffer, const AppState
                                   const WallTextureSet *wall_textures, const FlatTextureSet *flat_textures,
                                   const ObjectVisualSet *object_visuals, const WeaponVisualSet *weapon_visuals,
                                   const HudFont *hud_font, int x, int y, int w, int h) {
+  double profile_start_ms = 0.0;
+
   render_wall_debug(framebuffer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals, x, y,
                     w, h);
+  profile_start_ms = profile_now_ms();
   render_player_weapon(framebuffer, state, weapon_visuals, x, y, w, h);
+  profile_add_elapsed(&g_profiler.render_weapon_ms, profile_start_ms);
+  profile_start_ms = profile_now_ms();
   render_player_weapon_status(framebuffer, state, hud_font, x, y, w, h);
+  profile_add_elapsed(&g_profiler.render_hud_ms, profile_start_ms);
 }
 
 static void free_menu_image(MenuImage *image) {
@@ -11414,13 +12441,25 @@ static void render_menu_image(RenderFramebuffer *framebuffer, const MenuImage *i
     return;
   }
 
-  if (render_width <= 0 || render_height <= 0 || framebuffer->pixels == NULL || image->width <= 0 ||
-      image->height <= 0) {
+  if (render_width <= 0 || render_height <= 0 || image->width <= 0 || image->height <= 0) {
     return;
   }
+#ifdef GLOOM_DOS_SDL3
+  if (framebuffer->index_pixels == NULL || framebuffer->index_pitch_pixels < framebuffer->width) {
+    return;
+  }
+#else
+  if (framebuffer->pixels == NULL || framebuffer->pitch_pixels < framebuffer->width) {
+    return;
+  }
+#endif
 
   for (dst_y = 0; dst_y < render_height; ++dst_y) {
+#ifdef GLOOM_DOS_SDL3
+    uint8_t *dst_row = framebuffer->index_pixels + ((size_t)dst_y * (size_t)framebuffer->index_pitch_pixels);
+#else
     uint32_t *dst_row = framebuffer->pixels + ((size_t)dst_y * (size_t)framebuffer->pitch_pixels);
+#endif
     int dst_x = 0;
 
     for (dst_x = 0; dst_x < render_width; ++dst_x) {
@@ -11447,7 +12486,11 @@ static void render_menu_image(RenderFramebuffer *framebuffer, const MenuImage *i
       if (src_y < 0) src_y = 0;
       if (src_x >= image->width) src_x = image->width - 1;
       if (src_y >= image->height) src_y = image->height - 1;
+#ifdef GLOOM_DOS_SDL3
+      dst_row[dst_x] = dos_argb_to_index(image->pixels[(size_t)src_y * (size_t)image->width + (size_t)src_x]);
+#else
       dst_row[dst_x] = image->pixels[(size_t)src_y * (size_t)image->width + (size_t)src_x];
+#endif
     }
   }
 }
@@ -11458,8 +12501,26 @@ static void copy_menu_background(RenderFramebuffer *framebuffer, const uint32_t 
                                  int render_height) {
   int y = 0;
 
-  if (framebuffer == NULL || framebuffer->pixels == NULL || background == NULL || render_width <= 0 ||
-      render_height <= 0) {
+  if (framebuffer == NULL || background == NULL || render_width <= 0 || render_height <= 0) {
+    return;
+  }
+
+#ifdef GLOOM_DOS_SDL3
+  if (framebuffer->index_pixels == NULL || framebuffer->index_pitch_pixels < framebuffer->width) {
+    return;
+  }
+
+  for (y = 0; y < render_height; ++y) {
+    uint8_t *dst_row = framebuffer->index_pixels + ((size_t)y * (size_t)framebuffer->index_pitch_pixels);
+    const uint32_t *src_row = background + ((size_t)y * (size_t)render_width);
+    int x = 0;
+
+    for (x = 0; x < render_width; ++x) {
+      dst_row[x] = dos_argb_to_index(src_row[x]);
+    }
+  }
+#else
+  if (framebuffer->pixels == NULL || framebuffer->pitch_pixels < framebuffer->width) {
     return;
   }
 
@@ -11467,6 +12528,7 @@ static void copy_menu_background(RenderFramebuffer *framebuffer, const uint32_t 
     memcpy(framebuffer->pixels + ((size_t)y * (size_t)framebuffer->pitch_pixels),
            background + ((size_t)y * (size_t)render_width), (size_t)render_width * sizeof(*background));
   }
+#endif
 }
 
 static bool cache_start_menu_background(RenderFramebuffer *framebuffer, const MenuAssets *assets, int render_width,
@@ -11510,8 +12572,23 @@ static bool cache_start_menu_background(RenderFramebuffer *framebuffer, const Me
   }
   render_menu_text_brightness(framebuffer, &assets->big_font, "GLOOM WITH FRIENDS", render_width / 2, title_y,
                               title_scale, 255u);
+#ifdef GLOOM_DOS_SDL3
+  if (framebuffer->index_pixels == NULL || framebuffer->index_pitch_pixels < framebuffer->width) {
+    return false;
+  }
+  for (y = 0; y < render_height; ++y) {
+    const uint8_t *src_row = framebuffer->index_pixels + ((size_t)y * (size_t)framebuffer->index_pitch_pixels);
+    uint32_t *dst_row = *io_cache + ((size_t)y * (size_t)render_width);
+    int x = 0;
+
+    for (x = 0; x < render_width; ++x) {
+      dst_row[x] = g_dos_index_palette_argb[src_row[x]];
+    }
+  }
+#else
   copy_menu_background(&(RenderFramebuffer){.pixels = *io_cache, .pitch_pixels = render_width}, framebuffer->pixels,
                        render_width, render_height);
+#endif
   return true;
 }
 
@@ -12425,6 +13502,8 @@ static void render(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const
                    const ObjectVisualSet *object_visuals, const WeaponVisualSet *weapon_visuals,
                    const HudFont *hud_font, int render_width, int render_height) {
   int pixsize = state != NULL ? state->player_pixsize : 0;
+  double profile_render_start_ms = profile_now_ms();
+  double profile_start_ms = 0.0;
 
   if (framebuffer == NULL || framebuffer->texture == NULL || framebuffer->width != render_width ||
       framebuffer->height != render_height) {
@@ -12432,6 +13511,7 @@ static void render(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const
     return;
   }
 
+  profile_start_ms = profile_now_ms();
   if (!begin_render_framebuffer(framebuffer)) {
     return;
   }
@@ -12439,6 +13519,7 @@ static void render(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const
       wall_textures == NULL || wall_textures->loaded_count == 0u) {
     framebuffer_clear(framebuffer, 0xFF000000u);
   }
+  profile_add_elapsed(&g_profiler.render_lock_clear_ms, profile_start_ms);
   if (state != NULL && state->two_player_mode) {
     AppState player2_state = *state;
     RuntimePlayerState player1_state;
@@ -12448,23 +13529,30 @@ static void render(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const
     capture_primary_player_state(state, &player1_state);
     render_scene_contents(framebuffer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals,
                           hud_font, 0, 0, left_w, render_height);
+    profile_start_ms = profile_now_ms();
     apply_player_red_palette_rect(framebuffer, state, 0, 0, left_w, render_height);
+    profile_add_elapsed(&g_profiler.render_red_ms, profile_start_ms);
     apply_primary_player_state(&player2_state, &state->player2);
     player2_state.player2 = player1_state;
     player2_state.active_player_index = 1u;
     render_scene_contents(framebuffer, &player2_state, grid_offsets, wall_textures, flat_textures, object_visuals,
                           weapon_visuals, hud_font, left_w, 0, right_w, render_height);
+    profile_start_ms = profile_now_ms();
     apply_player_red_palette_rect(framebuffer, &player2_state, left_w, 0, right_w, render_height);
+    profile_add_elapsed(&g_profiler.render_red_ms, profile_start_ms);
   } else {
     render_scene_contents(framebuffer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals,
                           hud_font, 0, 0, render_width, render_height);
+    profile_start_ms = profile_now_ms();
     apply_player_red_palette(framebuffer, state);
+    profile_add_elapsed(&g_profiler.render_red_ms, profile_start_ms);
   }
 #ifndef GLOOM_DOS_SDL3
   snapshot_render_framebuffer(framebuffer);
 #endif
   end_render_framebuffer(framebuffer);
 
+  profile_start_ms = profile_now_ms();
 #ifndef GLOOM_DOS_SDL3
   SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
   SDL_RenderClear(renderer);
@@ -12482,6 +13570,8 @@ static void render(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const
   }
 
   SDL_RenderPresent(renderer);
+  profile_add_elapsed(&g_profiler.render_present_ms, profile_start_ms);
+  profile_add_elapsed(&g_profiler.render_ms, profile_render_start_ms);
 }
 
 static int16_t interpolate_int16(int16_t previous, int16_t current, float alpha) {
@@ -14720,6 +15810,9 @@ static bool load_runtime_level(const char *map_path, AppState *state, WallTextur
   *wall_textures = next_wall_textures;
   *flat_textures = next_flat_textures;
   *object_visuals = next_object_visuals;
+#ifdef GLOOM_DOS_SDL3
+  rebuild_dos_level_index_mappings(wall_textures, flat_textures, object_visuals);
+#endif
 
   if (resolved_map_path != NULL && resolved_map_path_size > 0u) {
     (void)snprintf(resolved_map_path, resolved_map_path_size, "%s", resolved);
@@ -15257,6 +16350,7 @@ int main(int argc, char **argv) {
   bool combat_mode = false;
   bool skip_menu = false;
   uint8_t violence_mode = GLOOM_VIOLENCE_MEATY_MESSY;
+  uint32_t profile_render_frames = 0u;
   bool level_transition_pending = false;
   bool combat_round_pending = false;
   AppState state;
@@ -15404,6 +16498,21 @@ int main(int argc, char **argv) {
         combat_mode = true;
       } else if (strcmp(argv[argi], "--skip-menu") == 0) {
         skip_menu = true;
+      } else if (strcmp(argv[argi], "--profile-render") == 0) {
+        char *end = NULL;
+        long parsed = 0;
+
+        if (argi + 1 >= argc) {
+          fprintf(stderr, "--profile-render requires a frame count, for example --profile-render 60\n");
+          return 1;
+        }
+        parsed = strtol(argv[++argi], &end, 10);
+        if (end == argv[argi] || *end != '\0' || parsed < 1 || parsed > 10000) {
+          fprintf(stderr, "--profile-render requires a frame count from 1 to 10000\n");
+          return 1;
+        }
+        profile_render_frames = (uint32_t)parsed;
+        skip_menu = true;
       } else if (strcmp(argv[argi], "--player-projectiles") == 0 ||
                  strcmp(argv[argi], "--legacy-projectiles") == 0) {
         barrel_projectile_origin = false;
@@ -15435,6 +16544,9 @@ int main(int argc, char **argv) {
       return 1;
     }
     resolved_map_path = map_path_buffer;
+#ifdef GLOOM_DOS_SDL3
+    refresh_dos_index_palette(&framebuffer, window);
+#endif
   }
 
   if (!gloom_map_load(resolved_map_path, &state.map, error, sizeof(error))) {
@@ -15496,6 +16608,9 @@ int main(int argc, char **argv) {
     gloom_map_free(&state.map);
     return 1;
   }
+#ifdef GLOOM_DOS_SDL3
+  register_dos_hud_font_palette(&hud_font);
+#endif
 
   compute_map_bounds(&state);
 
@@ -15528,6 +16643,9 @@ int main(int argc, char **argv) {
     gloom_map_free(&state.map);
     return 1;
   }
+#ifdef GLOOM_DOS_SDL3
+  rebuild_dos_runtime_index_mappings(&wall_textures, &flat_textures, &object_visuals, &weapon_visuals);
+#endif
 
   if (state.map.zone_count > (size_t)GLOOM_MAX_RENDER_ZONES) {
     fprintf(stderr, "Cannot load %s: zone count %zu exceeds fixed render buffer capacity %u\n", resolved_map_path,
@@ -15625,6 +16743,10 @@ int main(int argc, char **argv) {
     return 1;
   }
 
+#ifdef GLOOM_DOS_SDL3
+  (void)SDL_SetHint(SDL_HINT_DOS_ALLOW_DIRECT_FRAMEBUFFER, "1");
+#endif
+
   window = SDL_CreateWindow("Gloom With Friends", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, window_width,
                             window_height, SDL_WINDOW_RESIZABLE);
   if (window == NULL) {
@@ -15649,6 +16771,7 @@ int main(int argc, char **argv) {
   fprintf(stderr, "DOS checkpoint: SDL_CreateWindow ok %dx%d render=%dx%d\n", window_width, window_height,
           render_width, render_height);
   fflush(stderr);
+  configure_dos_index_display_mode(window, render_width, render_height);
 #endif
 
   renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
@@ -15682,6 +16805,9 @@ int main(int argc, char **argv) {
 
   (void)SDL_RenderSetIntegerScale(renderer, classic_viewport ? SDL_TRUE : SDL_FALSE);
   (void)SDL_RenderSetLogicalSize(renderer, render_width, render_height);
+#ifdef GLOOM_DOS_SDL3
+  apply_dos_index_palette_to_window(window);
+#endif
   if (!ensure_render_framebuffer(renderer, &framebuffer, render_width, render_height)) {
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(window);
@@ -15837,6 +16963,12 @@ int main(int argc, char **argv) {
   if (previous_zones != NULL) {
     previous_state.map.zones = previous_zones;
   }
+  if (profile_render_frames > 0u) {
+    memset(&g_profiler, 0, sizeof(g_profiler));
+    g_profiler.enabled = true;
+    g_profiler.target_frames = profile_render_frames;
+    profile_logf("PROFILE begin frames=%u map=%s", (unsigned)profile_render_frames, resolved_map_path);
+  }
   perf_frequency = SDL_GetPerformanceFrequency();
   perf_prev = SDL_GetPerformanceCounter();
 
@@ -15845,6 +16977,8 @@ int main(int argc, char **argv) {
     AppState render_state;
     float render_alpha = 0.0f;
     bool pause_menu_requested = false;
+    double profile_frame_start_ms = profile_now_ms();
+    double profile_start_ms = 0.0;
     uint64_t perf_now = SDL_GetPerformanceCounter();
     double elapsed = (double)(perf_now - perf_prev) / (double)perf_frequency;
     perf_prev = perf_now;
@@ -15923,6 +17057,7 @@ int main(int argc, char **argv) {
 #endif
       }
     }
+    profile_add_elapsed(&g_profiler.events_ms, profile_start_ms);
 
     if (pause_menu_requested && running) {
       render_alpha = (float)(accumulator / dt);
@@ -15960,6 +17095,9 @@ int main(int argc, char **argv) {
           running = false;
           continue;
         }
+#ifdef GLOOM_DOS_SDL3
+        refresh_dos_index_palette(&framebuffer, window);
+#endif
         mouse_captured = set_runtime_mouse_capture(window, true);
         previous_state = state;
         if (previous_zones != NULL) {
@@ -15981,6 +17119,7 @@ int main(int argc, char **argv) {
       mouse_dx_accum = keyboard_look_enabled ? mouse_dx_accum - (double)keyboard_dx : 0.0;
     }
 
+    profile_start_ms = profile_now_ms();
     while (accumulator >= dt) {
       const uint8_t *keyboard = SDL_GetKeyboardState(NULL);
       bool mouse_fire = mouse_captured && !suppress_mouse_fire_until_button_up &&
@@ -15992,6 +17131,9 @@ int main(int argc, char **argv) {
         previous_state.map.zones = previous_zones;
       }
       update(&state, keyboard, mouse_fire, &object_visuals);
+      if (g_profiler.enabled) {
+        g_profiler.update_steps += 1u;
+      }
       if (state.finished == GLOOM_LEVEL_COMPLETE_FINISHED) {
         level_transition_pending = true;
         break;
@@ -16002,6 +17144,7 @@ int main(int argc, char **argv) {
       }
       accumulator -= dt;
     }
+    profile_add_elapsed(&g_profiler.update_ms, profile_start_ms);
 
     if (title_timer >= 1.0) {
 #ifndef __EMSCRIPTEN__
@@ -16024,8 +17167,10 @@ int main(int argc, char **argv) {
       title_timer = 0.0;
     }
 
+    profile_start_ms = profile_now_ms();
     render_alpha = (float)(accumulator / dt);
     render_state = interpolate_render_state(&previous_state, &state, render_alpha, render_zones, state.map.zone_count);
+    profile_add_elapsed(&g_profiler.interpolate_ms, profile_start_ms);
     render(renderer, &framebuffer, &render_state, &grid_offsets, &wall_textures, &flat_textures, &object_visuals,
            &weapon_visuals, &hud_font, render_width, render_height);
 
@@ -16053,6 +17198,9 @@ int main(int argc, char **argv) {
           running = false;
           continue;
         }
+#ifdef GLOOM_DOS_SDL3
+        refresh_dos_index_palette(&framebuffer, window);
+#endif
         mouse_captured = set_runtime_mouse_capture(window, true);
         previous_state = state;
         if (previous_zones != NULL) {
@@ -16077,6 +17225,9 @@ int main(int argc, char **argv) {
         continue;
       }
       resolved_map_path = map_path_buffer;
+#ifdef GLOOM_DOS_SDL3
+      refresh_dos_index_palette(&framebuffer, window);
+#endif
       previous_state = state;
       if (previous_zones != NULL) {
         previous_state.map.zones = previous_zones;
@@ -16128,6 +17279,9 @@ int main(int argc, char **argv) {
           running = false;
           continue;
         }
+#ifdef GLOOM_DOS_SDL3
+        refresh_dos_index_palette(&framebuffer, window);
+#endif
         mouse_captured = set_runtime_mouse_capture(window, true);
         previous_state = state;
         if (previous_zones != NULL) {
@@ -16153,14 +17307,26 @@ int main(int argc, char **argv) {
       }
 
       resolved_map_path = map_path_buffer;
+#ifdef GLOOM_DOS_SDL3
+      refresh_dos_index_palette(&framebuffer, window);
+#endif
       previous_state = state;
       if (previous_zones != NULL) {
         previous_state.map.zones = previous_zones;
       }
       accumulator = 0.0;
     }
+
+    if (g_profiler.enabled) {
+      profile_add_elapsed(&g_profiler.frame_ms, profile_frame_start_ms);
+      g_profiler.frames += 1u;
+      if (g_profiler.frames >= g_profiler.target_frames) {
+        running = false;
+      }
+    }
   }
 
+  profile_report(render_width, render_height);
   free(previous_zones);
   free(render_zones);
   free_menu_assets(&menu_assets);
