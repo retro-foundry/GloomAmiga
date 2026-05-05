@@ -9,6 +9,7 @@ include(FetchContent)
 
 option(GLOOM_FETCH_SDL "Fetch SDL2 from source" ON)
 option(GLOOM_ENABLE_WEB_ASSETS "Preload game assets when targeting Emscripten" ON)
+option(GLOOM_ENABLE_MENU_MUSIC "Enable original Amiga title music on web/desktop builds" ON)
 set(GLOOM_BINARY_VERSION "${PROJECT_VERSION}" CACHE STRING "Version string embedded in native/DOS binary builds")
 
 if(NOT EMSCRIPTEN AND GLOOM_FETCH_SDL)
@@ -24,6 +25,38 @@ if(NOT EMSCRIPTEN AND GLOOM_FETCH_SDL)
   )
 
   FetchContent_MakeAvailable(SDL2)
+endif()
+
+if(NOT EMSCRIPTEN AND NOT DEFINED GLOOM_DOS_SDL3 AND GLOOM_ENABLE_MENU_MUSIC)
+  set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+  set(SDL2MIXER_INSTALL OFF CACHE BOOL "" FORCE)
+  set(SDL2MIXER_SAMPLES OFF CACHE BOOL "" FORCE)
+  set(SDL2MIXER_DEPS_SHARED OFF CACHE BOOL "" FORCE)
+  set(SDL2MIXER_VENDORED ON CACHE BOOL "" FORCE)
+  set(SDL2MIXER_FLAC OFF CACHE BOOL "" FORCE)
+  set(SDL2MIXER_GME OFF CACHE BOOL "" FORCE)
+  set(SDL2MIXER_MOD ON CACHE BOOL "" FORCE)
+  set(SDL2MIXER_MOD_MODPLUG OFF CACHE BOOL "" FORCE)
+  set(SDL2MIXER_MOD_XMP ON CACHE BOOL "" FORCE)
+  set(SDL2MIXER_MP3 OFF CACHE BOOL "" FORCE)
+  set(SDL2MIXER_MIDI OFF CACHE BOOL "" FORCE)
+  set(SDL2MIXER_OPUS OFF CACHE BOOL "" FORCE)
+  set(SDL2MIXER_VORBIS "" CACHE STRING "" FORCE)
+  set(SDL2MIXER_WAVPACK OFF CACHE BOOL "" FORCE)
+  set(SDL2MIXER_WAVE ON CACHE BOOL "" FORCE)
+
+  FetchContent_Declare(
+    SDL2_mixer
+    GIT_REPOSITORY https://github.com/libsdl-org/SDL_mixer.git
+    GIT_TAG release-2.8.1
+    GIT_SHALLOW TRUE
+    GIT_SUBMODULES_RECURSE TRUE
+  )
+
+  FetchContent_MakeAvailable(SDL2_mixer)
+  if(MSVC AND TARGET xmp_static)
+    target_compile_options(xmp_static PRIVATE "$<$<CONFIG:Debug>:/UDEBUG>")
+  endif()
 endif()
 
 add_executable(gloom_pc
@@ -49,8 +82,19 @@ if(EMSCRIPTEN)
     "SHELL:-sINITIAL_MEMORY=134217728"
     "SHELL:-sSTACK_SIZE=4194304"
     "SHELL:-sASYNCIFY"
-    "SHELL:-sEXPORTED_FUNCTIONS=_main,_SetWebRTCGuestConnected,_SetWebRTCGuestPlayer2Input"
+    "SHELL:-sEXPORTED_FUNCTIONS=_main,_SetWebRTCGuestConnected,_SetWebRTCGuestPlayer2Input,_SetWebMusicVolume"
   )
+  if(GLOOM_ENABLE_MENU_MUSIC)
+    target_compile_definitions(gloom_pc PRIVATE GLOOM_ENABLE_MENU_MUSIC=1)
+    target_compile_options(gloom_pc PRIVATE
+      "SHELL:-sUSE_SDL_MIXER=2"
+      "SHELL:--use-port=sdl2_mixer:formats=mod"
+    )
+    target_link_options(gloom_pc PRIVATE
+      "SHELL:-sUSE_SDL_MIXER=2"
+      "SHELL:--use-port=sdl2_mixer:formats=mod"
+    )
+  endif()
   if(GLOOM_ENABLE_WEB_ASSETS)
     target_link_options(gloom_pc PRIVATE
       "SHELL:--preload-file ${CMAKE_SOURCE_DIR}/amiga@/amiga"
@@ -170,11 +214,17 @@ if(NOT EMSCRIPTEN)
   if(TARGET SDL2::SDL2main)
     target_link_libraries(gloom_pc PRIVATE SDL2::SDL2main)
   endif()
+
+  if(GLOOM_ENABLE_MENU_MUSIC AND TARGET SDL2_mixer::SDL2_mixer-static)
+    target_compile_definitions(gloom_pc PRIVATE GLOOM_ENABLE_MENU_MUSIC=1)
+    target_link_libraries(gloom_pc PRIVATE SDL2_mixer::SDL2_mixer-static)
+  endif()
 endif()
 
 if(MSVC)
   target_compile_definitions(gloom_pc PRIVATE _CRT_SECURE_NO_WARNINGS)
   target_compile_options(gloom_pc PRIVATE /W4)
+  target_link_options(gloom_pc PRIVATE /STACK:8388608)
 else()
   target_compile_options(gloom_pc PRIVATE -Wall -Wextra -Wpedantic)
 endif()

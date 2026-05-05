@@ -4,6 +4,13 @@
 #include <SDL.h>
 #endif
 
+#if defined(GLOOM_ENABLE_MENU_MUSIC) && GLOOM_ENABLE_MENU_MUSIC && !defined(GLOOM_DOS_SDL3)
+#include <SDL_mixer.h>
+#define GLOOM_USE_SDL_MIXER 1
+#else
+#define GLOOM_USE_SDL_MIXER 0
+#endif
+
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -979,6 +986,11 @@ static bool spawn_enemy_projectile_params_ex(AppState *state, const RuntimeObjec
 static bool audio_load_sfx_bank(AudioSystem *audio);
 static bool audio_start(AudioSystem *audio);
 static void audio_shutdown(AudioSystem *audio);
+#if GLOOM_USE_SDL_MIXER
+static bool menu_music_load(void);
+#endif
+static void menu_music_start(void);
+static void menu_music_stop(void);
 static void audio_play_sfx(int sfx_id, int volume, int priority);
 static void audio_vblank_tick(void);
 static void audio_pause_output(AudioSystem *audio, bool paused, bool clear_channels);
@@ -1028,6 +1040,10 @@ static void update_with_controls(AppState *state, const PlayerControls *controls
                                  const ObjectVisualSet *object_visuals);
 
 static AudioSystem g_audio;
+#if GLOOM_USE_SDL_MIXER
+static Mix_Music *g_menu_music;
+static int g_menu_music_volume_percent = 100;
+#endif
 static RuntimeGamepad g_gamepads[GLOOM_GAMEPAD_COUNT];
 static RuntimeControlConfig g_control_config = {GLOOM_CONTROL_KEYBOARD, GLOOM_CONTROL_GAMEPAD_1};
 static bool g_webrtc_guest_connected = false;
@@ -1685,21 +1701,22 @@ static bool audio_load_sfx_bank(AudioSystem *audio) {
   return true;
 }
 
-static void audio_callback(void *userdata, Uint8 *stream, int len) {
-  AudioSystem *audio = (AudioSystem *)userdata;
+static void audio_mix_sfx_float(AudioSystem *audio, Uint8 *stream, int len, bool clear_stream) {
   float *out = (float *)stream;
   int frames = len / (int)(sizeof(float) * 2u);
   int frame = 0;
   static const double pi = 3.14159265358979323846;
 
-  memset(stream, 0, (size_t)len);
+  if (clear_stream) {
+    memset(stream, 0, (size_t)len);
+  }
   if (audio == NULL) {
     return;
   }
 
   for (frame = 0; frame < frames; ++frame) {
-    float left = 0.0f;
-    float right = 0.0f;
+    float left = clear_stream ? 0.0f : out[frame * 2];
+    float right = clear_stream ? 0.0f : out[(frame * 2) + 1];
     int channel_index = 0;
 
     for (channel_index = 0; channel_index < GLOOM_AUDIO_CHANNEL_COUNT; ++channel_index) {
@@ -1753,6 +1770,69 @@ static void audio_callback(void *userdata, Uint8 *stream, int len) {
     out[frame * 2] = clampf(left, -1.0f, 1.0f);
     out[frame * 2 + 1] = clampf(right, -1.0f, 1.0f);
   }
+}
+
+static void audio_callback(void *userdata, Uint8 *stream, int len) {
+  audio_mix_sfx_float((AudioSystem *)userdata, stream, len, true);
+}
+
+#if GLOOM_USE_SDL_MIXER
+static void audio_mixer_postmix(void *userdata, Uint8 *stream, int len) {
+  audio_mix_sfx_float((AudioSystem *)userdata, stream, len, false);
+}
+#endif
+
+static bool audio_output_ready(const AudioSystem *audio) {
+  if (audio == NULL || !audio->initialized) {
+    return false;
+  }
+#ifdef GLOOM_DOS_SDL3
+  return audio->stream != NULL;
+#else
+#if GLOOM_USE_SDL_MIXER
+  return audio->obtained.freq > 0 && audio->obtained.channels == 2;
+#else
+  return audio->device != 0u;
+#endif
+#endif
+}
+
+static void audio_lock_output(AudioSystem *audio) {
+  if (audio == NULL) {
+    return;
+  }
+#ifdef GLOOM_DOS_SDL3
+  if (audio->stream != NULL) {
+    (void)SDL_LockAudioStream(audio->stream);
+  }
+#else
+#if GLOOM_USE_SDL_MIXER
+  SDL_LockAudio();
+#else
+  if (audio->device != 0u) {
+    SDL_LockAudioDevice(audio->device);
+  }
+#endif
+#endif
+}
+
+static void audio_unlock_output(AudioSystem *audio) {
+  if (audio == NULL) {
+    return;
+  }
+#ifdef GLOOM_DOS_SDL3
+  if (audio->stream != NULL) {
+    (void)SDL_UnlockAudioStream(audio->stream);
+  }
+#else
+#if GLOOM_USE_SDL_MIXER
+  SDL_UnlockAudio();
+#else
+  if (audio->device != 0u) {
+    SDL_UnlockAudioDevice(audio->device);
+  }
+#endif
+#endif
 }
 
 #ifdef GLOOM_DOS_SDL3
@@ -2113,11 +2193,46 @@ static bool audio_start(AudioSystem *audio) {
   }
   return true;
 #else
-  SDL_AudioSpec desired;
-
   if (audio == NULL) {
     return false;
   }
+
+#if GLOOM_USE_SDL_MIXER
+  int mixer_freq = 0;
+  Uint16 mixer_format = 0;
+  int mixer_channels = 0;
+
+  if ((Mix_Init(MIX_INIT_MOD) & MIX_INIT_MOD) == 0) {
+    fprintf(stderr, "SDL_mixer MOD decoder unavailable for Amiga title music: %s\n", Mix_GetError());
+    return false;
+  }
+  if (Mix_OpenAudio(48000, AUDIO_F32SYS, 2, 1024) != 0) {
+    fprintf(stderr, "Mix_OpenAudio failed while opening shared menu music/Paula SFX output: %s\n", Mix_GetError());
+    Mix_Quit();
+    return false;
+  }
+  if (Mix_QuerySpec(&mixer_freq, &mixer_format, &mixer_channels) == 0 ||
+      mixer_format != AUDIO_F32SYS || mixer_channels != 2) {
+    fprintf(stderr, "SDL_mixer returned unsupported format/channels for shared menu music/Paula SFX output\n");
+    Mix_CloseAudio();
+    Mix_Quit();
+    return false;
+  }
+  audio->obtained.freq = mixer_freq;
+  audio->obtained.format = mixer_format;
+  audio->obtained.channels = (Uint8)mixer_channels;
+  Mix_SetPostMix(audio_mixer_postmix, audio);
+  audio->initialized = true;
+  if (!menu_music_load()) {
+    audio->initialized = false;
+    Mix_SetPostMix(NULL, NULL);
+    Mix_CloseAudio();
+    Mix_Quit();
+    return false;
+  }
+  return true;
+#else
+  SDL_AudioSpec desired;
 
   memset(&desired, 0, sizeof(desired));
   desired.freq = 48000;
@@ -2144,6 +2259,7 @@ static bool audio_start(AudioSystem *audio) {
   SDL_PauseAudioDevice(audio->device, 0);
   return true;
 #endif
+#endif
 }
 
 static void audio_shutdown(AudioSystem *audio) {
@@ -2164,13 +2280,69 @@ static void audio_shutdown(AudioSystem *audio) {
   audio->dos_audio_target_bytes = 0;
   audio->device = 0u;
 #else
+#if GLOOM_USE_SDL_MIXER
+  menu_music_stop();
+  if (g_menu_music != NULL) {
+    Mix_FreeMusic(g_menu_music);
+    g_menu_music = NULL;
+  }
+  Mix_SetPostMix(NULL, NULL);
+  Mix_CloseAudio();
+  Mix_Quit();
+#else
   if (audio->device != 0u) {
     SDL_CloseAudioDevice(audio->device);
     audio->device = 0u;
   }
 #endif
+#endif
   audio->initialized = false;
   audio_free_sfx_bank(audio);
+}
+
+#if GLOOM_USE_SDL_MIXER
+static bool menu_music_load(void) {
+  char path[512];
+
+  if (g_menu_music != NULL) {
+    return true;
+  }
+  /* Port of amiga/gloom2.s titlemed load/start path: the title MED is sfxs/med1. */
+  if (!resolve_runtime_file_path("amiga/sfxs/med1", path, sizeof(path))) {
+    fprintf(stderr, "Unable to find Amiga title music asset amiga/sfxs/med1\n");
+    return false;
+  }
+  g_menu_music = Mix_LoadMUS(path);
+  if (g_menu_music == NULL) {
+    fprintf(stderr, "Mix_LoadMUS failed for Amiga title music %s: %s\n", path, Mix_GetError());
+    return false;
+  }
+  Mix_VolumeMusic((MIX_MAX_VOLUME * g_menu_music_volume_percent) / 100);
+  return true;
+}
+#endif
+
+static void menu_music_start(void) {
+#if GLOOM_USE_SDL_MIXER
+  if (!audio_output_ready(&g_audio) || !menu_music_load()) {
+    return;
+  }
+  if (Mix_PlayingMusic() == 0) {
+    if (Mix_PlayMusic(g_menu_music, -1) != 0) {
+      fprintf(stderr, "Mix_PlayMusic failed for Amiga title music: %s\n", Mix_GetError());
+    }
+  } else if (Mix_PausedMusic() != 0) {
+    Mix_ResumeMusic();
+  }
+#endif
+}
+
+static void menu_music_stop(void) {
+#if GLOOM_USE_SDL_MIXER
+  if (Mix_PlayingMusic() != 0 || Mix_PausedMusic() != 0) {
+    Mix_HaltMusic();
+  }
+#endif
 }
 
 static void audio_start_channel_locked(AudioSystem *audio, AudioChannel *channel, int sfx_id, int volume, int priority) {
@@ -2211,30 +2383,18 @@ static void audio_play_sfx(int sfx_id, int volume, int priority) {
     return;
   }
 #else
-  if (!audio->initialized || audio->device == 0u || sfx_id < 0 || sfx_id >= GLOOM_SFX_COUNT) {
+  if (!audio_output_ready(audio) || sfx_id < 0 || sfx_id >= GLOOM_SFX_COUNT) {
     return;
   }
 #endif
 
-#ifdef GLOOM_DOS_SDL3
-  if (audio->stream != NULL) {
-    (void)SDL_LockAudioStream(audio->stream);
-  }
-#else
-  SDL_LockAudioDevice(audio->device);
-#endif
+  audio_lock_output(audio);
   for (i = 0; i < GLOOM_AUDIO_CHANNEL_COUNT; ++i) {
     AudioChannel *channel = &audio->channels[i];
 
     if (!channel->active && !channel->queued) {
       audio_start_channel_locked(audio, channel, sfx_id, volume, priority);
-#ifdef GLOOM_DOS_SDL3
-      if (audio->stream != NULL) {
-        (void)SDL_UnlockAudioStream(audio->stream);
-      }
-#else
-      SDL_UnlockAudioDevice(audio->device);
-#endif
+      audio_unlock_output(audio);
       return;
     }
   }
@@ -2249,23 +2409,11 @@ static void audio_play_sfx(int sfx_id, int volume, int priority) {
       channel->queued_sfx_id = sfx_id;
       channel->queued_volume = volume;
       channel->queued_priority = priority;
-#ifdef GLOOM_DOS_SDL3
-      if (audio->stream != NULL) {
-        (void)SDL_UnlockAudioStream(audio->stream);
-      }
-#else
-      SDL_UnlockAudioDevice(audio->device);
-#endif
+      audio_unlock_output(audio);
       return;
     }
   }
-#ifdef GLOOM_DOS_SDL3
-  if (audio->stream != NULL) {
-    (void)SDL_UnlockAudioStream(audio->stream);
-  }
-#else
-  SDL_UnlockAudioDevice(audio->device);
-#endif
+  audio_unlock_output(audio);
 }
 
 static void audio_play_ui_beep(int hz, int duration_ms, float volume) {
@@ -2277,7 +2425,7 @@ static void audio_play_ui_beep(int hz, int duration_ms, float volume) {
     return;
   }
 #else
-  if (!audio->initialized || audio->device == 0u || audio->obtained.freq <= 0) {
+  if (!audio_output_ready(audio) || audio->obtained.freq <= 0) {
     return;
   }
 #endif
@@ -2287,13 +2435,7 @@ static void audio_play_ui_beep(int hz, int duration_ms, float volume) {
     total = 1u;
   }
 
-#ifdef GLOOM_DOS_SDL3
-  if (audio->stream != NULL) {
-    (void)SDL_LockAudioStream(audio->stream);
-  }
-#else
-  SDL_LockAudioDevice(audio->device);
-#endif
+  audio_lock_output(audio);
   audio->ui_beep_total = total;
   audio->ui_beep_remaining = total;
   audio->ui_beep_phase = 0.0;
@@ -2306,13 +2448,7 @@ static void audio_play_ui_beep(int hz, int duration_ms, float volume) {
       audio->obtained.freq > 0 ? (uint32_t)(((uint64_t)(unsigned)hz << 32) / (uint32_t)audio->obtained.freq) : 0u;
   audio->ui_beep_volume_s16 = (int)(volume * 32767.0f);
 #endif
-#ifdef GLOOM_DOS_SDL3
-  if (audio->stream != NULL) {
-    (void)SDL_UnlockAudioStream(audio->stream);
-  }
-#else
-  SDL_UnlockAudioDevice(audio->device);
-#endif
+  audio_unlock_output(audio);
 }
 
 static void audio_play_ui_move(void) {
@@ -2342,23 +2478,11 @@ static void audio_vblank_tick(void) {
   AudioSystem *audio = &g_audio;
   int i = 0;
 
-#ifdef GLOOM_DOS_SDL3
-  if (!audio->initialized || audio->stream == NULL) {
+  if (!audio_output_ready(audio)) {
     return;
   }
-#else
-  if (!audio->initialized || audio->device == 0u) {
-    return;
-  }
-#endif
 
-#ifdef GLOOM_DOS_SDL3
-  if (audio->stream != NULL) {
-    (void)SDL_LockAudioStream(audio->stream);
-  }
-#else
-  SDL_LockAudioDevice(audio->device);
-#endif
+  audio_lock_output(audio);
   for (i = 0; i < GLOOM_AUDIO_CHANNEL_COUNT; ++i) {
     AudioChannel *channel = &audio->channels[i];
 
@@ -2377,37 +2501,19 @@ static void audio_vblank_tick(void) {
       audio_start_channel_locked(audio, channel, sfx_id, volume, priority);
     }
   }
-#ifdef GLOOM_DOS_SDL3
-  if (audio->stream != NULL) {
-    (void)SDL_UnlockAudioStream(audio->stream);
-  }
-#else
-  SDL_UnlockAudioDevice(audio->device);
-#endif
+  audio_unlock_output(audio);
 }
 
 static void audio_pause_output(AudioSystem *audio, bool paused, bool clear_channels) {
   if (audio == NULL || !audio->initialized) {
     return;
   }
-#ifdef GLOOM_DOS_SDL3
-  if (audio->stream == NULL) {
+  if (!audio_output_ready(audio)) {
     return;
   }
-#else
-  if (audio->device == 0u) {
-    return;
-  }
-#endif
 
   if (clear_channels) {
-#ifdef GLOOM_DOS_SDL3
-    if (audio->stream != NULL) {
-      (void)SDL_LockAudioStream(audio->stream);
-    }
-#else
-    SDL_LockAudioDevice(audio->device);
-#endif
+    audio_lock_output(audio);
     memset(audio->channels, 0, sizeof(audio->channels));
     audio->ui_beep_remaining = 0u;
     audio->ui_beep_total = 0u;
@@ -2416,12 +2522,12 @@ static void audio_pause_output(AudioSystem *audio, bool paused, bool clear_chann
     audio->ui_beep_volume = 0.0f;
 #ifdef GLOOM_DOS_SDL3
     if (audio->stream != NULL) {
-      (void)SDL_UnlockAudioStream(audio->stream);
+      audio_unlock_output(audio);
       (void)SDL_ClearAudioStream(audio->stream);
       SDL_DOSSoundBlasterClearQueuedAudio(audio->device);
     }
 #else
-    SDL_UnlockAudioDevice(audio->device);
+    audio_unlock_output(audio);
 #endif
   }
 #ifdef GLOOM_DOS_SDL3
@@ -2433,7 +2539,11 @@ static void audio_pause_output(AudioSystem *audio, bool paused, bool clear_chann
     }
   }
 #else
+#if GLOOM_USE_SDL_MIXER
+  (void)paused;
+#else
   SDL_PauseAudioDevice(audio->device, paused ? 1 : 0);
+#endif
 #endif
 }
 
@@ -6860,6 +6970,20 @@ EMSCRIPTEN_KEEPALIVE void SetWebRTCGuestConnected(int connected) {
 
 EMSCRIPTEN_KEEPALIVE void SetWebRTCGuestPlayer2Input(unsigned int input) {
   g_webrtc_guest_player2_input = input;
+}
+
+EMSCRIPTEN_KEEPALIVE void SetWebMusicVolume(int percent) {
+#if GLOOM_USE_SDL_MIXER
+  if (percent < 0) {
+    percent = 0;
+  } else if (percent > 100) {
+    percent = 100;
+  }
+  g_menu_music_volume_percent = percent;
+  Mix_VolumeMusic((MIX_MAX_VOLUME * percent) / 100);
+#else
+  (void)percent;
+#endif
 }
 #endif
 
@@ -14995,6 +15119,7 @@ static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer
 #endif
     end_render_framebuffer(framebuffer);
   }
+  menu_music_start();
 
   while (running) {
     SDL_Event event;
@@ -15004,6 +15129,7 @@ static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer
     while (SDL_PollEvent(&event) != 0) {
       gamepad_handle_event(&event);
       if (event.type == SDL_QUIT) {
+        menu_music_stop();
         return -1;
       }
       if (event.type == SDL_KEYDOWN && event.key.repeat == 0) {
@@ -15029,15 +15155,18 @@ static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer
           result = activate_start_menu_selection(selected_index, out_game_mode, io_control_config, &selected_visible,
                                                  &flash_ticks);
           if (result > 0) {
+            menu_music_stop();
             return 0;
           }
           if (result < 0) {
+            menu_music_stop();
             return -1;
           }
           redraw = true;
         } else if (sym == SDLK_ESCAPE) {
 #ifndef __EMSCRIPTEN__
           audio_play_ui_back();
+          menu_music_stop();
           return -1;
 #endif
         }
@@ -15068,9 +15197,11 @@ static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer
           result = activate_start_menu_selection(selected_index, out_game_mode, io_control_config, &selected_visible,
                                                  &flash_ticks);
           if (result > 0) {
+            menu_music_stop();
             return 0;
           }
           if (result < 0) {
+            menu_music_stop();
             return -1;
           }
           redraw = true;
@@ -15097,19 +15228,23 @@ static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer
           result = activate_start_menu_selection(selected_index, out_game_mode, io_control_config, &selected_visible,
                                                  &flash_ticks);
           if (result > 0) {
+            menu_music_stop();
             return 0;
           }
           if (result < 0) {
+            menu_music_stop();
             return -1;
           }
           redraw = true;
         } else if (gamepad_menu_back_event(&event)) {
 #ifndef __EMSCRIPTEN__
           audio_play_ui_back();
+          menu_music_stop();
           return -1;
 #endif
         }
       }
+      menu_music_start();
     }
 
     if (now - last_tick >= (uint32_t)(1000 / GLOOM_AMIGA_GAME_TICK_HZ)) {
@@ -15149,6 +15284,7 @@ static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer
 #endif
   }
 
+  menu_music_stop();
   return -1;
 }
 

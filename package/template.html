@@ -361,6 +361,12 @@
             gloomRuntimeReady: false,
             onRuntimeInitialized() {
                 Module.gloomRuntimeReady = true;
+                if (typeof window.gloomApplySavedVolume === 'function') {
+                    window.gloomApplySavedVolume();
+                } else if (typeof Module._SetWebMusicVolume === 'function' &&
+                           typeof Module.gloomPendingMusicVolumePercent === 'number') {
+                    Module._SetWebMusicVolume(Module.gloomPendingMusicVolumePercent | 0);
+                }
                 if (typeof window.gloomSyncWebRTCStateToWasm === 'function') {
                     window.gloomSyncWebRTCStateToWasm();
                 }
@@ -449,7 +455,30 @@
                 return true;
             }
 
+            function currentVolumePercent() {
+                if (!webrtcVolumeSlider) return 100;
+                var pct = parseInt(webrtcVolumeSlider.value, 10);
+                if (isNaN(pct)) pct = 100;
+                return Math.max(0, Math.min(100, pct));
+            }
+
+            function applyWebMusicVolume(percent) {
+                percent = Math.max(0, Math.min(100, percent | 0));
+                if (typeof Module === 'undefined') return;
+                Module.gloomPendingMusicVolumePercent = percent;
+                if (typeof Module._SetWebMusicVolume === 'function') {
+                    Module._SetWebMusicVolume(percent);
+                }
+            }
+
             function applyVolume(value01) {
+                var pct = Math.round(Math.max(0, Math.min(1, value01)) * 100);
+                if (!state || state.role !== 'guest') {
+                    applyWebMusicVolume(pct);
+                }
+                if (!state) {
+                    return;
+                }
                 if (state.role === 'guest') {
                     if (remoteVideo) remoteVideo.volume = value01;
                     return;
@@ -470,14 +499,18 @@
                         webrtcVolumeSlider.value = n;
                     }
                 }
+                window.gloomApplySavedVolume = function() {
+                    applyVolume(currentVolumePercent() / 100);
+                };
+                window.gloomApplySavedVolume();
                 webrtcVolumeSlider.addEventListener('input', function() {
-                    var pct = parseInt(webrtcVolumeSlider.value, 10);
+                    var pct = currentVolumePercent();
                     var v = Math.max(0, Math.min(1, pct / 100));
                     applyVolume(v);
                     localStorage.setItem(VOLUME_STORAGE_KEY, String(pct));
                 });
                 webrtcVolumeSlider.addEventListener('change', function() {
-                    var pct = parseInt(webrtcVolumeSlider.value, 10);
+                    var pct = currentVolumePercent();
                     localStorage.setItem(VOLUME_STORAGE_KEY, String(pct));
                 });
             }
@@ -547,7 +580,7 @@
                 return url.toString();
             }
 
-            const state = {
+            var state = {
                 role: null,
                 room: null,
                 peerId: makePeerId(),
