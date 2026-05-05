@@ -6266,7 +6266,7 @@ static void play_player_footstep_sfx(void) {
 }
 
 static void apply_mouse_look(AppState *state, int mouse_dx) {
-  if (state == NULL || mouse_dx == 0) {
+  if (state == NULL || mouse_dx == 0 || state->player_dead) {
     return;
   }
 
