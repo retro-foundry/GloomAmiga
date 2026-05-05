@@ -16751,6 +16751,13 @@ static void dos_runtime_reset_absolute_mouse_capture(void) {
   g_dos_mouse_absolute_x = 0.0f;
 }
 
+static void dos_runtime_set_mouse_pump_enabled(bool enabled) {
+  SDL_SetHint("SDL_DOS_SKIP_MOUSE_PUMP", enabled ? "0" : "1");
+  SDL_SetEventEnabled(SDL_EVENT_MOUSE_MOTION, enabled);
+  SDL_SetEventEnabled(SDL_EVENT_MOUSE_BUTTON_DOWN, enabled);
+  SDL_SetEventEnabled(SDL_EVENT_MOUSE_BUTTON_UP, enabled);
+}
+
 static void dos_runtime_center_mouse(SDL_Window *window) {
   int window_width = 0;
   int window_height = 0;
@@ -16793,32 +16800,30 @@ static bool set_runtime_mouse_capture(SDL_Window *window, bool captured) {
   }
 
   if (captured) {
+#ifdef GLOOM_DOS_SDL3
+    dos_runtime_set_mouse_pump_enabled(true);
+    dos_logf("DOS mouse: using absolute motion capture");
+    g_dos_mouse_absolute_capture = true;
+    g_dos_mouse_absolute_valid = false;
+    dos_runtime_center_mouse(window);
+#else
     if (SDL_SetRelativeMouseMode(SDL_TRUE) != 0) {
       fprintf(stderr, "SDL_SetRelativeMouseMode(SDL_TRUE) failed: %s\n", SDL_GetError());
-#ifdef GLOOM_DOS_SDL3
-      dos_logf("DOS mouse: relative mode failed; using absolute motion capture: %s", SDL_GetError());
-      g_dos_mouse_absolute_capture = true;
-      g_dos_mouse_absolute_valid = false;
-      dos_runtime_center_mouse(window);
-#else
       return false;
-#endif
-    }
-#ifdef GLOOM_DOS_SDL3
-    else {
-      dos_logf("DOS mouse: relative mode enabled");
-      dos_runtime_reset_absolute_mouse_capture();
     }
 #endif
     SDL_SetWindowGrab(window, SDL_TRUE);
     g_runtime_mouse_capture_active = true;
     (void)SDL_ShowCursor(SDL_DISABLE);
   } else {
+#ifndef GLOOM_DOS_SDL3
     if (SDL_SetRelativeMouseMode(SDL_FALSE) != 0) {
       fprintf(stderr, "SDL_SetRelativeMouseMode(SDL_FALSE) failed: %s\n", SDL_GetError());
     }
+#endif
 #ifdef GLOOM_DOS_SDL3
     dos_runtime_reset_absolute_mouse_capture();
+    dos_runtime_set_mouse_pump_enabled(false);
 #endif
     (void)SDL_CaptureMouse(SDL_FALSE);
     SDL_SetWindowGrab(window, SDL_FALSE);
@@ -16835,12 +16840,7 @@ static bool set_runtime_mouse_capture(SDL_Window *window, bool captured) {
 }
 
 static bool set_gameplay_start_mouse_capture(SDL_Window *window) {
-#ifdef GLOOM_DOS_SDL3
-  (void)window;
-  return false;
-#else
   return set_runtime_mouse_capture(window, true);
-#endif
 }
 
 int main(int argc, char **argv) {
@@ -17359,9 +17359,7 @@ int main(int argc, char **argv) {
   (void)SDL_RenderSetIntegerScale(renderer, classic_viewport ? SDL_TRUE : SDL_FALSE);
   (void)SDL_RenderSetLogicalSize(renderer, render_width, render_height);
 #ifdef GLOOM_DOS_SDL3
-  SDL_SetEventEnabled(SDL_EVENT_MOUSE_MOTION, false);
-  SDL_SetEventEnabled(SDL_EVENT_MOUSE_BUTTON_DOWN, false);
-  SDL_SetEventEnabled(SDL_EVENT_MOUSE_BUTTON_UP, false);
+  dos_runtime_set_mouse_pump_enabled(false);
   apply_dos_index_palette_to_window(window);
 #endif
   if (!ensure_render_framebuffer(renderer, &framebuffer, render_width, render_height)) {
