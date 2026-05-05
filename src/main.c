@@ -49,6 +49,7 @@ static void dos_logf(const char *fmt, ...) {
 enum {
   BASE_WIDTH = 320,
   BASE_HEIGHT = 224,
+  DOS_LOWEST_HEIGHT = 200,
   WIDESCREEN_WIDTH = 400,
   DEFAULT_WINDOW_WIDTH = 1280,
   DEFAULT_WINDOW_HEIGHT = 720,
@@ -635,6 +636,7 @@ typedef struct {
   uint8_t shaded_indices[16][256];
   uint8_t palette_used[256];
   uint8_t *column_texels;
+  uint8_t *column_shaded_texels;
 #endif
   uint8_t *texels;
   uint8_t *column_flags;
@@ -654,6 +656,7 @@ typedef struct {
 #ifdef GLOOM_DOS_SDL3
   uint8_t shaded_indices[16][256];
   uint8_t palette_used[256];
+  uint8_t *shaded_texels;
 #endif
   uint8_t *texels;
 } FlatTexture;
@@ -803,6 +806,12 @@ typedef struct {
   const DosSceneWall *wall;
   int32_t depth;
   int32_t wall_u;
+  bool fast_wall_column;
+  bool transparent_wall_column;
+  const uint8_t *wall_texels;
+  const uint8_t *wall_shaded_texels;
+  const uint8_t *wall_palette;
+  size_t wall_texel_base;
 } DosRayWallHit;
 #endif
 
@@ -933,7 +942,9 @@ void runtime_emscripten_canvas_cursor_default(void);
 void runtime_emscripten_install_fullscreen_listeners(void);
 void runtime_emscripten_canvas_fullscreen_toggle(void);
 static bool runtime_emscripten_consume_fullscreen_resize(void);
+#ifndef GLOOM_DOS_SDL3
 static void select_aspect_720p_resolution(int *io_width, int *io_height);
+#endif
 static void initialize_combat_rotation_state(AppState *state, uint8_t series, int16_t start_lives);
 static bool resolve_next_combat_map(AppState *state, char *out_map_path, size_t out_map_path_size);
 static void initialize_wall_texture_remap(AppState *state);
@@ -2422,6 +2433,7 @@ static void free_wall_texture_set(WallTextureSet *set) {
     free(set->screens[i].column_flags);
 #ifdef GLOOM_DOS_SDL3
     free(set->screens[i].column_texels);
+    free(set->screens[i].column_shaded_texels);
 #endif
   }
 
@@ -2441,12 +2453,14 @@ static bool clone_wall_texture_screen(const WallTextureScreen *source, WallTextu
   free(destination->column_flags);
 #ifdef GLOOM_DOS_SDL3
   free(destination->column_texels);
+  free(destination->column_shaded_texels);
 #endif
   *destination = *source;
   destination->texels = NULL;
   destination->column_flags = NULL;
 #ifdef GLOOM_DOS_SDL3
   destination->column_texels = NULL;
+  destination->column_shaded_texels = NULL;
 #endif
 
   texel_count = source->texture_count * (size_t)GLOOM_TEXTURE_WIDTH * (size_t)GLOOM_TEXTURE_HEIGHT;
@@ -2469,6 +2483,20 @@ static bool clone_wall_texture_screen(const WallTextureScreen *source, WallTextu
     }
     memcpy(destination->column_texels, source->column_texels, texel_count * sizeof(*destination->column_texels));
   }
+  if (source->column_shaded_texels != NULL) {
+    size_t shaded_texel_count = 16u * texel_count;
+
+    destination->column_shaded_texels =
+        (uint8_t *)malloc(shaded_texel_count * sizeof(*destination->column_shaded_texels));
+    if (destination->column_shaded_texels == NULL) {
+      free(destination->texels);
+      free(destination->column_texels);
+      memset(destination, 0, sizeof(*destination));
+      return false;
+    }
+    memcpy(destination->column_shaded_texels, source->column_shaded_texels,
+           shaded_texel_count * sizeof(*destination->column_shaded_texels));
+  }
 #endif
 
   if (source->column_flags != NULL) {
@@ -2477,6 +2505,7 @@ static bool clone_wall_texture_screen(const WallTextureScreen *source, WallTextu
       free(destination->texels);
 #ifdef GLOOM_DOS_SDL3
       free(destination->column_texels);
+      free(destination->column_shaded_texels);
 #endif
       memset(destination, 0, sizeof(*destination));
       return false;
@@ -2906,6 +2935,65 @@ static void rebuild_dos_object_visual_indices(ObjectVisual *visual) {
   build_dos_shaded_palette_indices(visual->shaded_indices, visual->shaded_palette[0], visual->palette_used);
 }
 
+static bool rebuild_dos_flat_texture_indices(FlatTexture *texture) {
+  enum { FLAT_TEXEL_BYTES = GLOOM_FLAT_TEXTURE_SIZE * GLOOM_FLAT_TEXTURE_SIZE };
+  size_t shade = 0u;
+
+  if (texture == NULL || !texture->loaded || texture->texels == NULL) {
+    return true;
+  }
+
+  build_dos_shaded_palette_indices(texture->shaded_indices, texture->palette, texture->palette_used);
+  if (texture->shaded_texels == NULL) {
+    texture->shaded_texels = (uint8_t *)malloc((size_t)16u * (size_t)FLAT_TEXEL_BYTES);
+    if (texture->shaded_texels == NULL) {
+      return false;
+    }
+  }
+
+  for (shade = 0u; shade < 16u; ++shade) {
+    uint8_t *dst = texture->shaded_texels + (shade * (size_t)FLAT_TEXEL_BYTES);
+    const uint8_t *palette = texture->shaded_indices[shade];
+    size_t i = 0u;
+
+    for (i = 0u; i < (size_t)FLAT_TEXEL_BYTES; ++i) {
+      dst[i] = palette[texture->texels[i]];
+    }
+  }
+
+  return true;
+}
+
+static bool rebuild_dos_wall_texture_screen_indices(WallTextureScreen *screen) {
+  size_t texel_count = 0u;
+  size_t shade = 0u;
+
+  if (screen == NULL || !screen->loaded || screen->column_texels == NULL || screen->texture_count == 0u) {
+    return true;
+  }
+
+  build_dos_shaded_palette_indices(screen->shaded_indices, screen->palette, screen->palette_used);
+  texel_count = screen->texture_count * (size_t)GLOOM_TEXTURE_WIDTH * (size_t)GLOOM_TEXTURE_HEIGHT;
+  if (screen->column_shaded_texels == NULL) {
+    screen->column_shaded_texels = (uint8_t *)malloc(16u * texel_count * sizeof(*screen->column_shaded_texels));
+    if (screen->column_shaded_texels == NULL) {
+      return false;
+    }
+  }
+
+  for (shade = 0u; shade < 16u; ++shade) {
+    uint8_t *dst = screen->column_shaded_texels + (shade * texel_count);
+    const uint8_t *palette = screen->shaded_indices[shade];
+    size_t i = 0u;
+
+    for (i = 0u; i < texel_count; ++i) {
+      dst[i] = palette[screen->column_texels[i]];
+    }
+  }
+
+  return true;
+}
+
 static void rebuild_dos_level_index_mappings(WallTextureSet *wall_textures, FlatTextureSet *flat_textures,
                                              ObjectVisualSet *object_visuals) {
   size_t i = 0u;
@@ -2943,18 +3031,16 @@ static void rebuild_dos_level_index_mappings(WallTextureSet *wall_textures, Flat
       WallTextureScreen *screen = &wall_textures->screens[i];
 
       if (screen->loaded) {
-        build_dos_shaded_palette_indices(screen->shaded_indices, screen->palette, screen->palette_used);
+        (void)rebuild_dos_wall_texture_screen_indices(screen);
       }
     }
   }
   if (flat_textures != NULL) {
     if (flat_textures->floor.loaded) {
-      build_dos_shaded_palette_indices(flat_textures->floor.shaded_indices, flat_textures->floor.palette,
-                                       flat_textures->floor.palette_used);
+      (void)rebuild_dos_flat_texture_indices(&flat_textures->floor);
     }
     if (flat_textures->roof.loaded) {
-      build_dos_shaded_palette_indices(flat_textures->roof.shaded_indices, flat_textures->roof.palette,
-                                       flat_textures->roof.palette_used);
+      (void)rebuild_dos_flat_texture_indices(&flat_textures->roof);
     }
   }
   if (object_visuals != NULL) {
@@ -3554,6 +3640,17 @@ static bool load_wall_texture_screen(const char *path, const char *source_name, 
   out_screen->column_flags = column_flags;
   out_screen->texture_count = available_textures;
   (void)snprintf(out_screen->source_name, sizeof(out_screen->source_name), "%s", source_name != NULL ? source_name : path);
+#ifdef GLOOM_DOS_SDL3
+  if (!rebuild_dos_wall_texture_screen_indices(out_screen)) {
+    free(data);
+    free(out_screen->texels);
+    free(out_screen->column_flags);
+    free(out_screen->column_texels);
+    free(out_screen->column_shaded_texels);
+    memset(out_screen, 0, sizeof(*out_screen));
+    return false;
+  }
+#endif
 
   free(data);
   return true;
@@ -3746,6 +3843,9 @@ static void free_flat_texture(FlatTexture *texture) {
   }
 
   free(texture->texels);
+#ifdef GLOOM_DOS_SDL3
+  free(texture->shaded_texels);
+#endif
   memset(texture, 0, sizeof(*texture));
 }
 
@@ -4144,11 +4244,17 @@ static bool load_flat_texture(const char *kind, const char *tile_tag, FlatTextur
 #endif
   build_shaded_palette(out_texture->shaded_palette, out_texture->palette);
 #ifdef GLOOM_DOS_SDL3
-  build_dos_shaded_palette_indices(out_texture->shaded_indices, out_texture->palette, out_texture->palette_used);
-#endif
-
   out_texture->texels = texels;
   out_texture->loaded = true;
+  if (!rebuild_dos_flat_texture_indices(out_texture)) {
+    free(data);
+    free_flat_texture(out_texture);
+    return false;
+  }
+#else
+  out_texture->texels = texels;
+  out_texture->loaded = true;
+#endif
   (void)snprintf(out_texture->source_name, sizeof(out_texture->source_name), "%s", resolved_path);
 
   free(data);
@@ -9646,14 +9752,13 @@ static bool ensure_render_framebuffer(SDL_Renderer *renderer, RenderFramebuffer 
 #else
   depth_buffer_int = (int32_t *)malloc((size_t)width * sizeof(*depth_buffer_int));
   sprite_depth_buffer_int = (int32_t *)malloc((size_t)width * sizeof(*sprite_depth_buffer_int));
-  index_coverage = (uint8_t *)calloc((size_t)width * (size_t)height, sizeof(*index_coverage));
 #endif
   filled_stamps = (uint32_t *)calloc((size_t)height, sizeof(*filled_stamps));
 #ifndef GLOOM_DOS_SDL3
   last_frame_pixels = (uint32_t *)malloc((size_t)width * (size_t)height * sizeof(*last_frame_pixels));
 #endif
 #ifdef GLOOM_DOS_SDL3
-  if (depth_buffer_int == NULL || sprite_depth_buffer_int == NULL || filled_stamps == NULL || index_coverage == NULL) {
+  if (depth_buffer_int == NULL || sprite_depth_buffer_int == NULL || filled_stamps == NULL) {
 #else
   if (depth_buffer == NULL || sprite_depth_buffer == NULL || filled_stamps == NULL || last_frame_pixels == NULL) {
 #endif
@@ -10016,6 +10121,20 @@ static float projection_focal_for_viewport(int w, int h) {
   return (float)GLOOM_PC_VIEW_FOCAL * scale;
 }
 
+#ifdef GLOOM_DOS_SDL3
+enum {
+  DOS_FLAT_FRAC_BITS = 9,
+  DOS_FLAT_FRAC_SCALE = 1 << DOS_FLAT_FRAC_BITS,
+  DOS_FLAT_TRIG_BITS = 9,
+  DOS_FLAT_TRIG_SCALE = 1 << DOS_FLAT_TRIG_BITS
+};
+
+static inline size_t dos_flat_texel_offset(int32_t world_x_fixed, int32_t world_z_fixed) {
+  return (size_t)((((uint32_t)world_x_fixed >> (DOS_FLAT_FRAC_BITS - 7)) & 0x3F80u) |
+                  (((uint32_t)world_z_fixed >> DOS_FLAT_FRAC_BITS) & 0x7Fu));
+}
+#endif
+
 static void render_flat_textures(RenderFramebuffer *framebuffer, const AppState *state, const FlatTextureSet *flats, int x,
                                  int y, int w, int h, float focal, float far_depth, float view_cos,
                                  float view_sin
@@ -10025,12 +10144,6 @@ static void render_flat_textures(RenderFramebuffer *framebuffer, const AppState 
 #endif
 ) {
 #ifdef GLOOM_DOS_SDL3
-  enum {
-    DOS_FLAT_FRAC_BITS = 9,
-    DOS_FLAT_FRAC_SCALE = 1 << DOS_FLAT_FRAC_BITS,
-    DOS_FLAT_TRIG_BITS = 9,
-    DOS_FLAT_TRIG_SCALE = 1 << DOS_FLAT_TRIG_BITS
-  };
   int32_t eye_height = 0;
   int32_t ceiling_delta = 0;
   int32_t cam_x_fixed = 0;
@@ -10051,6 +10164,9 @@ static void render_flat_textures(RenderFramebuffer *framebuffer, const AppState 
   }
 #ifdef GLOOM_DOS_SDL3
   if (framebuffer->index_pixels == NULL || framebuffer->index_pitch_pixels < framebuffer->width) {
+    return;
+  }
+  if (skip_existing_pixels && framebuffer->index_coverage == NULL) {
     return;
   }
 #else
@@ -10099,6 +10215,7 @@ static void render_flat_textures(RenderFramebuffer *framebuffer, const AppState 
     const FlatTexture *texture = NULL;
     const uint8_t *texels = NULL;
     const uint8_t *palette = NULL;
+    const uint8_t *shaded_texels = NULL;
     int32_t plane_distance = 0;
     int32_t depth = 0;
     int32_t depth_fixed = 0;
@@ -10137,7 +10254,16 @@ static void render_flat_textures(RenderFramebuffer *framebuffer, const AppState 
     }
 
     texels = texture->texels;
-    palette = texture->shaded_indices[amiga_depth_dark_index_int(depth)];
+    {
+      int shade_index = (int)amiga_depth_dark_index_int(depth);
+
+      palette = texture->shaded_indices[shade_index];
+      if (texture->shaded_texels != NULL) {
+        shaded_texels = texture->shaded_texels +
+                        ((size_t)shade_index * (size_t)GLOOM_FLAT_TEXTURE_SIZE *
+                         (size_t)GLOOM_FLAT_TEXTURE_SIZE);
+      }
+    }
     depth_fixed = depth << DOS_FLAT_FRAC_BITS;
     view_x_fixed = ((((0 - (w / 2)) * depth) << DOS_FLAT_FRAC_BITS) / focal_int);
     view_x_step_fixed = ((depth << DOS_FLAT_FRAC_BITS) / focal_int);
@@ -10148,33 +10274,40 @@ static void render_flat_textures(RenderFramebuffer *framebuffer, const AppState 
     world_x_step_fixed = ((view_x_step_fixed * cos_fixed) >> DOS_FLAT_TRIG_BITS);
     world_z_step_fixed = -((view_x_step_fixed * sin_fixed) >> DOS_FLAT_TRIG_BITS);
     dst_row = framebuffer->index_pixels + ((size_t)(y + row) * (size_t)framebuffer->index_pitch_pixels + (size_t)x);
-    coverage_row = framebuffer->index_coverage != NULL
+    coverage_row = skip_existing_pixels && framebuffer->index_coverage != NULL
                        ? framebuffer->index_coverage +
                              ((size_t)(y + row) * (size_t)framebuffer->width + (size_t)x)
                        : NULL;
 
-    if (skip_existing_pixels) {
+    if (skip_existing_pixels && shaded_texels != NULL) {
       for (col = 0; col < w; ++col) {
-        if (coverage_row == NULL || coverage_row[col] == 0u) {
-          int tx = (int)(world_x_fixed >> DOS_FLAT_FRAC_BITS) & (GLOOM_FLAT_TEXTURE_SIZE - 1);
-          int tz = (int)(world_z_fixed >> DOS_FLAT_FRAC_BITS) & (GLOOM_FLAT_TEXTURE_SIZE - 1);
-          uint8_t palette_index = texels[(tx * GLOOM_FLAT_TEXTURE_SIZE) + tz];
+        if (coverage_row[col] == 0u) {
+          dst_row[col] = shaded_texels[dos_flat_texel_offset(world_x_fixed, world_z_fixed)];
+        }
+        world_x_fixed += world_x_step_fixed;
+        world_z_fixed += world_z_step_fixed;
+      }
+    } else if (skip_existing_pixels) {
+      for (col = 0; col < w; ++col) {
+        if (coverage_row[col] == 0u) {
+          uint8_t palette_index = texels[dos_flat_texel_offset(world_x_fixed, world_z_fixed)];
 
           dst_row[col] = palette[palette_index];
         }
         world_x_fixed += world_x_step_fixed;
         world_z_fixed += world_z_step_fixed;
       }
+    } else if (shaded_texels != NULL) {
+      for (col = 0; col < w; ++col) {
+        dst_row[col] = shaded_texels[dos_flat_texel_offset(world_x_fixed, world_z_fixed)];
+        world_x_fixed += world_x_step_fixed;
+        world_z_fixed += world_z_step_fixed;
+      }
     } else {
       for (col = 0; col < w; ++col) {
-        int tx = (int)(world_x_fixed >> DOS_FLAT_FRAC_BITS) & (GLOOM_FLAT_TEXTURE_SIZE - 1);
-        int tz = (int)(world_z_fixed >> DOS_FLAT_FRAC_BITS) & (GLOOM_FLAT_TEXTURE_SIZE - 1);
-        uint8_t palette_index = texels[(tx * GLOOM_FLAT_TEXTURE_SIZE) + tz];
+        uint8_t palette_index = texels[dos_flat_texel_offset(world_x_fixed, world_z_fixed)];
 
         dst_row[col] = palette[palette_index];
-        if (coverage_row != NULL) {
-          coverage_row[col] = 1u;
-        }
         world_x_fixed += world_x_step_fixed;
         world_z_fixed += world_z_step_fixed;
       }
@@ -10247,6 +10380,56 @@ static int dos_project_view_x(int32_t view_x, int32_t view_z, int focal, int hal
   }
 
   return half_width + (int)((view_x * focal) / view_z);
+}
+
+static void bind_dos_wall_column_texture(const WallTextureSet *wall_textures, const AppState *state,
+                                         const GloomZone *zone, int32_t wall_u, int dark_index,
+                                         DosRayWallHit *hit) {
+  int tile_index = 0;
+  uint8_t texture_index = 0u;
+  size_t screen_index = 0u;
+  size_t local_index = 0u;
+  size_t tx = 0u;
+
+  if (hit == NULL) {
+    return;
+  }
+
+  hit->fast_wall_column = false;
+  hit->transparent_wall_column = true;
+  hit->wall_texels = NULL;
+  hit->wall_shaded_texels = NULL;
+  hit->wall_palette = NULL;
+  hit->wall_texel_base = 0u;
+
+  if (wall_textures == NULL || state == NULL || zone == NULL || dark_index < 0 || dark_index >= 16) {
+    return;
+  }
+
+  zone_wall_texture_coordinates_fixed16(zone, wall_u, &tile_index, &tx);
+  texture_index = remap_wall_texture_index(state, zone->textures[tile_index]);
+  screen_index = texture_index / (uint8_t)GLOOM_TEXTURES_PER_SCREEN;
+  local_index = texture_index % (uint8_t)GLOOM_TEXTURES_PER_SCREEN;
+  if (screen_index < (size_t)GLOOM_TEXTURE_SCREENS && wall_textures->screens[screen_index].loaded &&
+      wall_textures->screens[screen_index].texels != NULL &&
+      wall_textures->screens[screen_index].column_texels != NULL &&
+      local_index < wall_textures->screens[screen_index].texture_count) {
+    const WallTextureScreen *screen = &wall_textures->screens[screen_index];
+
+    hit->wall_texels = screen->column_texels;
+    if (screen->column_shaded_texels != NULL) {
+      hit->wall_shaded_texels =
+          screen->column_shaded_texels +
+          ((size_t)dark_index * screen->texture_count * (size_t)GLOOM_TEXTURE_WIDTH * (size_t)GLOOM_TEXTURE_HEIGHT);
+    }
+    hit->wall_palette = screen->shaded_indices[dark_index];
+    hit->wall_texel_base = local_index * ((size_t)GLOOM_TEXTURE_WIDTH * (size_t)GLOOM_TEXTURE_HEIGHT) +
+                           tx * (size_t)GLOOM_TEXTURE_HEIGHT;
+    hit->transparent_wall_column =
+        screen->column_flags != NULL &&
+        screen->column_flags[(local_index * (size_t)GLOOM_TEXTURE_WIDTH) + tx] != 0u;
+    hit->fast_wall_column = true;
+  }
 }
 
 static void render_wall_columns_dos_fixed(RenderFramebuffer *framebuffer, const AppState *state,
@@ -10349,6 +10532,7 @@ static void render_wall_columns_dos_fixed(RenderFramebuffer *framebuffer, const 
       size_t hit_index = 0u;
       uint32_t filled_stamp = 0u;
       double profile_column_start_ms = 0.0;
+      bool profile_column_sampled = false;
 
       framebuffer->filled_stamp += 1u;
       if (framebuffer->filled_stamp == 0u) {
@@ -10357,7 +10541,10 @@ static void render_wall_columns_dos_fixed(RenderFramebuffer *framebuffer, const 
       }
       filled_stamp = framebuffer->filled_stamp;
 
-      profile_column_start_ms = profile_now_ms();
+      profile_column_sampled = g_profiler.enabled && ((i & 15u) == 0u);
+      if (profile_column_sampled) {
+        profile_column_start_ms = profile_now_ms();
+      }
       for (wall_index = 0u; wall_index < scene_wall_count; ++wall_index) {
         const DosSceneWall *wall = &scene_walls[wall_index];
         int32_t side1 = wall->vx1 - ((wall->vz1 * ray_x) >> 16);
@@ -10365,6 +10552,9 @@ static void render_wall_columns_dos_fixed(RenderFramebuffer *framebuffer, const 
         int32_t side_delta = side2 - side1;
         int32_t depth = 0;
         int32_t wall_u = 0;
+        int dark_index = 0;
+        bool occluded_by_opaque = false;
+        size_t existing_hit = 0u;
 
         if ((int)i < wall->column_min || (int)i > wall->column_max || side_delta == 0) {
           continue;
@@ -10392,6 +10582,7 @@ static void render_wall_columns_dos_fixed(RenderFramebuffer *framebuffer, const 
           }
         }
 
+        dark_index = (int)amiga_depth_dark_index_int(depth);
         {
           DosRayWallHit hit;
           size_t insert_at = hit_count;
@@ -10399,6 +10590,23 @@ static void render_wall_columns_dos_fixed(RenderFramebuffer *framebuffer, const 
           hit.wall = wall;
           hit.depth = depth;
           hit.wall_u = wall_u;
+          bind_dos_wall_column_texture(wall_textures, state, wall->zone, wall_u, dark_index, &hit);
+
+          for (existing_hit = 0u; existing_hit < hit_count; ++existing_hit) {
+            if (!hits[existing_hit].transparent_wall_column && hits[existing_hit].depth <= hit.depth) {
+              occluded_by_opaque = true;
+              break;
+            }
+          }
+          if (occluded_by_opaque) {
+            continue;
+          }
+          if (!hit.transparent_wall_column) {
+            while (hit_count > 0u && hits[hit_count - 1u].depth > hit.depth) {
+              hit_count -= 1u;
+            }
+            insert_at = hit_count;
+          }
 
           while (insert_at > 0u && hits[insert_at - 1u].depth > hit.depth) {
             if (insert_at < (size_t)GLOOM_MAX_COLUMN_WALL_HITS) {
@@ -10415,9 +10623,13 @@ static void render_wall_columns_dos_fixed(RenderFramebuffer *framebuffer, const 
           }
         }
       }
-      profile_add_elapsed(&g_profiler.render_wall_search_ms, profile_column_start_ms);
+      if (profile_column_sampled) {
+        g_profiler.render_wall_search_ms += (profile_now_ms() - profile_column_start_ms) * 16.0;
+      }
 
-      profile_column_start_ms = profile_now_ms();
+      if (profile_column_sampled) {
+        profile_column_start_ms = profile_now_ms();
+      }
       for (hit_index = 0u; hit_index < hit_count; ++hit_index) {
         const DosRayWallHit *hit = &hits[hit_index];
         int32_t wall_top = horizon_y + (((GLOOM_WALL_TOP_Y - cam_y) * focal_int) / hit->depth);
@@ -10426,13 +10638,13 @@ static void render_wall_columns_dos_fixed(RenderFramebuffer *framebuffer, const 
         int y0 = (int)wall_top;
         int y1 = (int)wall_bottom;
         int draw_y = 0;
-        int dark_index = 0;
         int subtract = 0;
-        bool fast_wall_column = false;
-        bool transparent_wall_column = false;
-        const uint8_t *wall_texels = NULL;
-        const uint8_t *wall_palette = NULL;
-        size_t wall_texel_base = 0u;
+        bool fast_wall_column = hit->fast_wall_column;
+        bool transparent_wall_column = hit->transparent_wall_column;
+        const uint8_t *wall_texels = hit->wall_texels;
+        const uint8_t *wall_shaded_texels = hit->wall_shaded_texels;
+        const uint8_t *wall_palette = hit->wall_palette;
+        size_t wall_texel_base = hit->wall_texel_base;
 
         if (wall_height < 1) {
           int32_t center_y = (wall_top + wall_bottom) / 2;
@@ -10450,40 +10662,7 @@ static void render_wall_columns_dos_fixed(RenderFramebuffer *framebuffer, const 
           continue;
         }
 
-        dark_index = (int)amiga_depth_dark_index_int(hit->depth);
-        subtract = dark_index * 17;
-
-        {
-          const GloomZone *zone = hit->wall->zone;
-          int tile_index = 0;
-          uint8_t texture_index = 0u;
-          size_t screen_index = 0u;
-          size_t local_index = 0u;
-          size_t tx = 0u;
-
-          if (zone != NULL) {
-            zone_wall_texture_coordinates_fixed16(zone, hit->wall_u, &tile_index, &tx);
-            texture_index = remap_wall_texture_index(state, zone->textures[tile_index]);
-            screen_index = texture_index / (uint8_t)GLOOM_TEXTURES_PER_SCREEN;
-            local_index = texture_index % (uint8_t)GLOOM_TEXTURES_PER_SCREEN;
-            if (screen_index < (size_t)GLOOM_TEXTURE_SCREENS && wall_textures->screens[screen_index].loaded &&
-                wall_textures->screens[screen_index].texels != NULL &&
-                wall_textures->screens[screen_index].column_texels != NULL &&
-                local_index < wall_textures->screens[screen_index].texture_count) {
-              const WallTextureScreen *screen = &wall_textures->screens[screen_index];
-
-              wall_texels = screen->column_texels;
-              wall_palette = screen->shaded_indices[dark_index];
-              wall_texel_base =
-                  local_index * ((size_t)GLOOM_TEXTURE_WIDTH * (size_t)GLOOM_TEXTURE_HEIGHT) +
-                  tx * (size_t)GLOOM_TEXTURE_HEIGHT;
-              transparent_wall_column =
-                  screen->column_flags != NULL &&
-                  screen->column_flags[(local_index * (size_t)GLOOM_TEXTURE_WIDTH) + tx] != 0u;
-              fast_wall_column = true;
-            }
-          }
-        }
+        subtract = hit->fast_wall_column ? 0 : (int)amiga_depth_dark_index_int(hit->depth) * 17;
 
         {
           int32_t wall_v_fixed = ((((int32_t)y0 - wall_top) << 16) + 32768) / wall_height;
@@ -10494,38 +10673,23 @@ static void render_wall_columns_dos_fixed(RenderFramebuffer *framebuffer, const 
           if (fast_wall_column) {
             uint8_t *dst = framebuffer->index_pixels + ((size_t)y0 * (size_t)framebuffer->index_pitch_pixels) +
                            (size_t)screen_x;
-            uint8_t *covered = framebuffer->index_coverage != NULL
-                                   ? framebuffer->index_coverage + ((size_t)y0 * (size_t)framebuffer->width) +
-                                         (size_t)screen_x
-                                   : NULL;
             uint32_t *stamp = filled_stamps + (y0 - y);
             bool column_drawn = false;
 
             if (!transparent_wall_column && hit_index == 0u) {
-              for (draw_y = y0; draw_y <= y1; ++draw_y) {
-                size_t ty = (size_t)(tex_y_fixed >> 16);
-                uint8_t palette_index = 0u;
+              if (wall_shaded_texels != NULL) {
+                for (draw_y = y0; draw_y <= y1; ++draw_y) {
+                  size_t ty = (size_t)(tex_y_fixed >> 16);
 
-                if (ty >= (size_t)GLOOM_TEXTURE_HEIGHT) {
-                  ty = (size_t)GLOOM_TEXTURE_HEIGHT - 1u;
+                  if (ty >= (size_t)GLOOM_TEXTURE_HEIGHT) {
+                    ty = (size_t)GLOOM_TEXTURE_HEIGHT - 1u;
+                  }
+                  *dst = wall_shaded_texels[wall_texel_base + ty];
+                  dst += framebuffer->index_pitch_pixels;
+                  tex_y_fixed += tex_y_step_fixed;
                 }
-                palette_index = wall_texels[wall_texel_base + ty];
-                *dst = wall_palette[palette_index];
-                if (covered != NULL) {
-                  *covered = 1u;
-                }
-                *stamp = filled_stamp;
-                dst += framebuffer->index_pitch_pixels;
-                if (covered != NULL) {
-                  covered += framebuffer->width;
-                }
-                stamp += 1;
-                tex_y_fixed += tex_y_step_fixed;
-              }
-              column_drawn = true;
-            } else if (!transparent_wall_column) {
-              for (draw_y = y0; draw_y <= y1; ++draw_y) {
-                if (*stamp != filled_stamp) {
+              } else {
+                for (draw_y = y0; draw_y <= y1; ++draw_y) {
                   size_t ty = (size_t)(tex_y_fixed >> 16);
                   uint8_t palette_index = 0u;
 
@@ -10534,18 +10698,46 @@ static void render_wall_columns_dos_fixed(RenderFramebuffer *framebuffer, const 
                   }
                   palette_index = wall_texels[wall_texel_base + ty];
                   *dst = wall_palette[palette_index];
-                  if (covered != NULL) {
-                    *covered = 1u;
+                  dst += framebuffer->index_pitch_pixels;
+                  tex_y_fixed += tex_y_step_fixed;
+                }
+              }
+              column_drawn = true;
+            } else if (!transparent_wall_column) {
+              if (wall_shaded_texels != NULL) {
+                for (draw_y = y0; draw_y <= y1; ++draw_y) {
+                  if (*stamp != filled_stamp) {
+                    size_t ty = (size_t)(tex_y_fixed >> 16);
+
+                    if (ty >= (size_t)GLOOM_TEXTURE_HEIGHT) {
+                      ty = (size_t)GLOOM_TEXTURE_HEIGHT - 1u;
+                    }
+                    *dst = wall_shaded_texels[wall_texel_base + ty];
+                    *stamp = filled_stamp;
+                    column_drawn = true;
                   }
-                  *stamp = filled_stamp;
-                  column_drawn = true;
+                  dst += framebuffer->index_pitch_pixels;
+                  stamp += 1;
+                  tex_y_fixed += tex_y_step_fixed;
                 }
-                dst += framebuffer->index_pitch_pixels;
-                if (covered != NULL) {
-                  covered += framebuffer->width;
+              } else {
+                for (draw_y = y0; draw_y <= y1; ++draw_y) {
+                  if (*stamp != filled_stamp) {
+                    size_t ty = (size_t)(tex_y_fixed >> 16);
+                    uint8_t palette_index = 0u;
+
+                    if (ty >= (size_t)GLOOM_TEXTURE_HEIGHT) {
+                      ty = (size_t)GLOOM_TEXTURE_HEIGHT - 1u;
+                    }
+                    palette_index = wall_texels[wall_texel_base + ty];
+                    *dst = wall_palette[palette_index];
+                    *stamp = filled_stamp;
+                    column_drawn = true;
+                  }
+                  dst += framebuffer->index_pitch_pixels;
+                  stamp += 1;
+                  tex_y_fixed += tex_y_step_fixed;
                 }
-                stamp += 1;
-                tex_y_fixed += tex_y_step_fixed;
               }
             } else if (hit_index == 0u) {
               for (draw_y = y0; draw_y <= y1; ++draw_y) {
@@ -10558,16 +10750,10 @@ static void render_wall_columns_dos_fixed(RenderFramebuffer *framebuffer, const 
                 palette_index = wall_texels[wall_texel_base + ty];
                 if (palette_index != 0u) {
                   *dst = wall_palette[palette_index];
-                  if (covered != NULL) {
-                    *covered = 1u;
-                  }
                   *stamp = filled_stamp;
                   column_drawn = true;
                 }
                 dst += framebuffer->index_pitch_pixels;
-                if (covered != NULL) {
-                  covered += framebuffer->width;
-                }
                 stamp += 1;
                 tex_y_fixed += tex_y_step_fixed;
               }
@@ -10581,19 +10767,11 @@ static void render_wall_columns_dos_fixed(RenderFramebuffer *framebuffer, const 
                     ty = (size_t)GLOOM_TEXTURE_HEIGHT - 1u;
                   }
                   palette_index = wall_texels[wall_texel_base + ty];
-                  if (palette_index != 0u) {
-                    *dst = wall_palette[palette_index];
-                    if (covered != NULL) {
-                      *covered = 1u;
-                    }
-                    *stamp = filled_stamp;
-                    column_drawn = true;
-                  }
+                  *dst = wall_palette[palette_index];
+                  *stamp = filled_stamp;
+                  column_drawn = true;
                 }
                 dst += framebuffer->index_pitch_pixels;
-                if (covered != NULL) {
-                  covered += framebuffer->width;
-                }
                 stamp += 1;
                 tex_y_fixed += tex_y_step_fixed;
               }
@@ -10630,9 +10808,6 @@ static void render_wall_columns_dos_fixed(RenderFramebuffer *framebuffer, const 
 
               framebuffer->index_pixels[(size_t)draw_y * (size_t)framebuffer->index_pitch_pixels + (size_t)screen_x] =
                   color_index;
-              if (framebuffer->index_coverage != NULL) {
-                framebuffer->index_coverage[(size_t)draw_y * (size_t)framebuffer->width + (size_t)screen_x] = 1u;
-              }
               filled_stamps[draw_y - y] = filled_stamp;
 
               if (hit->depth < depth_buffer[i]) {
@@ -10642,7 +10817,9 @@ static void render_wall_columns_dos_fixed(RenderFramebuffer *framebuffer, const 
           }
         }
       }
-      profile_add_elapsed(&g_profiler.render_wall_draw_ms, profile_column_start_ms);
+      if (profile_column_sampled) {
+        g_profiler.render_wall_draw_ms += (profile_now_ms() - profile_column_start_ms) * 16.0;
+      }
     }
   }
 }
@@ -10767,6 +10944,9 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
   size_t i = 0;
   int horizon_y = y + (h / 2);
   double profile_start_ms = 0.0;
+#ifndef GLOOM_DOS_SDL3
+  double profile_wall_phase_start_ms = 0.0;
+#endif
 
   if (w <= 0 || h <= 0) {
     return;
@@ -10818,30 +10998,22 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
 
 #ifdef GLOOM_DOS_SDL3
   profile_start_ms = profile_now_ms();
-  for (i = 0u; i < (size_t)h; ++i) {
-    memset(framebuffer->index_pixels + ((size_t)(y + (int)i) * (size_t)framebuffer->index_pitch_pixels) + (size_t)x,
-           0, (size_t)w);
-    if (framebuffer->index_coverage != NULL) {
-      memset(framebuffer->index_coverage + ((size_t)(y + (int)i) * (size_t)framebuffer->width) + (size_t)x, 0,
-             (size_t)w);
-    }
-  }
-  profile_add_elapsed(&g_profiler.render_lock_clear_ms, profile_start_ms);
+  render_flat_textures(framebuffer, state, flats, x, y, w, h, focal, far_depth, view_cos, view_sin, false);
+  profile_add_elapsed(&g_profiler.render_flat_ms, profile_start_ms);
 
   profile_start_ms = profile_now_ms();
   render_wall_columns_dos_fixed(framebuffer, state, wall_textures, wall_candidates, wall_candidate_count, x, y, w, h,
                                 horizon_y, view_cos, view_sin, focal);
   profile_add_elapsed(&g_profiler.render_wall_ms, profile_start_ms);
-
-  profile_start_ms = profile_now_ms();
-  render_flat_textures(framebuffer, state, flats, x, y, w, h, focal, far_depth, view_cos, view_sin, true);
-  profile_add_elapsed(&g_profiler.render_flat_ms, profile_start_ms);
 #else
   profile_start_ms = profile_now_ms();
   render_flat_textures(framebuffer, state, flats, x, y, w, h, focal, far_depth, view_cos, view_sin);
   profile_add_elapsed(&g_profiler.render_flat_ms, profile_start_ms);
 
   profile_start_ms = profile_now_ms();
+  if (g_profiler.enabled) {
+    profile_wall_phase_start_ms = profile_now_ms();
+  }
   for (i = 0; i < wall_candidate_count; ++i) {
     const GloomZone *z = &state->map.zones[wall_candidates[i].zone_index];
     float x1 = (float)z->x1 - cam_x;
@@ -10897,6 +11069,9 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
       scene_wall_count -= 1u;
     }
   }
+  if (g_profiler.enabled) {
+    profile_add_elapsed(&g_profiler.render_wall_search_ms, profile_wall_phase_start_ms);
+  }
 
   for (i = 0; i < (size_t)w; ++i) {
     int screen_x = x + (int)i;
@@ -10914,6 +11089,9 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
     }
     filled_stamp = framebuffer->filled_stamp;
 
+    if (g_profiler.enabled) {
+      profile_wall_phase_start_ms = profile_now_ms();
+    }
     for (wall_index = 0; wall_index < scene_wall_count; ++wall_index) {
       const SceneWall *wall = &scene_walls[wall_index];
       float sx = wall->vx2 - wall->vx1;
@@ -10971,7 +11149,13 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
         }
       }
     }
+    if (g_profiler.enabled) {
+      profile_add_elapsed(&g_profiler.render_wall_search_ms, profile_wall_phase_start_ms);
+    }
 
+    if (g_profiler.enabled) {
+      profile_wall_phase_start_ms = profile_now_ms();
+    }
     for (hit_index = 0u; hit_index < hit_count; ++hit_index) {
       const RayWallHit *hit = &hits[hit_index];
       float wall_top =
@@ -11123,6 +11307,9 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
         }
       }
 #endif
+    }
+    if (g_profiler.enabled) {
+      profile_add_elapsed(&g_profiler.render_wall_draw_ms, profile_wall_phase_start_ms);
     }
   }
   profile_add_elapsed(&g_profiler.render_wall_ms, profile_start_ms);
@@ -11607,6 +11794,8 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
         int sx = 0;
         bool column_drawn = false;
         int32_t source_y_fixed = source_y_start_fixed;
+        uint8_t *dst = framebuffer->index_pixels + ((size_t)y0 * (size_t)framebuffer->index_pitch_pixels) +
+                       (size_t)screen_x;
 
         if (sp->depth_int >= sprite_depth_buffer_int[rel_x]) {
           continue;
@@ -11624,7 +11813,8 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
           sx = source_x_fixed >> 16;
         }
 
-        for (draw_y = y0; draw_y <= y1; ++draw_y, source_y_fixed += source_y_step_fixed) {
+        for (draw_y = y0; draw_y <= y1;
+             ++draw_y, source_y_fixed += source_y_step_fixed, dst += framebuffer->index_pitch_pixels) {
           uint8_t palette_index = 0u;
           int sy = 0;
 
@@ -11645,8 +11835,7 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
             continue;
           }
 
-          framebuffer->index_pixels[(size_t)draw_y * (size_t)framebuffer->index_pitch_pixels + (size_t)screen_x] =
-              sprite_palette[palette_index];
+          *dst = sprite_palette[palette_index];
           column_drawn = true;
         }
 
@@ -11771,6 +11960,11 @@ static void render_argb_pixels_scaled(RenderFramebuffer *framebuffer, const uint
     for (sx = 0; sx < src_width; ++sx) {
       uint32_t argb = pixels[(size_t)sy * (size_t)src_width + (size_t)sx];
       uint8_t alpha = 0u;
+#ifdef GLOOM_DOS_SDL3
+      uint8_t color_index = 0u;
+#else
+      uint32_t opaque_argb = 0u;
+#endif
       int dst_x0 = x + (sx * scale);
       int dst_x1 = dst_x0 + scale;
       int draw_y = 0;
@@ -11784,23 +11978,24 @@ static void render_argb_pixels_scaled(RenderFramebuffer *framebuffer, const uint
       }
       if (dst_x0 < 0) dst_x0 = 0;
       if (dst_x1 > framebuffer->width) dst_x1 = framebuffer->width;
+#ifdef GLOOM_DOS_SDL3
+      color_index = dos_argb_to_opaque_index(argb);
+#else
+      opaque_argb = 0xFF000000u | (argb & 0x00FFFFFFu);
+#endif
 
       for (draw_y = dst_y0; draw_y < dst_y1; ++draw_y) {
 #ifdef GLOOM_DOS_SDL3
         uint8_t *row = framebuffer->index_pixels + ((size_t)draw_y * (size_t)framebuffer->index_pitch_pixels);
-        uint8_t color_index = dos_argb_to_opaque_index(argb);
+        memset(row + dst_x0, color_index, (size_t)(dst_x1 - dst_x0));
 #else
         uint32_t *row = framebuffer->pixels + ((size_t)draw_y * (size_t)framebuffer->pitch_pixels);
-#endif
         int draw_x = 0;
 
         for (draw_x = dst_x0; draw_x < dst_x1; ++draw_x) {
-#ifdef GLOOM_DOS_SDL3
-          row[draw_x] = color_index;
-#else
-          row[draw_x] = 0xFF000000u | (argb & 0x00FFFFFFu);
-#endif
+          row[draw_x] = opaque_argb;
         }
+#endif
       }
     }
   }
@@ -11861,11 +12056,7 @@ static void render_object_frame_scaled_dos_indexed(RenderFramebuffer *framebuffe
       color_index = palette[palette_index];
       for (draw_y = dst_y0; draw_y < dst_y1; ++draw_y) {
         uint8_t *row = framebuffer->index_pixels + ((size_t)draw_y * (size_t)framebuffer->index_pitch_pixels);
-        int draw_x = 0;
-
-        for (draw_x = dst_x0; draw_x < dst_x1; ++draw_x) {
-          row[draw_x] = color_index;
-        }
+        memset(row + dst_x0, color_index, (size_t)(dst_x1 - dst_x0));
       }
     }
   }
@@ -12026,32 +12217,49 @@ static void render_hud_glyph_scaled_brightness(RenderFramebuffer *framebuffer, c
       uint32_t r = ((src >> 16) & 0xffu) * (uint32_t)brightness / 255u;
       uint32_t g = ((src >> 8) & 0xffu) * (uint32_t)brightness / 255u;
       uint32_t b = (src & 0xffu) * (uint32_t)brightness / 255u;
+      int dst_x0 = x + (sx * scale);
+      int dst_x1 = dst_x0 + scale;
       int dy = 0;
+#ifdef GLOOM_DOS_SDL3
+      uint8_t color_index = 0u;
+#else
+      uint32_t color_argb = 0u;
+#endif
 
       if (alpha == 0u) {
         continue;
       }
+      if (dst_x1 <= 0 || dst_x0 >= framebuffer->width) {
+        continue;
+      }
+      if (dst_x0 < 0) dst_x0 = 0;
+      if (dst_x1 > framebuffer->width) dst_x1 = framebuffer->width;
+#ifdef GLOOM_DOS_SDL3
+      color_index = dos_argb_to_opaque_index(0xFF000000u | (r << 16u) | (g << 8u) | b);
+#else
+      color_argb = 0xff000000u | (r << 16) | (g << 8) | b;
+#endif
       for (dy = 0; dy < scale; ++dy) {
         int py = y + (sy * scale) + dy;
-        int dx = 0;
 
         if (py < 0 || py >= framebuffer->height) {
           continue;
         }
-        for (dx = 0; dx < scale; ++dx) {
-          int px = x + (sx * scale) + dx;
-
-          if (px < 0 || px >= framebuffer->width) {
-            continue;
-          }
 #ifdef GLOOM_DOS_SDL3
-          framebuffer->index_pixels[(size_t)py * (size_t)framebuffer->index_pitch_pixels + (size_t)px] =
-              dos_argb_to_opaque_index(0xFF000000u | (r << 16u) | (g << 8u) | b);
-#else
-          framebuffer->pixels[(size_t)py * (size_t)framebuffer->pitch_pixels + (size_t)px] =
-              0xff000000u | (r << 16) | (g << 8) | b;
-#endif
+        {
+          uint8_t *row = framebuffer->index_pixels + ((size_t)py * (size_t)framebuffer->index_pitch_pixels);
+          memset(row + dst_x0, color_index, (size_t)(dst_x1 - dst_x0));
         }
+#else
+        {
+          uint32_t *row = framebuffer->pixels + ((size_t)py * (size_t)framebuffer->pitch_pixels);
+          int px = 0;
+
+          for (px = dst_x0; px < dst_x1; ++px) {
+            row[px] = color_argb;
+          }
+        }
+#endif
       }
     }
   }
@@ -16344,6 +16552,7 @@ static bool runtime_emscripten_consume_fullscreen_resize(void) {
 }
 #endif
 
+#ifndef GLOOM_DOS_SDL3
 static void select_aspect_720p_resolution(int *io_width, int *io_height) {
   static const int common_aspects[][2] = {{16, 9}, {16, 10}, {3, 2}, {4, 3}, {21, 9}, {32, 9}};
   static const int aspect_720p[][2] = {{1280, 720}, {1152, 720}, {1080, 720}, {960, 720}, {1680, 720}, {2560, 720}};
@@ -16400,6 +16609,7 @@ static void select_aspect_720p_resolution(int *io_width, int *io_height) {
   *io_width = aspect_720p[best_index][0];
   *io_height = aspect_720p[best_index][1];
 }
+#endif
 
 static void runtime_force_cursor_visible(void) {
   int n = 0;
@@ -16530,7 +16740,11 @@ int main(int argc, char **argv) {
   int render_scale = 1;
   int window_width = DEFAULT_WINDOW_WIDTH;
   int window_height = DEFAULT_WINDOW_HEIGHT;
+#ifdef GLOOM_DOS_SDL3
+  bool classic_viewport = true;
+#else
   bool classic_viewport = false;
+#endif
   bool explicit_resolution = false;
   bool barrel_projectile_origin = true;
   bool two_player_mode = false;
@@ -16900,9 +17114,18 @@ int main(int argc, char **argv) {
   if (!explicit_resolution) {
     if (classic_viewport) {
       render_width = BASE_WIDTH;
+#ifdef GLOOM_DOS_SDL3
+      render_height = DOS_LOWEST_HEIGHT;
+#else
       render_height = BASE_HEIGHT;
+#endif
     } else {
+#ifdef GLOOM_DOS_SDL3
+      render_width = WIDESCREEN_WIDTH;
+      render_height = DOS_LOWEST_HEIGHT;
+#else
       select_aspect_720p_resolution(&render_width, &render_height);
+#endif
     }
   }
   render_width *= render_scale;
