@@ -20148,6 +20148,8 @@ int main(int argc, char **argv) {
         gloom_map_free(&state.map);
         return 1;
       }
+      autosave_notice[0] = '\0';
+      autosave_notice_timer = 0.0;
     } else
 #endif
     if (combat_mode) {
@@ -20416,6 +20418,10 @@ int main(int argc, char **argv) {
           running = false;
           continue;
         }
+#if GLOOM_RUNTIME_HAS_AUTOSAVE
+        autosave_notice[0] = '\0';
+        autosave_notice_timer = 0.0;
+#endif
 #ifdef GLOOM_DOS_SDL3
         refresh_dos_index_palette(&framebuffer, window);
 #endif
@@ -20442,6 +20448,8 @@ int main(int argc, char **argv) {
           running = false;
           continue;
         }
+        autosave_notice[0] = '\0';
+        autosave_notice_timer = 0.0;
 #ifdef GLOOM_DOS_SDL3
         refresh_dos_index_palette(&framebuffer, window);
 #endif
