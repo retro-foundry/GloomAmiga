@@ -276,6 +276,7 @@ try {
   & (Join-Path $djgppBin 'i586-pc-msdosdjgpp-gcc.exe') `
     -O3 -fomit-frame-pointer -march=i386 -mtune=i486 `
     -std=c17 -Wall -Wextra -Wpedantic -DGLOOM_DOS_SDL3 `
+    -DGLOOM_BINARY_VERSION_MAJOR=1 -DGLOOM_BINARY_VERSION_MINOR=0 -DGLOOM_BINARY_VERSION_PATCH=0 `
     -Isrc "-I$sdlInclude" `
     src\main.c src\map.c src\iff.c $sdlLib -lm `
     -o $outExe

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(GloomPC LANGUAGES C)
+project(GloomPC VERSION 1.0.0 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 17)
 set(CMAKE_C_STANDARD_REQUIRED ON)
@@ -9,6 +9,7 @@ include(FetchContent)
 
 option(GLOOM_FETCH_SDL "Fetch SDL2 from source" ON)
 option(GLOOM_ENABLE_WEB_ASSETS "Preload game assets when targeting Emscripten" ON)
+set(GLOOM_BINARY_VERSION "${PROJECT_VERSION}" CACHE STRING "Version string embedded in native/DOS binary builds")
 
 if(NOT EMSCRIPTEN AND GLOOM_FETCH_SDL)
   set(SDL_SHARED OFF CACHE BOOL "" FORCE)
@@ -72,6 +73,11 @@ if(EMSCRIPTEN)
     )
   endif()
 else()
+target_compile_definitions(gloom_pc PRIVATE
+  GLOOM_BINARY_VERSION_MAJOR=${PROJECT_VERSION_MAJOR}
+  GLOOM_BINARY_VERSION_MINOR=${PROJECT_VERSION_MINOR}
+  GLOOM_BINARY_VERSION_PATCH=${PROJECT_VERSION_PATCH}
+)
 add_custom_command(TARGET gloom_pc POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:gloom_pc>/amiga"
   COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:gloom_pc>/amiga/data"

@@ -14,6 +14,12 @@
 #include "iff.h"
 #include "map.h"
 
+#ifdef GLOOM_BINARY_VERSION_MAJOR
+#define GLOOM_RUNTIME_IS_BINARY 1
+#else
+#define GLOOM_RUNTIME_IS_BINARY 0
+#endif
+
 #ifdef GLOOM_DOS_SDL3
 static void dos_logf(const char *fmt, ...) {
   FILE *file = fopen("GLOOM.LOG", "a");
@@ -37,6 +43,20 @@ static void dos_logf(const char *fmt, ...) {
   (void)fmt;
 }
 #endif
+
+static const char *runtime_title(void) {
+#if GLOOM_RUNTIME_IS_BINARY
+  static char title[32];
+
+  if (title[0] == '\0') {
+    (void)snprintf(title, sizeof(title), "Gloom %d.%d.%d", GLOOM_BINARY_VERSION_MAJOR,
+                   GLOOM_BINARY_VERSION_MINOR, GLOOM_BINARY_VERSION_PATCH);
+  }
+  return title;
+#else
+  return "Gloom With Friends";
+#endif
+}
 
 #ifdef __EMSCRIPTEN__
 #include <emscripten.h>
@@ -13629,6 +13649,8 @@ static void compute_start_menu_layout(int render_width, int render_height, int i
   int logo_max_w = 0;
   int logo_divisor = 1;
   int logo_area_top = 0;
+  int top_group_h = 0;
+  int upper_area_h = 0;
 
   if (out_layout == NULL) {
     return;
@@ -13646,25 +13668,16 @@ static void compute_start_menu_layout(int render_width, int render_height, int i
   row_height = GLOOM_MENU_BIG_FONT_HEIGHT * layout.scale;
   title_h = GLOOM_MENU_BIG_FONT_HEIGHT * layout.title_scale;
   menu_h = item_count * row_height;
-  credit_h = GLOOM_MENU_BIG_FONT_HEIGHT * layout.scale * 2;
+  credit_h = GLOOM_MENU_BIG_FONT_HEIGHT * layout.scale * 3;
   top_margin = 4 * layout.scale;
   bottom_margin = 2 * layout.scale;
   title_menu_gap = 4 * layout.scale;
   menu_logo_gap = 6 * layout.scale;
   logo_credit_gap = 3 * layout.scale;
 
-  layout.title_y = render_height / 10;
-  if (layout.title_y < top_margin) {
-    layout.title_y = top_margin;
-  }
-  layout.menu_y = layout.title_y + title_h + title_menu_gap;
-  if (layout.menu_y < top_margin) {
-    layout.menu_y = top_margin;
-  }
-
   logo_max_w = render_width;
   layout.credit_y = render_height - credit_h - bottom_margin;
-  logo_area_top = layout.menu_y + menu_h + menu_logo_gap;
+  logo_area_top = title_h + title_menu_gap + menu_h + menu_logo_gap + top_margin;
   logo_max_h = layout.credit_y - logo_credit_gap - logo_area_top;
   if (logo_max_h > 144 * layout.scale) {
     logo_max_h = 144 * layout.scale;
@@ -13689,9 +13702,14 @@ static void compute_start_menu_layout(int render_width, int render_height, int i
   }
   layout.logo_x = (render_width - layout.logo_w) / 2;
   layout.logo_y = layout.credit_y - logo_credit_gap - layout.logo_h;
-  if (layout.logo_y < logo_area_top) {
-    layout.logo_y = logo_area_top;
+
+  top_group_h = title_h + title_menu_gap + menu_h;
+  upper_area_h = layout.logo_y - menu_logo_gap - top_margin;
+  layout.title_y = top_margin + ((upper_area_h - top_group_h) / 2);
+  if (layout.title_y < top_margin) {
+    layout.title_y = top_margin;
   }
+  layout.menu_y = layout.title_y + title_h + title_menu_gap;
 
   *out_layout = layout;
 }
@@ -13737,6 +13755,10 @@ static void render_start_menu_static_marks(RenderFramebuffer *framebuffer, const
                               layout.scale, 255u);
   render_menu_text_brightness(framebuffer, &assets->big_font, "RETROFOUNDRY", render_width / 2,
                               layout.credit_y + (GLOOM_MENU_BIG_FONT_HEIGHT * layout.scale), layout.scale, 255u);
+#if GLOOM_RUNTIME_IS_BINARY
+  render_menu_text_brightness(framebuffer, &assets->big_font, runtime_title(), render_width / 2,
+                              layout.credit_y + (GLOOM_MENU_BIG_FONT_HEIGHT * layout.scale * 2), layout.scale, 255u);
+#endif
 }
 
 static void copy_argb_background(RenderFramebuffer *framebuffer, const uint32_t *background,
@@ -17979,6 +18001,11 @@ int main(int argc, char **argv) {
   memset(&menu_assets, 0, sizeof(menu_assets));
   memset(&framebuffer, 0, sizeof(framebuffer));
 
+  if (argc > 1 && strcmp(argv[1], "--version") == 0) {
+    printf("%s\n", runtime_title());
+    return 0;
+  }
+
   if (argc > 1 && strcmp(argv[1], "--iff-info") == 0) {
     const char *iff_path = argc > 2 ? argv[2] : "amiga/combat.iff";
     return run_iff_info(iff_path);
@@ -18149,6 +18176,10 @@ int main(int argc, char **argv) {
   if (resolve_runtime_file_path(map_path, map_path_buffer, sizeof(map_path_buffer))) {
     resolved_map_path = map_path_buffer;
   }
+
+#if GLOOM_RUNTIME_IS_BINARY
+  printf("%s\n", runtime_title());
+#endif
 
   memset(&state, 0, sizeof(state));
   memset(&previous_state, 0, sizeof(previous_state));
@@ -18378,7 +18409,7 @@ int main(int argc, char **argv) {
   (void)SDL_SetHint(SDL_HINT_DOS_ALLOW_DIRECT_FRAMEBUFFER, "1");
 #endif
 
-  window = SDL_CreateWindow("Gloom With Friends", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, window_width,
+  window = SDL_CreateWindow(runtime_title(), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, window_width,
                             window_height, SDL_WINDOW_RESIZABLE);
   if (window == NULL) {
     fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
@@ -18806,15 +18837,16 @@ int main(int argc, char **argv) {
       char title[160];
       if (state.two_player_mode) {
         (void)snprintf(title, sizeof(title),
-                       "Gloom With Friends | 2P | P1 HP=%d L=%d | P2 HP=%d L=%d | zones=%zu",
+                       "%s | 2P | P1 HP=%d L=%d | P2 HP=%d L=%d | zones=%zu", runtime_title(),
                        state.player_hitpoints, state.player_lives, state.player2.player_hitpoints,
                        state.player2.player_lives, state.map.zone_count);
       } else if (state.player_dead) {
-        (void)snprintf(title, sizeof(title), "Gloom With Friends | DEAD | x=%.0f z=%.0f angle=%.2f | zones=%zu",
-                       state.camera_x, state.camera_z, state.camera_angle, state.map.zone_count);
+        (void)snprintf(title, sizeof(title), "%s | DEAD | x=%.0f z=%.0f angle=%.2f | zones=%zu",
+                       runtime_title(), state.camera_x, state.camera_z, state.camera_angle,
+                       state.map.zone_count);
       } else {
-        (void)snprintf(title, sizeof(title), "Gloom With Friends | HP=%d | x=%.0f z=%.0f angle=%.2f | zones=%zu",
-                       state.player_hitpoints, state.camera_x, state.camera_z, state.camera_angle,
+        (void)snprintf(title, sizeof(title), "%s | HP=%d | x=%.0f z=%.0f angle=%.2f | zones=%zu",
+                       runtime_title(), state.player_hitpoints, state.camera_x, state.camera_z, state.camera_angle,
                        state.map.zone_count);
       }
       SDL_SetWindowTitle(window, title);
