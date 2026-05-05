@@ -3,6 +3,8 @@ $ErrorActionPreference = 'Stop'
 $repoRoot = Split-Path -Parent $PSScriptRoot
 $djgppBin = Join-Path $repoRoot 'build\dos-toolchain\djgpp-mingw\djgpp\bin'
 $stubEdit = Join-Path $repoRoot 'build\dos-toolchain\djgpp-mingw\djgpp\i586-pc-msdosdjgpp\bin\stubedit.exe'
+$sdlSource = Join-Path $repoRoot 'build\dos-sdl\SDL'
+$sdlBuild = Join-Path $repoRoot 'build\dos-sdl\SDL-build'
 $sdlInclude = Join-Path $repoRoot 'build\dos-sdl\SDL\include'
 $sdlLib = Join-Path $repoRoot 'build\dos-sdl\SDL-build\libSDL3.a'
 $outDir = Join-Path $repoRoot 'build\dos'
@@ -10,6 +12,36 @@ $outExe = Join-Path $outDir 'GLOOMPC.EXE'
 
 if (-not (Test-Path -LiteralPath (Join-Path $djgppBin 'i586-pc-msdosdjgpp-gcc.exe'))) {
   throw "Missing DJGPP compiler under $djgppBin"
+}
+
+$sdlDosEvents = Join-Path $sdlSource 'src\video\dos\SDL_dosevents.c'
+if (Test-Path -LiteralPath $sdlDosEvents) {
+  $eventsSource = Get-Content -LiteralPath $sdlDosEvents -Raw
+  $patchedSource = $eventsSource
+
+  if ($patchedSource -notlike '*SDL_DOS_SKIP_EVENT_YIELD*') {
+    $yieldPatchSource = "    /* Give cooperative threads a chance to run.  Audio mixing now runs`n       in its own cooperative thread (via SDL's normal audio thread),`n       so it will execute during this yield along with loading threads`n       and anything else that is runnable. */`n    DOS_Yield();"
+    if (-not $patchedSource.Contains($yieldPatchSource)) {
+      throw "Unable to patch SDL DOS event yield in $sdlDosEvents"
+    }
+    $patchedSource = $patchedSource.Replace($yieldPatchSource,
+      "    /* Gloom DOS pumps events once per rendered frame; yielding here turns`n       input polling into a visible frame-time spike on 386-class profiles. */`n    if (!SDL_GetHintBoolean(`"SDL_DOS_SKIP_EVENT_YIELD`", false)) {`n        DOS_Yield();`n    }")
+  }
+  if ($patchedSource -notlike '*SDL_DOS_SKIP_MOUSE_PUMP*') {
+    $mousePatchSource = '    if (mouse->internal) { // if non-NULL, there''s a mouse detected on the system.'
+    if (-not $patchedSource.Contains($mousePatchSource)) {
+      throw "Unable to patch SDL DOS mouse pump in $sdlDosEvents"
+    }
+    $patchedSource = $patchedSource.Replace($mousePatchSource,
+      '    if (mouse->internal && !SDL_GetHintBoolean("SDL_DOS_SKIP_MOUSE_PUMP", false)) { // if non-NULL, there''s a mouse detected on the system.')
+  }
+  if ($patchedSource -ne $eventsSource) {
+    Set-Content -LiteralPath $sdlDosEvents -Value $patchedSource -NoNewline
+  }
+}
+
+if (Test-Path -LiteralPath $sdlBuild) {
+  & cmake --build $sdlBuild --config Release
 }
 if (-not (Test-Path -LiteralPath $sdlLib)) {
   throw "Missing DOS SDL3 library $sdlLib"

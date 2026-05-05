@@ -56,6 +56,7 @@ enum {
   GLOOM_AMIGA_GAME_TICK_HZ = 25,
 #ifdef GLOOM_DOS_SDL3
   FIXED_TICK_HZ = 25,
+  DOS_EVENT_POLL_INTERVAL_FRAMES = 1,
 #else
   FIXED_TICK_HZ = 60,
 #endif
@@ -234,6 +235,10 @@ typedef struct {
   uint8_t busy_passes;
   double position;
   double increment;
+#ifdef GLOOM_DOS_SDL3
+  uint32_t position_fp;
+  uint32_t increment_fp;
+#endif
 } AudioChannel;
 
 typedef struct {
@@ -253,6 +258,11 @@ typedef struct {
   double ui_beep_phase;
   double ui_beep_phase_step;
   float ui_beep_volume;
+#ifdef GLOOM_DOS_SDL3
+  uint32_t ui_beep_phase_fp;
+  uint32_t ui_beep_phase_step_fp;
+  int ui_beep_volume_s16;
+#endif
 } AudioSystem;
 
 typedef struct {
@@ -1680,11 +1690,84 @@ static void audio_callback(void *userdata, Uint8 *stream, int len) {
 }
 
 #ifdef GLOOM_DOS_SDL3
+static int16_t audio_clamp_s16(int value) {
+  if (value < -32768) {
+    return -32768;
+  }
+  if (value > 32767) {
+    return 32767;
+  }
+  return (int16_t)value;
+}
+
+static void audio_dos_callback_s16(void *userdata, Uint8 *stream, int len) {
+  AudioSystem *audio = (AudioSystem *)userdata;
+  int16_t *out = (int16_t *)stream;
+  int frames = len / (int)(sizeof(int16_t) * 2u);
+  int frame = 0;
+
+  memset(stream, 0, (size_t)len);
+  if (audio == NULL) {
+    return;
+  }
+
+  for (frame = 0; frame < frames; ++frame) {
+    int left = 0;
+    int right = 0;
+    int channel_index = 0;
+
+    for (channel_index = 0; channel_index < GLOOM_AUDIO_CHANNEL_COUNT; ++channel_index) {
+      AudioChannel *channel = &audio->channels[channel_index];
+      const SfxSample *sample = NULL;
+      uint32_t sample_index = 0u;
+      int scaled = 0;
+
+      if (!channel->active || channel->sfx_id < 0 || channel->sfx_id >= GLOOM_SFX_COUNT) {
+        continue;
+      }
+
+      sample = &audio->samples[channel->sfx_id];
+      sample_index = channel->position_fp >> 16;
+      if (!sample->loaded || sample->samples == NULL || sample_index >= sample->sample_count) {
+        channel->active = false;
+        continue;
+      }
+
+      if (channel->busy_passes > 0u) {
+        scaled = (int)sample->samples[sample_index] * channel->volume * 4;
+        if (channel_index == 1 || channel_index == 2) {
+          right += scaled;
+        } else {
+          left += scaled;
+        }
+      }
+
+      channel->position_fp += channel->increment_fp;
+      if ((channel->position_fp >> 16) >= sample->sample_count) {
+        channel->active = false;
+      }
+    }
+
+    if (audio->ui_beep_remaining > 0u && audio->ui_beep_total > 0u) {
+      int value = (audio->ui_beep_phase_fp & 0x80000000u) != 0u ? -audio->ui_beep_volume_s16
+                                                                : audio->ui_beep_volume_s16;
+      value = (int)(((int64_t)value * (int64_t)audio->ui_beep_remaining) / (int64_t)audio->ui_beep_total);
+      left += value;
+      right += value;
+      audio->ui_beep_phase_fp += audio->ui_beep_phase_step_fp;
+      audio->ui_beep_remaining -= 1u;
+    }
+
+    out[frame * 2] = audio_clamp_s16(left);
+    out[(frame * 2) + 1] = audio_clamp_s16(right);
+  }
+}
+
 static void audio_dos_stream_callback(void *userdata, SDL_AudioStream *stream, int additional_amount,
                                       int total_amount) {
   AudioSystem *audio = (AudioSystem *)userdata;
   int remaining = additional_amount;
-  const int frame_bytes = (int)(sizeof(float) * 2u);
+  const int frame_bytes = (int)(sizeof(int16_t) * 2u);
 
   (void)total_amount;
   if (audio == NULL || stream == NULL || audio->mix_buffer == NULL || audio->mix_buffer_size < frame_bytes) {
@@ -1702,7 +1785,7 @@ static void audio_dos_stream_callback(void *userdata, SDL_AudioStream *stream, i
       break;
     }
 
-    audio_callback(audio, audio->mix_buffer, bytes);
+    audio_dos_callback_s16(audio, audio->mix_buffer, bytes);
     if (!SDL_PutAudioStreamData(stream, audio->mix_buffer, bytes)) {
       dos_logf("DOS Sound Blaster: SDL_PutAudioStreamData failed: %s", SDL_GetError());
       break;
@@ -1722,7 +1805,7 @@ static bool audio_start(AudioSystem *audio) {
 
   memset(&desired, 0, sizeof(desired));
   desired.freq = 22050;
-  desired.format = AUDIO_F32SYS;
+  desired.format = SDL_AUDIO_S16LE;
   desired.channels = 2;
 
   audio->mix_buffer_size = 8192;
@@ -1838,6 +1921,13 @@ static void audio_start_channel_locked(AudioSystem *audio, AudioChannel *channel
   channel->busy_passes = 1u;
   channel->position = 0.0;
   channel->increment = sample->sample_rate / (double)audio->obtained.freq;
+#ifdef GLOOM_DOS_SDL3
+  channel->position_fp = 0u;
+  channel->increment_fp = (uint32_t)((sample->sample_rate * 65536.0 / (double)audio->obtained.freq) + 0.5);
+  if (channel->increment_fp == 0u) {
+    channel->increment_fp = 1u;
+  }
+#endif
 }
 
 static void audio_play_sfx(int sfx_id, int volume, int priority) {
@@ -1938,6 +2028,12 @@ static void audio_play_ui_beep(int hz, int duration_ms, float volume) {
   audio->ui_beep_phase_step =
       (2.0 * 3.14159265358979323846 * (double)hz) / (double)audio->obtained.freq;
   audio->ui_beep_volume = volume;
+#ifdef GLOOM_DOS_SDL3
+  audio->ui_beep_phase_fp = 0u;
+  audio->ui_beep_phase_step_fp =
+      audio->obtained.freq > 0 ? (uint32_t)(((uint64_t)(unsigned)hz << 32) / (uint32_t)audio->obtained.freq) : 0u;
+  audio->ui_beep_volume_s16 = (int)(volume * 32767.0f);
+#endif
 #ifdef GLOOM_DOS_SDL3
   if (audio->stream != NULL) {
     (void)SDL_UnlockAudioStream(audio->stream);
@@ -10133,6 +10229,38 @@ static inline size_t dos_flat_texel_offset(int32_t world_x_fixed, int32_t world_
   return (size_t)((((uint32_t)world_x_fixed >> (DOS_FLAT_FRAC_BITS - 7)) & 0x3F80u) |
                   (((uint32_t)world_z_fixed >> DOS_FLAT_FRAC_BITS) & 0x7Fu));
 }
+
+static inline void dos_render_flat_row_shaded(uint8_t *dst, int count, const uint8_t *shaded_texels,
+                                              int32_t world_x_fixed, int32_t world_z_fixed,
+                                              int32_t world_x_step_fixed, int32_t world_z_step_fixed) {
+  if (dst == NULL || shaded_texels == NULL || count <= 0) {
+    return;
+  }
+
+  while (count >= 4) {
+    dst[0] = shaded_texels[dos_flat_texel_offset(world_x_fixed, world_z_fixed)];
+    world_x_fixed += world_x_step_fixed;
+    world_z_fixed += world_z_step_fixed;
+    dst[1] = shaded_texels[dos_flat_texel_offset(world_x_fixed, world_z_fixed)];
+    world_x_fixed += world_x_step_fixed;
+    world_z_fixed += world_z_step_fixed;
+    dst[2] = shaded_texels[dos_flat_texel_offset(world_x_fixed, world_z_fixed)];
+    world_x_fixed += world_x_step_fixed;
+    world_z_fixed += world_z_step_fixed;
+    dst[3] = shaded_texels[dos_flat_texel_offset(world_x_fixed, world_z_fixed)];
+    world_x_fixed += world_x_step_fixed;
+    world_z_fixed += world_z_step_fixed;
+    dst += 4;
+    count -= 4;
+  }
+
+  while (count > 0) {
+    *dst++ = shaded_texels[dos_flat_texel_offset(world_x_fixed, world_z_fixed)];
+    world_x_fixed += world_x_step_fixed;
+    world_z_fixed += world_z_step_fixed;
+    count -= 1;
+  }
+}
 #endif
 
 static void render_flat_textures(RenderFramebuffer *framebuffer, const AppState *state, const FlatTextureSet *flats, int x,
@@ -10298,11 +10426,8 @@ static void render_flat_textures(RenderFramebuffer *framebuffer, const AppState 
         world_z_fixed += world_z_step_fixed;
       }
     } else if (shaded_texels != NULL) {
-      for (col = 0; col < w; ++col) {
-        dst_row[col] = shaded_texels[dos_flat_texel_offset(world_x_fixed, world_z_fixed)];
-        world_x_fixed += world_x_step_fixed;
-        world_z_fixed += world_z_step_fixed;
-      }
+      dos_render_flat_row_shaded(dst_row, w, shaded_texels, world_x_fixed, world_z_fixed, world_x_step_fixed,
+                                 world_z_step_fixed);
     } else {
       for (col = 0; col < w; ++col) {
         uint8_t palette_index = texels[dos_flat_texel_offset(world_x_fixed, world_z_fixed)];
@@ -16709,6 +16834,15 @@ static bool set_runtime_mouse_capture(SDL_Window *window, bool captured) {
   return true;
 }
 
+static bool set_gameplay_start_mouse_capture(SDL_Window *window) {
+#ifdef GLOOM_DOS_SDL3
+  (void)window;
+  return false;
+#else
+  return set_runtime_mouse_capture(window, true);
+#endif
+}
+
 int main(int argc, char **argv) {
   const char *map_path = "amiga/maps/map1_1";
   const char *resolved_map_path = map_path;
@@ -16752,6 +16886,9 @@ int main(int argc, char **argv) {
   bool skip_menu = false;
   uint8_t violence_mode = GLOOM_VIOLENCE_MEATY_MESSY;
   uint32_t profile_render_frames = 0u;
+#ifdef GLOOM_DOS_SDL3
+  uint32_t dos_event_poll_frame = 0u;
+#endif
   bool level_transition_pending = false;
   bool combat_round_pending = false;
   AppState state;
@@ -17090,6 +17227,8 @@ int main(int argc, char **argv) {
 #ifdef GLOOM_DOS_SDL3
   SDL_SetHint(SDL_HINT_AUDIO_DRIVER, "soundblaster");
   SDL_SetHint(SDL_HINT_DOS_ALLOW_DIRECT_FRAMEBUFFER, "1");
+  SDL_SetHint("SDL_DOS_SKIP_EVENT_YIELD", "1");
+  SDL_SetHint("SDL_DOS_SKIP_MOUSE_PUMP", "1");
   if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_AUDIO) != 0) {
 #else
   if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_AUDIO | SDL_INIT_GAMECONTROLLER) != 0) {
@@ -17220,6 +17359,9 @@ int main(int argc, char **argv) {
   (void)SDL_RenderSetIntegerScale(renderer, classic_viewport ? SDL_TRUE : SDL_FALSE);
   (void)SDL_RenderSetLogicalSize(renderer, render_width, render_height);
 #ifdef GLOOM_DOS_SDL3
+  SDL_SetEventEnabled(SDL_EVENT_MOUSE_MOTION, false);
+  SDL_SetEventEnabled(SDL_EVENT_MOUSE_BUTTON_DOWN, false);
+  SDL_SetEventEnabled(SDL_EVENT_MOUSE_BUTTON_UP, false);
   apply_dos_index_palette_to_window(window);
 #endif
   if (!ensure_render_framebuffer(renderer, &framebuffer, render_width, render_height)) {
@@ -17371,7 +17513,7 @@ int main(int argc, char **argv) {
     }
     resolved_map_path = map_path_buffer;
   }
-  mouse_captured = set_runtime_mouse_capture(window, true);
+  mouse_captured = set_gameplay_start_mouse_capture(window);
 
   previous_state = state;
   if (previous_zones != NULL) {
@@ -17395,6 +17537,9 @@ int main(int argc, char **argv) {
     double profile_start_ms = 0.0;
     uint64_t perf_now = SDL_GetPerformanceCounter();
     double elapsed = (double)(perf_now - perf_prev) / (double)perf_frequency;
+#ifdef GLOOM_DOS_SDL3
+    bool poll_events_this_frame = dos_event_poll_frame == 0u;
+#endif
     perf_prev = perf_now;
 
     if (elapsed > 0.25) {
@@ -17419,58 +17564,69 @@ int main(int argc, char **argv) {
     }
 #endif
 
-    while (SDL_PollEvent(&event) != 0) {
-      gamepad_handle_event(&event);
-      if (event.type == SDL_QUIT) {
-        running = false;
-      }
-      if (event.type == SDL_KEYDOWN && event.key.repeat == 0) {
-        if (event.key.keysym.sym == SDLK_ESCAPE) {
+    profile_start_ms = profile_now_ms();
+#ifdef GLOOM_DOS_SDL3
+    /* The patched DOS SDL pump skips the cooperative yield and mouse INT 33h work, so per-frame polling stays smooth. */
+    dos_event_poll_frame = (dos_event_poll_frame + 1u) % (uint32_t)DOS_EVENT_POLL_INTERVAL_FRAMES;
+    if (poll_events_this_frame) {
+#endif
+      while (SDL_PollEvent(&event) != 0) {
+        gamepad_handle_event(&event);
+        if (event.type == SDL_QUIT) {
+          running = false;
+        }
+        if (event.type == SDL_KEYDOWN && event.key.repeat == 0) {
+          if (event.key.keysym.sym == SDLK_ESCAPE) {
+            pause_menu_requested = true;
+            if (mouse_captured || g_runtime_mouse_capture_active || SDL_GetRelativeMouseMode()) {
+              (void)set_runtime_mouse_capture(window, false);
+              mouse_captured = false;
+              mouse_dx_accum = 0.0;
+              suppress_mouse_fire_until_button_up = false;
+              SDL_FlushEvent(SDL_MOUSEMOTION);
+            }
+          } else if (event.key.keysym.sym == SDLK_p) {
+            pause_menu_requested = true;
+          } else if (event.key.keysym.sym == SDLK_F11) {
+#ifdef __EMSCRIPTEN__
+            runtime_emscripten_canvas_fullscreen_toggle();
+#else
+            Uint32 flags = SDL_GetWindowFlags(window);
+            if ((flags & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP)) != 0u) {
+              (void)SDL_SetWindowFullscreen(window, 0);
+            } else {
+              (void)SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP);
+            }
+#endif
+          }
+        }
+        if (event.type == SDL_CONTROLLERBUTTONDOWN && event.cbutton.button == SDL_CONTROLLER_BUTTON_START) {
           pause_menu_requested = true;
-          if (mouse_captured || g_runtime_mouse_capture_active || SDL_GetRelativeMouseMode()) {
-            (void)set_runtime_mouse_capture(window, false);
-            mouse_captured = false;
+        }
+#ifndef GLOOM_DOS_SDL3
+        if (event.type == SDL_MOUSEBUTTONDOWN && event.button.clicks >= 2) {
+          if (!mouse_captured && set_runtime_mouse_capture(window, true)) {
+            mouse_captured = true;
             mouse_dx_accum = 0.0;
-            suppress_mouse_fire_until_button_up = false;
+            suppress_mouse_fire_until_button_up = event.button.button == SDL_BUTTON_LEFT;
             SDL_FlushEvent(SDL_MOUSEMOTION);
           }
-        } else if (event.key.keysym.sym == SDLK_p) {
-          pause_menu_requested = true;
-        } else if (event.key.keysym.sym == SDLK_F11) {
-#ifdef __EMSCRIPTEN__
-          runtime_emscripten_canvas_fullscreen_toggle();
-#else
-          Uint32 flags = SDL_GetWindowFlags(window);
-          if ((flags & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP)) != 0u) {
-            (void)SDL_SetWindowFullscreen(window, 0);
-          } else {
-            (void)SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP);
-          }
+        }
 #endif
+        if (event.type == SDL_MOUSEBUTTONUP && event.button.button == SDL_BUTTON_LEFT) {
+          suppress_mouse_fire_until_button_up = false;
         }
-      }
-      if (event.type == SDL_CONTROLLERBUTTONDOWN && event.cbutton.button == SDL_CONTROLLER_BUTTON_START) {
-        pause_menu_requested = true;
-      }
-      if (event.type == SDL_MOUSEBUTTONDOWN && event.button.clicks >= 2) {
-        if (!mouse_captured && set_runtime_mouse_capture(window, true)) {
-          mouse_captured = true;
-          mouse_dx_accum = 0.0;
-          suppress_mouse_fire_until_button_up = event.button.button == SDL_BUTTON_LEFT;
-          SDL_FlushEvent(SDL_MOUSEMOTION);
-        }
-      }
-      if (event.type == SDL_MOUSEBUTTONUP && event.button.button == SDL_BUTTON_LEFT) {
-        suppress_mouse_fire_until_button_up = false;
-      }
-      if (event.type == SDL_MOUSEMOTION && mouse_captured) {
+        if (event.type == SDL_MOUSEMOTION && mouse_captured) {
 #ifdef GLOOM_DOS_SDL3
-        mouse_dx_accum += dos_runtime_mouse_motion_delta(window, &event.motion);
+          mouse_dx_accum += dos_runtime_mouse_motion_delta(window, &event.motion);
 #else
-        mouse_dx_accum += event.motion.xrel;
+          mouse_dx_accum += event.motion.xrel;
 #endif
+        }
       }
+#ifdef GLOOM_DOS_SDL3
     }
+#endif
     profile_add_elapsed(&g_profiler.events_ms, profile_start_ms);
 
     if (pause_menu_requested && running) {
@@ -17512,7 +17668,7 @@ int main(int argc, char **argv) {
 #ifdef GLOOM_DOS_SDL3
         refresh_dos_index_palette(&framebuffer, window);
 #endif
-        mouse_captured = set_runtime_mouse_capture(window, true);
+        mouse_captured = set_gameplay_start_mouse_capture(window);
         previous_state = state;
         if (previous_zones != NULL) {
           previous_state.map.zones = previous_zones;
@@ -17615,7 +17771,7 @@ int main(int argc, char **argv) {
 #ifdef GLOOM_DOS_SDL3
         refresh_dos_index_palette(&framebuffer, window);
 #endif
-        mouse_captured = set_runtime_mouse_capture(window, true);
+        mouse_captured = set_gameplay_start_mouse_capture(window);
         previous_state = state;
         if (previous_zones != NULL) {
           previous_state.map.zones = previous_zones;
@@ -17696,7 +17852,7 @@ int main(int argc, char **argv) {
 #ifdef GLOOM_DOS_SDL3
         refresh_dos_index_palette(&framebuffer, window);
 #endif
-        mouse_captured = set_runtime_mouse_capture(window, true);
+        mouse_captured = set_gameplay_start_mouse_capture(window);
         previous_state = state;
         if (previous_zones != NULL) {
           previous_state.map.zones = previous_zones;
