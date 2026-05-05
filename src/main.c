@@ -18827,6 +18827,97 @@ cleanup:
   return result;
 }
 
+static int run_completion_selftest(void) {
+  char next_map_path[1024] = {0};
+  ScriptCompletion completion;
+  MenuImage image;
+  HudFont font;
+  int result = 1;
+
+  memset(&completion, 0, sizeof(completion));
+  memset(&image, 0, sizeof(image));
+  memset(&font, 0, sizeof(font));
+
+  if (resolve_next_script_play_map_or_done("amiga/data/maps/map4_7", next_map_path, sizeof(next_map_path),
+                                           &completion) != SCRIPT_PLAY_NEXT_DONE) {
+    fprintf(stderr, "Completion selftest failed: map4_7 did not advance to original done_ script command\n");
+    return 1;
+  }
+  if (strcmp(completion.picture, "theend") != 0 ||
+      strcmp(completion.text, "congratulations! you have completed gloom!") != 0) {
+    fprintf(stderr, "Completion selftest failed: original pict_theend/text_ completion commands were not resolved\n");
+    return 1;
+  }
+  if (!load_script_picture_image(completion.picture, &image)) {
+    fprintf(stderr, "Completion selftest failed: original pict_theend image could not be loaded\n");
+    return 1;
+  }
+  if (!load_menu_big_font(&font)) {
+    fprintf(stderr, "Completion selftest failed: original bigfont asset could not be loaded\n");
+    free_menu_image(&image);
+    return 1;
+  }
+
+#ifndef GLOOM_DOS_SDL3
+  {
+    enum { TEST_W = 320, TEST_H = 200 };
+    RenderFramebuffer text_framebuffer;
+    RenderFramebuffer image_framebuffer;
+    uint32_t *text_pixels = NULL;
+    uint32_t *image_pixels = NULL;
+    size_t pixel_count = (size_t)TEST_W * (size_t)TEST_H;
+    size_t i = 0u;
+    size_t changed_pixels = 0u;
+
+    memset(&text_framebuffer, 0, sizeof(text_framebuffer));
+    memset(&image_framebuffer, 0, sizeof(image_framebuffer));
+    text_pixels = (uint32_t *)calloc(pixel_count, sizeof(*text_pixels));
+    image_pixels = (uint32_t *)calloc(pixel_count, sizeof(*image_pixels));
+    if (text_pixels == NULL || image_pixels == NULL) {
+      fprintf(stderr, "Completion selftest failed: out of memory preparing render buffers\n");
+      free(text_pixels);
+      free(image_pixels);
+      goto cleanup;
+    }
+
+    text_framebuffer.pixels = text_pixels;
+    text_framebuffer.pitch_pixels = TEST_W;
+    text_framebuffer.width = TEST_W;
+    text_framebuffer.height = TEST_H;
+    image_framebuffer.pixels = image_pixels;
+    image_framebuffer.pitch_pixels = TEST_W;
+    image_framebuffer.width = TEST_W;
+    image_framebuffer.height = TEST_H;
+
+    framebuffer_clear(&image_framebuffer, 0xFF000000u);
+    render_menu_image(&image_framebuffer, &image, TEST_W, TEST_H);
+    render_completion_frame(&text_framebuffer, &image, &font, completion.text, TEST_W, TEST_H);
+
+    for (i = 0u; i < pixel_count; ++i) {
+      if (text_pixels[i] != image_pixels[i]) {
+        changed_pixels += 1u;
+      }
+    }
+    free(text_pixels);
+    free(image_pixels);
+    if (changed_pixels == 0u) {
+      fprintf(stderr, "Completion selftest failed: completion text did not render over pict_theend\n");
+      goto cleanup;
+    }
+  }
+#endif
+
+  printf("Completion selftest passed: map4_7 resolves pict_theend/text_/done_ and renders completion screen\n");
+  result = 0;
+
+#ifndef GLOOM_DOS_SDL3
+cleanup:
+#endif
+  free_hud_font(&font);
+  free_menu_image(&image);
+  return result;
+}
+
 static bool run_menu_and_restart_game(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, int render_width,
                                       int render_height, AppState *state, WallTextureSet *wall_textures,
                                       FlatTextureSet *flat_textures, ObjectVisualSet *object_visuals,
@@ -19312,6 +19403,10 @@ int main(int argc, char **argv) {
 
   if (argc > 1 && strcmp(argv[1], "--menu-selftest") == 0) {
     return run_menu_selftest();
+  }
+
+  if (argc > 1 && strcmp(argv[1], "--completion-selftest") == 0) {
+    return run_completion_selftest();
   }
 
   if (argc > 1 && strcmp(argv[1], "--texture-source-selftest") == 0) {
