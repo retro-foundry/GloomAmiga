@@ -151,6 +151,7 @@ enum {
   GLOOM_UI_BEEP_MS = 45,
   GLOOM_UI_SELECT_BEEP_HZ = 1320,
   GLOOM_UI_SELECT_BEEP_MS = 55,
+  GLOOM_MENU_SELECT_PAUSE_MS = 120,
   GLOOM_MENU_BIG_FONT_WIDTH = 8,
   GLOOM_MENU_BIG_FONT_HEIGHT = 10,
   GLOOM_MENU_FLASH_TICKS = 13,
@@ -2287,6 +2288,17 @@ static void audio_play_ui_activate(void) {
 
 static void audio_play_ui_back(void) {
   audio_play_ui_beep(GLOOM_UI_BEEP_HZ, GLOOM_UI_BEEP_MS, 0.12f);
+}
+
+static void menu_pause_after_selection(void) {
+  uint32_t start_tick = SDL_GetTicks();
+
+  while (SDL_GetTicks() - start_tick < (uint32_t)GLOOM_MENU_SELECT_PAUSE_MS) {
+#ifdef GLOOM_DOS_SDL3
+    audio_dos_pump(&g_audio);
+#endif
+    SDL_Delay(5);
+  }
 }
 
 static void audio_vblank_tick(void) {
@@ -13758,10 +13770,12 @@ static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer
           redraw = true;
           audio_play_ui_move();
         } else if (sym == SDLK_RETURN || sym == SDLK_SPACE || sym == SDLK_LCTRL || sym == SDLK_RCTRL) {
-          int result =
-              activate_start_menu_selection(selected_index, out_game_mode, io_control_config, &selected_visible,
-                                            &flash_ticks);
+          int result = 0;
+
           audio_play_ui_activate();
+          menu_pause_after_selection();
+          result = activate_start_menu_selection(selected_index, out_game_mode, io_control_config, &selected_visible,
+                                                 &flash_ticks);
           if (result > 0) {
             return 0;
           }
@@ -13797,9 +13811,10 @@ static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer
 
           selected_index = click_index;
           selected_visible = true;
+          audio_play_ui_activate();
+          menu_pause_after_selection();
           result = activate_start_menu_selection(selected_index, out_game_mode, io_control_config, &selected_visible,
                                                  &flash_ticks);
-          audio_play_ui_activate();
           if (result > 0) {
             return 0;
           }
@@ -13825,10 +13840,12 @@ static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer
           redraw = true;
           audio_play_ui_move();
         } else if (gamepad_menu_activate_event(&event)) {
-          int result =
-              activate_start_menu_selection(selected_index, out_game_mode, io_control_config, &selected_visible,
-                                            &flash_ticks);
+          int result = 0;
+
           audio_play_ui_activate();
+          menu_pause_after_selection();
+          result = activate_start_menu_selection(selected_index, out_game_mode, io_control_config, &selected_visible,
+                                                 &flash_ticks);
           if (result > 0) {
             return 0;
           }
@@ -13979,6 +13996,7 @@ static int run_combat_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffe
           audio_play_ui_move();
         } else if (sym == SDLK_RETURN || sym == SDLK_SPACE || sym == SDLK_LCTRL || sym == SDLK_RCTRL) {
           audio_play_ui_activate();
+          menu_pause_after_selection();
           if (selected_index < 3) {
             *out_series = (uint8_t)(selected_index + 1);
             *out_lives = lives;
@@ -14015,6 +14033,7 @@ static int run_combat_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffe
           audio_play_ui_move();
         } else if (gamepad_menu_activate_event(&event)) {
           audio_play_ui_activate();
+          menu_pause_after_selection();
           if (selected_index < 3) {
             *out_series = (uint8_t)(selected_index + 1);
             *out_lives = lives;
@@ -14270,11 +14289,13 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
         } else if (sym == SDLK_RETURN || sym == SDLK_SPACE || sym == SDLK_LCTRL || sym == SDLK_RCTRL) {
           PauseMenuResult result = selected_index == 0 ? PAUSE_MENU_CONTINUE : PAUSE_MENU_MAIN_MENU;
           audio_play_ui_activate();
+          menu_pause_after_selection();
           audio_pause_output(&g_audio, false, false);
           free_hud_font(&font);
           return result;
         } else if (sym == SDLK_p) {
           audio_play_ui_activate();
+          menu_pause_after_selection();
           audio_pause_output(&g_audio, false, false);
           free_hud_font(&font);
           return PAUSE_MENU_CONTINUE;
@@ -14299,6 +14320,7 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
 
             selected_index = click_index;
             audio_play_ui_activate();
+            menu_pause_after_selection();
             audio_pause_output(&g_audio, false, false);
             free_hud_font(&font);
             return result;
@@ -14320,6 +14342,7 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
 
           selected_index = click_index;
           audio_play_ui_activate();
+          menu_pause_after_selection();
           audio_pause_output(&g_audio, false, false);
           free_hud_font(&font);
           return result;
@@ -14351,6 +14374,7 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
         } else if (gamepad_menu_activate_event(&event)) {
           PauseMenuResult result = selected_index == 0 ? PAUSE_MENU_CONTINUE : PAUSE_MENU_MAIN_MENU;
           audio_play_ui_activate();
+          menu_pause_after_selection();
           audio_pause_output(&g_audio, false, false);
           free_hud_font(&font);
           return result;
