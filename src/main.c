@@ -10,6 +10,7 @@
 #include <stdio.h>
 #include <stdarg.h>
 #include <string.h>
+#include <errno.h>
 
 #include "iff.h"
 #include "map.h"
@@ -579,13 +580,16 @@ typedef enum {
 typedef enum {
   PAUSE_MENU_QUIT = -1,
   PAUSE_MENU_CONTINUE = 0,
-  PAUSE_MENU_MAIN_MENU = 1
+  PAUSE_MENU_MAIN_MENU = 1,
+  PAUSE_MENU_LOAD_GAME = 2
 } PauseMenuResult;
 
 typedef enum {
   GLOOM_GAME_MODE_ONE_PLAYER = 0,
   GLOOM_GAME_MODE_TWO_PLAYER = 1,
-  GLOOM_GAME_MODE_COMBAT = 2
+  GLOOM_GAME_MODE_COMBAT = 2,
+  GLOOM_GAME_MODE_LOAD_ONE_PLAYER = 3,
+  GLOOM_GAME_MODE_LOAD_TWO_PLAYER = 4
 } GloomGameMode;
 
 typedef enum {
@@ -4589,6 +4593,256 @@ static bool load_game_script_blob(uint8_t **out_script, size_t *out_script_size)
   fprintf(stderr, "Unable to load game script for scriptplay level progression\n");
   return false;
 }
+
+static bool script_play_ordinal_for_map(const char *map_path, uint32_t *out_ordinal) {
+  char map_name[64] = {0};
+  uint8_t *script = NULL;
+  size_t script_size = 0u;
+  size_t pos = 0u;
+  uint32_t ordinal = 0u;
+
+  if (!map_leaf_name(map_path, map_name, sizeof(map_name)) || out_ordinal == NULL) {
+    return false;
+  }
+  *out_ordinal = 0u;
+
+  if (!load_game_script_blob(&script, &script_size)) {
+    return false;
+  }
+
+  while (pos < script_size) {
+    size_t line_start = pos;
+    size_t line_len = 0u;
+    const char *line = NULL;
+
+    while (pos < script_size && script[pos] != '\n') {
+      pos += 1u;
+    }
+
+    line = (const char *)script + line_start;
+    line_len = pos - line_start;
+    if (pos < script_size && script[pos] == '\n') {
+      pos += 1u;
+    }
+
+    while (line_len > 0u && (*line == ' ' || *line == '\t')) {
+      line += 1;
+      line_len -= 1u;
+    }
+    while (line_len > 0u && (line[line_len - 1u] == '\r' || line[line_len - 1u] == ' ' || line[line_len - 1u] == '\t')) {
+      line_len -= 1u;
+    }
+
+    if (line_len > 5u && memcmp(line, "play_", 5u) == 0) {
+      const char *script_map_name = line + 5u;
+      size_t script_map_len = line_len - 5u;
+
+      ordinal += 1u;
+      if (script_map_len == strlen(map_name) && memcmp(script_map_name, map_name, script_map_len) == 0) {
+        *out_ordinal = ordinal;
+        free(script);
+        return true;
+      }
+    }
+  }
+
+  fprintf(stderr, "No script play_ ordinal found for map %s\n", map_name);
+  free(script);
+  return false;
+}
+
+#if GLOOM_RUNTIME_IS_BINARY
+#define GLOOM_AUTOSAVE_ONE_PLAYER_FILE "GLOOM1P.SAV"
+#define GLOOM_AUTOSAVE_TWO_PLAYER_FILE "GLOOM2P.SAV"
+
+typedef struct {
+  char map_path[1024];
+  bool two_player_mode;
+  bool combat_mode;
+  uint8_t violence_mode;
+  bool barrel_projectile_origin;
+  int16_t player_hitpoints;
+  int16_t player_lives;
+  uint8_t player_weapon;
+  uint8_t player_reload;
+  int16_t player2_hitpoints;
+  int16_t player2_lives;
+  uint8_t player2_weapon;
+  uint8_t player2_reload;
+  uint32_t script_ordinal;
+} GloomAutosaveData;
+
+static const char *gloom_autosave_path_for_mode(bool two_player_mode) {
+  return two_player_mode ? GLOOM_AUTOSAVE_TWO_PLAYER_FILE : GLOOM_AUTOSAVE_ONE_PLAYER_FILE;
+}
+
+static bool gloom_autosave_available(bool two_player_mode) {
+  FILE *file = fopen(gloom_autosave_path_for_mode(two_player_mode), "r");
+
+  if (file == NULL) {
+    return false;
+  }
+  fclose(file);
+  return true;
+}
+
+static void trim_autosave_line(char *line) {
+  size_t len = 0u;
+
+  if (line == NULL) {
+    return;
+  }
+  len = strlen(line);
+  while (len > 0u && (line[len - 1u] == '\n' || line[len - 1u] == '\r')) {
+    line[len - 1u] = '\0';
+    len -= 1u;
+  }
+}
+
+static bool write_gloom_autosave(const AppState *state, const char *resolved_map_path, uint32_t script_ordinal) {
+  const char *save_path = NULL;
+  FILE *file = NULL;
+
+  if (state == NULL || resolved_map_path == NULL || resolved_map_path[0] == '\0') {
+    fprintf(stderr, "Cannot autosave: missing current game state or map path\n");
+    return false;
+  }
+  if (state->combat_mode) {
+    return false;
+  }
+  save_path = gloom_autosave_path_for_mode(state->two_player_mode);
+
+  file = fopen(save_path, "w");
+  if (file == NULL) {
+    fprintf(stderr, "Cannot autosave %s: %s\n", save_path, strerror(errno));
+    return false;
+  }
+
+  fprintf(file, "GLOOM_AUTOSAVE 1\n");
+  fprintf(file, "map=%s\n", resolved_map_path);
+  fprintf(file, "script_ordinal=%lu\n", (unsigned long)script_ordinal);
+  fprintf(file, "two_player=%d\n", state->two_player_mode ? 1 : 0);
+  fprintf(file, "combat=%d\n", state->combat_mode ? 1 : 0);
+  fprintf(file, "violence=%u\n", (unsigned)state->violence_mode);
+  fprintf(file, "barrel_origin=%d\n", state->barrel_projectile_origin ? 1 : 0);
+  fprintf(file, "p1=%d,%d,%u,%u\n", (int)state->player_hitpoints, (int)state->player_lives,
+          (unsigned)state->player_weapon, (unsigned)state->player_reload);
+  fprintf(file, "p2=%d,%d,%u,%u\n", (int)state->player2.player_hitpoints, (int)state->player2.player_lives,
+          (unsigned)state->player2.player_weapon, (unsigned)state->player2.player_reload);
+
+  if (fclose(file) != 0) {
+    fprintf(stderr, "Cannot finish autosave %s: %s\n", save_path, strerror(errno));
+    return false;
+  }
+  return true;
+}
+
+static bool read_gloom_autosave(bool two_player_mode, GloomAutosaveData *out_save) {
+  const char *save_path = gloom_autosave_path_for_mode(two_player_mode);
+  FILE *file = NULL;
+  char line[1200];
+  bool have_script_ordinal = false;
+  bool have_two_player = false;
+  bool have_combat = false;
+  bool have_violence = false;
+  bool have_barrel = false;
+  bool have_p1 = false;
+  bool have_p2 = false;
+  bool path_too_long = false;
+
+  if (out_save == NULL) {
+    return false;
+  }
+  memset(out_save, 0, sizeof(*out_save));
+
+  file = fopen(save_path, "r");
+  if (file == NULL) {
+    fprintf(stderr, "Cannot load autosave %s: %s\n", save_path, strerror(errno));
+    return false;
+  }
+
+  if (fgets(line, sizeof(line), file) == NULL) {
+    fprintf(stderr, "Cannot load autosave %s: file is empty\n", save_path);
+    fclose(file);
+    return false;
+  }
+  trim_autosave_line(line);
+  if (strcmp(line, "GLOOM_AUTOSAVE 1") != 0) {
+    fprintf(stderr, "Cannot load autosave %s: unsupported header '%s'\n", save_path, line);
+    fclose(file);
+    return false;
+  }
+
+  while (fgets(line, sizeof(line), file) != NULL) {
+    int a = 0;
+    int b = 0;
+    unsigned c = 0u;
+    unsigned d = 0u;
+    unsigned value = 0u;
+    unsigned long long_value = 0ul;
+
+    trim_autosave_line(line);
+    if (memcmp(line, "map=", 4u) == 0) {
+      if (strlen(line + 4) >= sizeof(out_save->map_path)) {
+        path_too_long = true;
+      } else {
+        (void)snprintf(out_save->map_path, sizeof(out_save->map_path), "%s", line + 4);
+      }
+    } else if (sscanf(line, "script_ordinal=%lu", &long_value) == 1) {
+      out_save->script_ordinal = (uint32_t)long_value;
+      have_script_ordinal = true;
+    } else if (sscanf(line, "two_player=%u", &value) == 1) {
+      out_save->two_player_mode = value != 0u;
+      have_two_player = true;
+    } else if (sscanf(line, "combat=%u", &value) == 1) {
+      out_save->combat_mode = value != 0u;
+      have_combat = true;
+    } else if (sscanf(line, "violence=%u", &value) == 1) {
+      out_save->violence_mode = (uint8_t)value;
+      have_violence = true;
+    } else if (sscanf(line, "barrel_origin=%u", &value) == 1) {
+      out_save->barrel_projectile_origin = value != 0u;
+      have_barrel = true;
+    } else if (sscanf(line, "p1=%d,%d,%u,%u", &a, &b, &c, &d) == 4) {
+      out_save->player_hitpoints = (int16_t)a;
+      out_save->player_lives = (int16_t)b;
+      out_save->player_weapon = (uint8_t)c;
+      out_save->player_reload = (uint8_t)d;
+      have_p1 = true;
+    } else if (sscanf(line, "p2=%d,%d,%u,%u", &a, &b, &c, &d) == 4) {
+      out_save->player2_hitpoints = (int16_t)a;
+      out_save->player2_lives = (int16_t)b;
+      out_save->player2_weapon = (uint8_t)c;
+      out_save->player2_reload = (uint8_t)d;
+      have_p2 = true;
+    }
+  }
+
+  fclose(file);
+  if (path_too_long) {
+    fprintf(stderr, "Cannot load autosave %s: map path is too long\n", save_path);
+    return false;
+  }
+  if (out_save->map_path[0] == '\0') {
+    fprintf(stderr, "Cannot load autosave %s: missing map path\n", save_path);
+    return false;
+  }
+  if (!have_script_ordinal || !have_two_player || !have_combat || !have_violence || !have_barrel || !have_p1 ||
+      !have_p2) {
+    fprintf(stderr, "Cannot load autosave %s: save file is missing required state fields\n", save_path);
+    return false;
+  }
+  if (out_save->combat_mode) {
+    fprintf(stderr, "Cannot load autosave %s: combat autosaves are not written by this binary\n", save_path);
+    return false;
+  }
+  if (out_save->two_player_mode != two_player_mode) {
+    fprintf(stderr, "Cannot load autosave %s: save mode does not match the requested player count\n", save_path);
+    return false;
+  }
+  return true;
+}
+#endif
 
 static ScriptPlayNextResult resolve_next_script_play_map_or_done(const char *current_map_path, char *out_map_path,
                                                                  size_t out_map_path_size,
@@ -13596,6 +13850,9 @@ static void render_menu_argb_pixels(RenderFramebuffer *framebuffer, const uint32
 
 static int start_menu_item_count(void);
 
+static int g_start_menu_logo_src_w = 0;
+static int g_start_menu_logo_src_h = 0;
+
 typedef struct {
   const char *title_text;
   int scale;
@@ -13717,7 +13974,8 @@ static void compute_start_menu_layout(int render_width, int render_height, int i
 static int start_menu_y_for_viewport(int render_width, int render_height, int item_count) {
   StartMenuLayout layout;
 
-  compute_start_menu_layout(render_width, render_height, item_count, 0, 0, &layout);
+  compute_start_menu_layout(render_width, render_height, item_count, g_start_menu_logo_src_w,
+                            g_start_menu_logo_src_h, &layout);
   return layout.menu_y;
 }
 
@@ -13849,7 +14107,8 @@ static bool cache_start_menu_background(RenderFramebuffer *framebuffer, const Me
   framebuffer_clear(framebuffer, 0xFF000000u);
   render_menu_image(framebuffer, &assets->title, render_width, render_height);
 
-  compute_start_menu_layout(render_width, render_height, start_menu_item_count(), 0, 0, &layout);
+  compute_start_menu_layout(render_width, render_height, start_menu_item_count(), g_start_menu_logo_src_w,
+                            g_start_menu_logo_src_h, &layout);
   render_menu_text_brightness(framebuffer, &assets->big_font, layout.title_text, render_width / 2, layout.title_y,
                               layout.title_scale, 255u);
   render_start_menu_static_marks(framebuffer, assets, render_width, render_height);
@@ -13901,7 +14160,8 @@ static bool cache_start_menu_background_dos_indices(RenderFramebuffer *framebuff
   framebuffer_clear(framebuffer, 0xFF000000u);
   render_menu_image(framebuffer, &assets->title, render_width, render_height);
 
-  compute_start_menu_layout(render_width, render_height, start_menu_item_count(), 0, 0, &layout);
+  compute_start_menu_layout(render_width, render_height, start_menu_item_count(), g_start_menu_logo_src_w,
+                            g_start_menu_logo_src_h, &layout);
   render_menu_text_brightness(framebuffer, &assets->big_font, layout.title_text, render_width / 2, layout.title_y,
                               layout.title_scale, 255u);
   render_start_menu_static_marks(framebuffer, assets, render_width, render_height);
@@ -13919,11 +14179,52 @@ static bool cache_start_menu_background_dos_indices(RenderFramebuffer *framebuff
 #endif
 
 static int start_menu_item_count(void) {
-#ifdef __EMSCRIPTEN__
+#if GLOOM_RUNTIME_IS_BINARY
+  return 7;
+#elif defined(__EMSCRIPTEN__)
   return 4;
 #else
   return 5;
 #endif
+}
+
+static bool start_menu_item_enabled(int item_index) {
+#if GLOOM_RUNTIME_IS_BINARY
+  if (item_index == 1) {
+    return gloom_autosave_available(false);
+  }
+  if (item_index == 3) {
+    return gloom_autosave_available(true);
+  }
+#endif
+  return item_index >= 0 && item_index < start_menu_item_count();
+}
+
+static int start_menu_next_enabled_index(int selected_index, int direction) {
+  int item_count = start_menu_item_count();
+  int candidate = selected_index;
+  int attempts = 0;
+
+  if (item_count <= 0) {
+    return 0;
+  }
+  if (direction == 0) {
+    direction = 1;
+  }
+
+  for (attempts = 0; attempts < item_count; ++attempts) {
+    candidate += direction;
+    while (candidate < 0) {
+      candidate += item_count;
+    }
+    while (candidate >= item_count) {
+      candidate -= item_count;
+    }
+    if (start_menu_item_enabled(candidate)) {
+      return candidate;
+    }
+  }
+  return selected_index >= 0 && selected_index < item_count ? selected_index : 0;
 }
 
 static int menu_row_at_point(int render_width, int render_height, int item_count, int x, int y) {
@@ -13970,10 +14271,38 @@ static int activate_start_menu_selection(int selected_index, GloomGameMode *out_
     *out_game_mode = GLOOM_GAME_MODE_ONE_PLAYER;
     return 1;
   }
+#if GLOOM_RUNTIME_IS_BINARY
+  if (selected_index == 1) {
+    if (gloom_autosave_available(false)) {
+      *out_game_mode = GLOOM_GAME_MODE_LOAD_ONE_PLAYER;
+      return 1;
+    }
+    *io_selected_visible = false;
+    *io_flash_ticks = GLOOM_MENU_FLASH_TICKS;
+    return 0;
+  }
+  if (selected_index == 2) {
+    *out_game_mode = GLOOM_GAME_MODE_TWO_PLAYER;
+    return 1;
+  }
+  if (selected_index == 3) {
+    if (gloom_autosave_available(true)) {
+      *out_game_mode = GLOOM_GAME_MODE_LOAD_TWO_PLAYER;
+      return 1;
+    }
+    *io_selected_visible = false;
+    *io_flash_ticks = GLOOM_MENU_FLASH_TICKS;
+    return 0;
+  }
+  if (selected_index > 3) {
+    selected_index -= 2;
+  }
+#else
   if (selected_index == 1) {
     *out_game_mode = GLOOM_GAME_MODE_TWO_PLAYER;
     return 1;
   }
+#endif
   if (selected_index == 2) {
     cycle_control_config(io_control_config, 0u);
     *io_selected_visible = false;
@@ -13997,10 +14326,14 @@ static void render_start_menu_frame(RenderFramebuffer *framebuffer, const MenuAs
                                     int render_width, int render_height,
                                     int selected_index, bool selected_visible,
                                     uint8_t violence_mode, const RuntimeControlConfig *control_config) {
-  const char *items[6];
+  const char *items[7];
   int item_count = start_menu_item_count();
   char player1_item[32];
   char player2_item[32];
+#if GLOOM_RUNTIME_IS_BINARY
+  bool one_player_autosave_available = gloom_autosave_available(false);
+  bool two_player_autosave_available = gloom_autosave_available(true);
+#endif
   int scale = 1;
   int y = 0;
   int i = 0;
@@ -14018,10 +14351,19 @@ static void render_start_menu_frame(RenderFramebuffer *framebuffer, const MenuAs
   (void)snprintf(player2_item, sizeof(player2_item), "PLAYER 2 %s",
                  control_source_menu_name(control_config != NULL ? control_config->player2 : GLOOM_CONTROL_GAMEPAD_1));
   items[0] = "ONE PLAYER GAME";
+#if GLOOM_RUNTIME_IS_BINARY
+  items[1] = "LOAD ONE PLAYER AUTOSAVE";
+  items[2] = "TWO PLAYER GAME";
+  items[3] = "LOAD TWO PLAYER AUTOSAVE";
+  items[4] = player1_item;
+  items[5] = player2_item;
+  items[6] = "EXIT GLOOM";
+#else
   items[1] = "TWO PLAYER GAME";
   items[2] = player1_item;
   items[3] = player2_item;
   items[4] = "EXIT GLOOM";
+#endif
 
 #ifdef GLOOM_DOS_SDL3
   if (dos_index_background != NULL) {
@@ -14046,6 +14388,11 @@ static void render_start_menu_frame(RenderFramebuffer *framebuffer, const MenuAs
   for (i = 0; i < item_count; ++i) {
     uint8_t brightness = (i == selected_index && !selected_visible) ? 96u : 255u;
 
+#if GLOOM_RUNTIME_IS_BINARY
+    if ((i == 1 && !one_player_autosave_available) || (i == 3 && !two_player_autosave_available)) {
+      brightness = 96u;
+    }
+#endif
     render_menu_text_brightness(framebuffer, &assets->big_font, items[i], render_width / 2,
                                 y + (i * GLOOM_MENU_BIG_FONT_HEIGHT * scale), scale, brightness);
   }
@@ -14077,10 +14424,31 @@ static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer
   }
   runtime_prepare_menu_input();
   normalize_control_config(io_control_config);
+  {
+    int logo_src_x = 0;
+    int logo_src_y = 0;
+
+    menu_image_content_bounds(&assets->black_magic_logo, &logo_src_x, &logo_src_y, &g_start_menu_logo_src_w,
+                              &g_start_menu_logo_src_h);
+    (void)logo_src_x;
+    (void)logo_src_y;
+    if (g_start_menu_logo_src_w <= 0 || g_start_menu_logo_src_h <= 0) {
+      g_start_menu_logo_src_w = 0;
+      g_start_menu_logo_src_h = 0;
+    }
+  }
   if (*out_game_mode == GLOOM_GAME_MODE_TWO_PLAYER) {
+#if GLOOM_RUNTIME_IS_BINARY
+    selected_index = 2;
+#else
     selected_index = 1;
+#endif
   } else if (*out_game_mode == GLOOM_GAME_MODE_COMBAT) {
+#if GLOOM_RUNTIME_IS_BINARY
+    selected_index = 2;
+#else
     selected_index = 1;
+#endif
   }
 #ifdef GLOOM_DOS_SDL3
   apply_dos_menu_display_palette(framebuffer, &assets->title, &assets->black_magic_logo, &assets->big_font);
@@ -14110,15 +14478,13 @@ static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer
         SDL_Keycode sym = event.key.keysym.sym;
 
         if (sym == SDLK_UP || sym == SDLK_w) {
-          selected_index -= 1;
-          if (selected_index < 0) selected_index = item_count - 1;
+          selected_index = start_menu_next_enabled_index(selected_index, -1);
           selected_visible = false;
           flash_ticks = GLOOM_MENU_FLASH_TICKS;
           redraw = true;
           audio_play_ui_move();
         } else if (sym == SDLK_DOWN || sym == SDLK_s) {
-          selected_index += 1;
-          if (selected_index >= item_count) selected_index = 0;
+          selected_index = start_menu_next_enabled_index(selected_index, 1);
           selected_visible = false;
           flash_ticks = GLOOM_MENU_FLASH_TICKS;
           redraw = true;
@@ -14148,7 +14514,7 @@ static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer
         int hover_index =
             menu_row_at_event_point(renderer, render_width, render_height, item_count, event.motion.x, event.motion.y);
 
-        if (hover_index >= 0 && hover_index != selected_index) {
+        if (hover_index >= 0 && start_menu_item_enabled(hover_index) && hover_index != selected_index) {
           selected_index = hover_index;
           selected_visible = false;
           flash_ticks = GLOOM_MENU_FLASH_TICKS;
@@ -14160,7 +14526,7 @@ static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer
         int click_index =
             menu_row_at_event_point(renderer, render_width, render_height, item_count, event.button.x, event.button.y);
 
-        if (click_index >= 0) {
+        if (click_index >= 0 && start_menu_item_enabled(click_index)) {
           int result = 0;
 
           selected_index = click_index;
@@ -14180,15 +14546,13 @@ static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer
       }
       if (event.type == SDL_CONTROLLERBUTTONDOWN) {
         if (event.cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_UP) {
-          selected_index -= 1;
-          if (selected_index < 0) selected_index = item_count - 1;
+          selected_index = start_menu_next_enabled_index(selected_index, -1);
           selected_visible = false;
           flash_ticks = GLOOM_MENU_FLASH_TICKS;
           redraw = true;
           audio_play_ui_move();
         } else if (event.cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_DOWN) {
-          selected_index += 1;
-          if (selected_index >= item_count) selected_index = 0;
+          selected_index = start_menu_next_enabled_index(selected_index, 1);
           selected_visible = false;
           flash_ticks = GLOOM_MENU_FLASH_TICKS;
           redraw = true;
@@ -14493,11 +14857,35 @@ static bool run_combat_result_screen(SDL_Renderer *renderer, RenderFramebuffer *
   return true;
 }
 
+static int pause_menu_item_count(bool two_player_mode) {
+#if GLOOM_RUNTIME_IS_BINARY
+  return gloom_autosave_available(two_player_mode) ? 3 : 2;
+#else
+  (void)two_player_mode;
+  return 2;
+#endif
+}
+
+static PauseMenuResult pause_menu_result_for_index(int selected_index, bool two_player_mode) {
+#if GLOOM_RUNTIME_IS_BINARY
+  if (gloom_autosave_available(two_player_mode)) {
+    if (selected_index == 0) return PAUSE_MENU_CONTINUE;
+    if (selected_index == 1) return PAUSE_MENU_LOAD_GAME;
+    if (selected_index == 2) return PAUSE_MENU_MAIN_MENU;
+    return PAUSE_MENU_CONTINUE;
+  }
+#else
+  (void)two_player_mode;
+#endif
+  return selected_index == 0 ? PAUSE_MENU_CONTINUE : PAUSE_MENU_MAIN_MENU;
+}
+
 static void render_pause_menu_frame(RenderFramebuffer *framebuffer, const HudFont *font, const uint32_t *background,
                                     const uint8_t *dos_index_background, int background_pitch_pixels,
                                     int render_width, int render_height,
-                                    int selected_index, bool selected_visible) {
-  const char *items[2] = {"CONTINUE", "RETURN TO MAIN MENU"};
+                                    int selected_index, bool selected_visible, bool two_player_mode) {
+  const char *items[3];
+  int item_count = pause_menu_item_count(two_player_mode);
   int scale = 1;
   int y = 0;
   int i = 0;
@@ -14522,9 +14910,19 @@ static void render_pause_menu_frame(RenderFramebuffer *framebuffer, const HudFon
     framebuffer_clear(framebuffer, 0xFF000000u);
   }
 #endif
+  items[0] = "CONTINUE";
+#if GLOOM_RUNTIME_IS_BINARY
+  if (gloom_autosave_available(two_player_mode)) {
+    items[1] = "LOAD GAME";
+    items[2] = "RETURN TO MAIN MENU";
+  } else
+#endif
+  {
+    items[1] = "RETURN TO MAIN MENU";
+  }
   scale = menu_pixel_scale_for_viewport(render_width, render_height);
-  y = (render_height / 2) - (((int)(sizeof(items) / sizeof(items[0])) * GLOOM_MENU_BIG_FONT_HEIGHT * scale) / 2);
-  for (i = 0; i < (int)(sizeof(items) / sizeof(items[0])); ++i) {
+  y = (render_height / 2) - ((item_count * GLOOM_MENU_BIG_FONT_HEIGHT * scale) / 2);
+  for (i = 0; i < item_count; ++i) {
     uint8_t brightness = (i == selected_index && !selected_visible) ? 96u : 255u;
 
     render_menu_text_brightness(framebuffer, font, items[i], render_width / 2,
@@ -14534,7 +14932,8 @@ static void render_pause_menu_frame(RenderFramebuffer *framebuffer, const HudFon
 
 static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer, RenderFramebuffer *framebuffer,
                                       int render_width, int render_height, bool *io_mouse_captured,
-                                      double *io_mouse_dx_accum, bool *io_suppress_mouse_fire_until_button_up) {
+                                      double *io_mouse_dx_accum, bool *io_suppress_mouse_fire_until_button_up,
+                                      bool two_player_mode) {
 #ifdef GLOOM_DOS_SDL3
   static uint8_t *pause_background_indices = NULL;
   static size_t pause_background_index_capacity = 0u;
@@ -14613,6 +15012,7 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
   while (true) {
     SDL_Event event;
     uint32_t now = SDL_GetTicks();
+    const int item_count = pause_menu_item_count(two_player_mode);
 
 #ifdef __EMSCRIPTEN__
     if (runtime_emscripten_consume_pointer_lock_lost()) {
@@ -14634,14 +15034,22 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
       if (event.type == SDL_KEYDOWN && event.key.repeat == 0) {
         SDL_Keycode sym = event.key.keysym.sym;
 
-        if (sym == SDLK_UP || sym == SDLK_w || sym == SDLK_DOWN || sym == SDLK_s) {
-          selected_index = selected_index == 0 ? 1 : 0;
+        if (sym == SDLK_UP || sym == SDLK_w) {
+          selected_index -= 1;
+          if (selected_index < 0) selected_index = item_count - 1;
+          selected_visible = false;
+          flash_ticks = GLOOM_MENU_FLASH_TICKS;
+          redraw = true;
+          audio_play_ui_move();
+        } else if (sym == SDLK_DOWN || sym == SDLK_s) {
+          selected_index += 1;
+          if (selected_index >= item_count) selected_index = 0;
           selected_visible = false;
           flash_ticks = GLOOM_MENU_FLASH_TICKS;
           redraw = true;
           audio_play_ui_move();
         } else if (sym == SDLK_RETURN || sym == SDLK_SPACE || sym == SDLK_LCTRL || sym == SDLK_RCTRL) {
-          PauseMenuResult result = selected_index == 0 ? PAUSE_MENU_CONTINUE : PAUSE_MENU_MAIN_MENU;
+          PauseMenuResult result = pause_menu_result_for_index(selected_index, two_player_mode);
           audio_play_ui_activate();
           menu_pause_after_selection();
           audio_pause_output(&g_audio, false, false);
@@ -14667,10 +15075,10 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
       if (runtime_menu_accepts_mouse() && event.type == SDL_MOUSEBUTTONDOWN && event.button.clicks >= 2) {
         if (event.button.button == SDL_BUTTON_LEFT) {
           int click_index =
-              menu_row_at_event_point(renderer, render_width, render_height, 2, event.button.x, event.button.y);
+              menu_row_at_event_point(renderer, render_width, render_height, item_count, event.button.x, event.button.y);
 
           if (click_index >= 0) {
-            PauseMenuResult result = click_index == 0 ? PAUSE_MENU_CONTINUE : PAUSE_MENU_MAIN_MENU;
+            PauseMenuResult result = pause_menu_result_for_index(click_index, two_player_mode);
 
             selected_index = click_index;
             audio_play_ui_activate();
@@ -14689,10 +15097,10 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
       } else if (runtime_menu_accepts_mouse() && event.type == SDL_MOUSEBUTTONDOWN &&
                  event.button.button == SDL_BUTTON_LEFT) {
         int click_index =
-            menu_row_at_event_point(renderer, render_width, render_height, 2, event.button.x, event.button.y);
+            menu_row_at_event_point(renderer, render_width, render_height, item_count, event.button.x, event.button.y);
 
         if (click_index >= 0) {
-          PauseMenuResult result = click_index == 0 ? PAUSE_MENU_CONTINUE : PAUSE_MENU_MAIN_MENU;
+          PauseMenuResult result = pause_menu_result_for_index(click_index, two_player_mode);
 
           selected_index = click_index;
           audio_play_ui_activate();
@@ -14704,7 +15112,7 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
       }
       if (runtime_menu_accepts_mouse() && event.type == SDL_MOUSEMOTION) {
         int hover_index =
-            menu_row_at_event_point(renderer, render_width, render_height, 2, event.motion.x, event.motion.y);
+            menu_row_at_event_point(renderer, render_width, render_height, item_count, event.motion.x, event.motion.y);
 
         if (hover_index >= 0 && hover_index != selected_index) {
           selected_index = hover_index;
@@ -14720,13 +15128,19 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
       if (event.type == SDL_CONTROLLERBUTTONDOWN) {
         if (event.cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_UP ||
             event.cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_DOWN) {
-          selected_index = selected_index == 0 ? 1 : 0;
+          if (event.cbutton.button == SDL_CONTROLLER_BUTTON_DPAD_UP) {
+            selected_index -= 1;
+            if (selected_index < 0) selected_index = item_count - 1;
+          } else {
+            selected_index += 1;
+            if (selected_index >= item_count) selected_index = 0;
+          }
           selected_visible = false;
           flash_ticks = GLOOM_MENU_FLASH_TICKS;
           redraw = true;
           audio_play_ui_move();
         } else if (gamepad_menu_activate_event(&event)) {
-          PauseMenuResult result = selected_index == 0 ? PAUSE_MENU_CONTINUE : PAUSE_MENU_MAIN_MENU;
+          PauseMenuResult result = pause_menu_result_for_index(selected_index, two_player_mode);
           audio_play_ui_activate();
           menu_pause_after_selection();
           audio_pause_output(&g_audio, false, false);
@@ -14754,10 +15168,11 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
     if (redraw && begin_render_framebuffer(framebuffer)) {
 #ifdef GLOOM_DOS_SDL3
       render_pause_menu_frame(framebuffer, &font, NULL, pause_background_valid ? pause_background_indices : NULL,
-                              render_width, render_width, render_height, selected_index, selected_visible);
+                              render_width, render_width, render_height, selected_index, selected_visible,
+                              two_player_mode);
 #else
       render_pause_menu_frame(framebuffer, &font, pause_background_valid ? pause_background : NULL, NULL, render_width,
-                              render_width, render_height, selected_index, selected_visible);
+                              render_width, render_height, selected_index, selected_visible, two_player_mode);
 #endif
       end_render_framebuffer(framebuffer);
       SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
@@ -14917,7 +15332,7 @@ static void render(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const
                    const GridOffsetSet *grid_offsets,
                    const WallTextureSet *wall_textures, const FlatTextureSet *flat_textures,
                    const ObjectVisualSet *object_visuals, const WeaponVisualSet *weapon_visuals,
-                   const HudFont *hud_font, int render_width, int render_height) {
+                   const HudFont *hud_font, int render_width, int render_height, const char *notice_text) {
   int pixsize = state != NULL ? state->player_pixsize : 0;
   double profile_render_start_ms = profile_now_ms();
   double profile_start_ms = 0.0;
@@ -14964,6 +15379,16 @@ static void render(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const
     apply_player_red_palette(framebuffer, state);
     profile_add_elapsed(&g_profiler.render_red_ms, profile_start_ms);
   }
+#if GLOOM_RUNTIME_IS_BINARY
+  if (notice_text != NULL && notice_text[0] != '\0') {
+    int scale = menu_pixel_scale_for_viewport(render_width, render_height);
+    int y = (GLOOM_MENU_BIG_FONT_HEIGHT * scale) / 2;
+
+    render_menu_text_brightness(framebuffer, hud_font, notice_text, render_width / 2, y, scale, 255u);
+  }
+#else
+  (void)notice_text;
+#endif
   snapshot_render_framebuffer(framebuffer);
   end_render_framebuffer(framebuffer);
 
@@ -17438,6 +17863,136 @@ static bool load_runtime_level(const char *map_path, AppState *state, WallTextur
   return true;
 }
 
+#if GLOOM_RUNTIME_IS_BINARY
+static bool load_autosaved_runtime_game(bool two_player_save, AppState *state, WallTextureSet *wall_textures,
+                                        FlatTextureSet *flat_textures,
+                                        ObjectVisualSet *object_visuals, GloomZone *previous_zones,
+                                        GloomZone *render_zones, bool *io_two_player_mode, bool *io_combat_mode,
+                                        uint8_t *io_violence_mode, char *resolved_map_buffer,
+                                        size_t resolved_map_buffer_size, const char **io_resolved_map_path) {
+  GloomAutosaveData save;
+
+  if (state == NULL || wall_textures == NULL || flat_textures == NULL || object_visuals == NULL ||
+      previous_zones == NULL || render_zones == NULL || io_two_player_mode == NULL || io_combat_mode == NULL ||
+      io_violence_mode == NULL || resolved_map_buffer == NULL || resolved_map_buffer_size == 0u ||
+      io_resolved_map_path == NULL) {
+    return false;
+  }
+  if (!read_gloom_autosave(two_player_save, &save)) {
+    return false;
+  }
+
+  *io_two_player_mode = save.two_player_mode;
+  *io_combat_mode = save.combat_mode;
+  *io_violence_mode = save.violence_mode;
+  state->combat_mode = save.combat_mode;
+
+  if (!load_runtime_level(save.map_path, state, wall_textures, flat_textures, object_visuals, previous_zones,
+                          render_zones, true, save.player_hitpoints, save.player_lives, save.player_weapon,
+                          save.player_reload, save.player2_hitpoints, save.player2_lives, save.player2_weapon,
+                          save.player2_reload, save.barrel_projectile_origin, save.two_player_mode,
+                          save.violence_mode, resolved_map_buffer, resolved_map_buffer_size)) {
+    fprintf(stderr, "Cannot load autosave %s: failed to load saved map %s\n",
+            gloom_autosave_path_for_mode(two_player_save), save.map_path);
+    return false;
+  }
+
+  *io_resolved_map_path = resolved_map_buffer;
+  return true;
+}
+
+static bool autosave_selftest_expect(bool condition, const char *message) {
+  if (!condition) {
+    fprintf(stderr, "Autosave selftest failed: %s\n", message);
+    return false;
+  }
+  return true;
+}
+
+static void fill_autosave_selftest_state(AppState *state, bool two_player_mode) {
+  if (state == NULL) {
+    return;
+  }
+
+  memset(state, 0, sizeof(*state));
+  state->two_player_mode = two_player_mode;
+  state->combat_mode = false;
+  state->violence_mode = two_player_mode ? GLOOM_VIOLENCE_MESSY : GLOOM_VIOLENCE_MEATY_MESSY;
+  state->barrel_projectile_origin = two_player_mode;
+  state->player_hitpoints = two_player_mode ? 17 : 23;
+  state->player_lives = two_player_mode ? 4 : 2;
+  state->player_weapon = two_player_mode ? 3u : 1u;
+  state->player_reload = two_player_mode ? 9u : 5u;
+  state->player2.player_hitpoints = two_player_mode ? 11 : 0;
+  state->player2.player_lives = two_player_mode ? 3 : 0;
+  state->player2.player_weapon = two_player_mode ? 2u : 0u;
+  state->player2.player_reload = two_player_mode ? 7u : 0u;
+}
+
+static bool autosave_selftest_matches_state(const GloomAutosaveData *save, const AppState *state,
+                                            const char *map_path, uint32_t script_ordinal) {
+  return save != NULL && state != NULL && strcmp(save->map_path, map_path) == 0 &&
+         save->two_player_mode == state->two_player_mode && save->combat_mode == state->combat_mode &&
+         save->violence_mode == state->violence_mode &&
+         save->barrel_projectile_origin == state->barrel_projectile_origin &&
+         save->player_hitpoints == state->player_hitpoints && save->player_lives == state->player_lives &&
+         save->player_weapon == state->player_weapon && save->player_reload == state->player_reload &&
+         save->player2_hitpoints == state->player2.player_hitpoints &&
+         save->player2_lives == state->player2.player_lives &&
+         save->player2_weapon == state->player2.player_weapon &&
+         save->player2_reload == state->player2.player_reload && save->script_ordinal == script_ordinal;
+}
+
+static int run_autosave_selftest(void) {
+  const char *one_player_map = "amiga/data/maps/map1_5";
+  const char *two_player_map = "amiga/data/maps/map3_3";
+  static AppState one_player_state;
+  static AppState two_player_state;
+  GloomAutosaveData one_player_save;
+  GloomAutosaveData two_player_save;
+
+  if (gloom_autosave_available(false) || gloom_autosave_available(true)) {
+    fprintf(stderr, "Autosave selftest refused to overwrite existing %s or %s\n",
+            GLOOM_AUTOSAVE_ONE_PLAYER_FILE, GLOOM_AUTOSAVE_TWO_PLAYER_FILE);
+    return 1;
+  }
+
+  fill_autosave_selftest_state(&one_player_state, false);
+  fill_autosave_selftest_state(&two_player_state, true);
+
+  if (!write_gloom_autosave(&one_player_state, one_player_map, 5u)) return 1;
+  if (!autosave_selftest_expect(gloom_autosave_available(false), "one-player autosave file was not created")) return 1;
+  if (!autosave_selftest_expect(!gloom_autosave_available(true), "one-player autosave created two-player file")) return 1;
+  if (!read_gloom_autosave(false, &one_player_save)) return 1;
+  if (!autosave_selftest_expect(autosave_selftest_matches_state(&one_player_save, &one_player_state,
+                                                                one_player_map, 5u),
+                                "one-player autosave did not round-trip")) {
+    return 1;
+  }
+
+  if (!write_gloom_autosave(&two_player_state, two_player_map, 10u)) return 1;
+  if (!autosave_selftest_expect(gloom_autosave_available(false), "two-player write removed one-player file")) return 1;
+  if (!autosave_selftest_expect(gloom_autosave_available(true), "two-player autosave file was not created")) return 1;
+  if (!read_gloom_autosave(false, &one_player_save)) return 1;
+  if (!read_gloom_autosave(true, &two_player_save)) return 1;
+  if (!autosave_selftest_expect(autosave_selftest_matches_state(&one_player_save, &one_player_state,
+                                                                one_player_map, 5u),
+                                "two-player write changed one-player autosave")) {
+    return 1;
+  }
+  if (!autosave_selftest_expect(autosave_selftest_matches_state(&two_player_save, &two_player_state,
+                                                                two_player_map, 10u),
+                                "two-player autosave did not round-trip")) {
+    return 1;
+  }
+
+  (void)remove(GLOOM_AUTOSAVE_ONE_PLAYER_FILE);
+  (void)remove(GLOOM_AUTOSAVE_TWO_PLAYER_FILE);
+  printf("Autosave selftest passed: separate one-player and two-player saves round-trip independently\n");
+  return 0;
+}
+#endif
+
 static int run_level_transition_selftest(void) {
   static const char *expected_play_chain[] = {"amiga/maps/map1_1",      "amiga/data/maps/map1_2",
                                              "amiga/data/maps/map1_3", "amiga/data/maps/map1_4",
@@ -17641,6 +18196,19 @@ static bool run_menu_and_restart_game(SDL_Renderer *renderer, RenderFramebuffer 
   *io_combat_mode = menu_game_mode == GLOOM_GAME_MODE_COMBAT;
   *io_violence_mode = menu_violence_mode;
   state->combat_mode = *io_combat_mode;
+#if GLOOM_RUNTIME_IS_BINARY
+  if (menu_game_mode == GLOOM_GAME_MODE_LOAD_ONE_PLAYER || menu_game_mode == GLOOM_GAME_MODE_LOAD_TWO_PLAYER) {
+    bool load_two_player = menu_game_mode == GLOOM_GAME_MODE_LOAD_TWO_PLAYER;
+
+    if (!load_autosaved_runtime_game(load_two_player, state, wall_textures, flat_textures, object_visuals,
+                                     previous_zones, render_zones, io_two_player_mode, io_combat_mode,
+                                     io_violence_mode, resolved_map_buffer, resolved_map_buffer_size,
+                                     io_resolved_map_path)) {
+      return false;
+    }
+    return true;
+  }
+#endif
   if (*io_combat_mode) {
     uint8_t series = 1u;
     int16_t lives = 3;
@@ -17987,6 +18555,10 @@ int main(int argc, char **argv) {
 #ifdef GLOOM_DOS_SDL3
   uint32_t dos_event_poll_frame = 0u;
 #endif
+#if GLOOM_RUNTIME_IS_BINARY
+  char autosave_notice[32] = {0};
+  double autosave_notice_timer = 0.0;
+#endif
   bool level_transition_pending = false;
   bool combat_round_pending = false;
   AppState state;
@@ -18066,6 +18638,12 @@ int main(int argc, char **argv) {
   if (argc > 1 && strcmp(argv[1], "--input-selftest") == 0) {
     return run_input_selftest();
   }
+
+#if GLOOM_RUNTIME_IS_BINARY
+  if (argc > 1 && strcmp(argv[1], "--autosave-selftest") == 0) {
+    return run_autosave_selftest();
+  }
+#endif
 
   if (argc > 1 && strcmp(argv[1], "--wall-selftest") == 0) {
     return run_wall_selftest();
@@ -18557,6 +19135,34 @@ int main(int argc, char **argv) {
     state.two_player_mode = two_player_mode;
     state.combat_mode = combat_mode;
     state.violence_mode = violence_mode;
+#if GLOOM_RUNTIME_IS_BINARY
+    if (menu_game_mode == GLOOM_GAME_MODE_LOAD_ONE_PLAYER || menu_game_mode == GLOOM_GAME_MODE_LOAD_TWO_PLAYER) {
+      bool load_two_player = menu_game_mode == GLOOM_GAME_MODE_LOAD_TWO_PLAYER;
+
+      if (!load_autosaved_runtime_game(load_two_player, &state, &wall_textures, &flat_textures, &object_visuals,
+                                       previous_zones, render_zones, &two_player_mode, &combat_mode,
+                                       &violence_mode, map_path_buffer, sizeof(map_path_buffer),
+                                       &resolved_map_path)) {
+        fprintf(stderr, "Failed to load autosave from menu\n");
+        free_render_framebuffer(&framebuffer);
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        audio_shutdown(&g_audio);
+        gamepad_shutdown();
+        SDL_Quit();
+        free(previous_zones);
+        free(render_zones);
+        free_hud_font(&hud_font);
+        free_weapon_visual_set(&weapon_visuals);
+        free_grid_offset_set(&grid_offsets);
+        free_object_visual_set(&object_visuals);
+        free_flat_texture_set(&flat_textures);
+        free_wall_texture_set(&wall_textures);
+        gloom_map_free(&state.map);
+        return 1;
+      }
+    } else
+#endif
     if (combat_mode) {
       uint8_t series = 1u;
       int16_t lives = 3;
@@ -18603,28 +19209,32 @@ int main(int argc, char **argv) {
         return 1;
       }
     }
-    if (!load_runtime_level(selected_map_path, &state, &wall_textures, &flat_textures, &object_visuals, previous_zones,
-                            render_zones, false, 0, 0, 0u, 0u, 0, 0, 0u, 0u, barrel_projectile_origin,
-                            two_player_mode, violence_mode, map_path_buffer, sizeof(map_path_buffer))) {
-      fprintf(stderr, "Failed to load original selected menu map\n");
-      free_render_framebuffer(&framebuffer);
-      SDL_DestroyRenderer(renderer);
-      SDL_DestroyWindow(window);
-      audio_shutdown(&g_audio);
-      gamepad_shutdown();
-      SDL_Quit();
-      free(previous_zones);
-      free(render_zones);
-      free_hud_font(&hud_font);
-      free_weapon_visual_set(&weapon_visuals);
-      free_grid_offset_set(&grid_offsets);
-      free_object_visual_set(&object_visuals);
-      free_flat_texture_set(&flat_textures);
-      free_wall_texture_set(&wall_textures);
-      gloom_map_free(&state.map);
-      return 1;
+    {
+      if (menu_game_mode != GLOOM_GAME_MODE_LOAD_ONE_PLAYER && menu_game_mode != GLOOM_GAME_MODE_LOAD_TWO_PLAYER &&
+          !load_runtime_level(selected_map_path, &state, &wall_textures, &flat_textures, &object_visuals,
+                              previous_zones, render_zones, false, 0, 0, 0u, 0u, 0, 0, 0u, 0u,
+                              barrel_projectile_origin, two_player_mode, violence_mode, map_path_buffer,
+                              sizeof(map_path_buffer))) {
+        fprintf(stderr, "Failed to load original selected menu map\n");
+        free_render_framebuffer(&framebuffer);
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+        audio_shutdown(&g_audio);
+        gamepad_shutdown();
+        SDL_Quit();
+        free(previous_zones);
+        free(render_zones);
+        free_hud_font(&hud_font);
+        free_weapon_visual_set(&weapon_visuals);
+        free_grid_offset_set(&grid_offsets);
+        free_object_visual_set(&object_visuals);
+        free_flat_texture_set(&flat_textures);
+        free_wall_texture_set(&wall_textures);
+        gloom_map_free(&state.map);
+        return 1;
+      }
+      resolved_map_path = map_path_buffer;
     }
-    resolved_map_path = map_path_buffer;
   }
   mouse_captured = set_gameplay_start_mouse_capture(window);
 
@@ -18658,6 +19268,14 @@ int main(int argc, char **argv) {
     if (elapsed > 0.25) {
       elapsed = 0.25;
     }
+#if GLOOM_RUNTIME_IS_BINARY
+    if (autosave_notice_timer > 0.0) {
+      autosave_notice_timer -= elapsed;
+      if (autosave_notice_timer < 0.0) {
+        autosave_notice_timer = 0.0;
+      }
+    }
+#endif
 
     accumulator += elapsed;
     title_timer += elapsed;
@@ -18747,11 +19365,17 @@ int main(int argc, char **argv) {
       render_state =
           interpolate_render_state(&previous_state, &state, render_alpha, render_zones, state.map.zone_count);
       render(renderer, &framebuffer, &render_state, &grid_offsets, &wall_textures, &flat_textures, &object_visuals,
-             &weapon_visuals, &hud_font, render_width, render_height);
+             &weapon_visuals, &hud_font, render_width, render_height,
+#if GLOOM_RUNTIME_IS_BINARY
+             autosave_notice_timer > 0.0 ? autosave_notice : NULL
+#else
+             NULL
+#endif
+      );
 
       PauseMenuResult pause_result =
           run_pause_menu(window, renderer, &framebuffer, render_width, render_height, &mouse_captured, &mouse_dx_accum,
-                         &suppress_mouse_fire_until_button_up);
+                         &suppress_mouse_fire_until_button_up, state.two_player_mode);
 
       perf_prev = SDL_GetPerformanceCounter();
       accumulator = 0.0;
@@ -18789,6 +19413,34 @@ int main(int argc, char **argv) {
         title_timer = 1.0;
         continue;
       }
+#if GLOOM_RUNTIME_IS_BINARY
+      if (pause_result == PAUSE_MENU_LOAD_GAME) {
+        if (mouse_captured && set_runtime_mouse_capture(window, false)) {
+          mouse_captured = false;
+          mouse_dx_accum = 0.0;
+          suppress_mouse_fire_until_button_up = false;
+          SDL_FlushEvent(SDL_MOUSEMOTION);
+        }
+        if (!load_autosaved_runtime_game(state.two_player_mode, &state, &wall_textures, &flat_textures,
+                                         &object_visuals, previous_zones, render_zones, &two_player_mode,
+                                         &combat_mode, &violence_mode, map_path_buffer, sizeof(map_path_buffer),
+                                         &resolved_map_path)) {
+          running = false;
+          continue;
+        }
+#ifdef GLOOM_DOS_SDL3
+        refresh_dos_index_palette(&framebuffer, window);
+#endif
+        mouse_captured = set_gameplay_start_mouse_capture(window);
+        previous_state = state;
+        if (previous_zones != NULL) {
+          previous_state.map.zones = previous_zones;
+        }
+        accumulator = 0.0;
+        title_timer = 1.0;
+        continue;
+      }
+#endif
     }
 
     {
@@ -18859,7 +19511,13 @@ int main(int argc, char **argv) {
     render_state = interpolate_render_state(&previous_state, &state, render_alpha, render_zones, state.map.zone_count);
     profile_add_elapsed(&g_profiler.interpolate_ms, profile_start_ms);
     render(renderer, &framebuffer, &render_state, &grid_offsets, &wall_textures, &flat_textures, &object_visuals,
-           &weapon_visuals, &hud_font, render_width, render_height);
+           &weapon_visuals, &hud_font, render_width, render_height,
+#if GLOOM_RUNTIME_IS_BINARY
+           autosave_notice_timer > 0.0 ? autosave_notice : NULL
+#else
+           NULL
+#endif
+    );
 
     if (combat_round_pending) {
       char next_combat_map[1024] = {0};
@@ -18994,6 +19652,17 @@ int main(int argc, char **argv) {
       }
 
       resolved_map_path = map_path_buffer;
+#if GLOOM_RUNTIME_IS_BINARY
+      {
+        uint32_t script_ordinal = 0u;
+
+        if (script_play_ordinal_for_map(resolved_map_path, &script_ordinal) && script_ordinal > 0u &&
+            (script_ordinal % 5u) == 0u && write_gloom_autosave(&state, resolved_map_path, script_ordinal)) {
+          (void)snprintf(autosave_notice, sizeof(autosave_notice), "GAME SAVED");
+          autosave_notice_timer = 2.0;
+        }
+      }
+#endif
 #ifdef GLOOM_DOS_SDL3
       refresh_dos_index_palette(&framebuffer, window);
 #endif

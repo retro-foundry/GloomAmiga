@@ -29,6 +29,22 @@
        WINDOWS  : gloom_pc.exe
        VERSION  : gloom_pc.exe --version
 
+     SAVE / LOAD
+
+       Binary builds use separate one-player and two-player autosaves:
+
+         GLOOM1P.SAV
+         GLOOM2P.SAV
+
+       The game autosaves every five campaign levels. When a save is
+       written, GAME SAVED appears on screen.
+
+       The main menu shows LOAD ONE PLAYER AUTOSAVE and LOAD TWO PLAYER
+       AUTOSAVE under the matching new-game options. Each load option is
+       drawn dark until that autosave exists. The pause menu loads the
+       autosave matching the current one-player or two-player game. Combat
+       games are not autosaved.
+
      RESOLUTION OPTIONS
 
        DEFAULT DOS LOW MODE:
