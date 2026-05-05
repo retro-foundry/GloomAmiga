@@ -3,6 +3,9 @@
   <head>
     <meta charset="utf-8">
     <meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+    <meta http-equiv="Cache-Control" content="no-store">
+    <meta http-equiv="Pragma" content="no-cache">
+    <meta http-equiv="Expires" content="0">
     <title>Gloom With Friends</title>
     <script>
       (function () {
@@ -361,6 +364,13 @@
                 if (typeof window.gloomSyncWebRTCStateToWasm === 'function') {
                     window.gloomSyncWebRTCStateToWasm();
                 }
+            },
+            locateFile(path, prefix) {
+                var url = prefix + path;
+                if (path === 'gloom_pc.wasm' || path === 'gloom_pc.data') {
+                    url += '?v=1.0.0-web-autosave';
+                }
+                return url;
             }
         };
         if (window.WEBRTC_JOIN_MODE) Module.noInitialRun = true;

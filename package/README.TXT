@@ -31,10 +31,13 @@
 
      SAVE / LOAD
 
-       Binary builds use separate one-player and two-player autosaves:
+       Binary and web builds use separate one-player and two-player
+       autosaves. Binary builds write these files beside the executable:
 
          GLOOM1P.SAV
          GLOOM2P.SAV
+
+       Web builds store the same autosave records in browser localStorage.
 
        The game autosaves at every campaign level for save-game testing.
        When a save is written, GAME SAVED appears on screen.

@@ -21,6 +21,12 @@
 #define GLOOM_RUNTIME_IS_BINARY 0
 #endif
 
+#if GLOOM_RUNTIME_IS_BINARY || defined(__EMSCRIPTEN__)
+#define GLOOM_RUNTIME_HAS_AUTOSAVE 1
+#else
+#define GLOOM_RUNTIME_HAS_AUTOSAVE 0
+#endif
+
 #ifdef GLOOM_DOS_SDL3
 static void dos_logf(const char *fmt, ...) {
   FILE *file = fopen("GLOOM.LOG", "a");
@@ -1003,6 +1009,7 @@ static bool set_runtime_mouse_capture(SDL_Window *window, bool captured);
 static void runtime_force_cursor_visible(void);
 void runtime_emscripten_install_pointer_lock_listener(void);
 static bool runtime_emscripten_consume_pointer_lock_lost(void);
+static void runtime_emscripten_discard_pointer_lock_lost(void);
 void runtime_emscripten_canvas_cursor_default(void);
 void runtime_emscripten_install_fullscreen_listeners(void);
 void runtime_emscripten_canvas_fullscreen_toggle(void);
@@ -4782,7 +4789,7 @@ static bool resolve_script_level_intro_for_map(const char *map_path, ScriptLevel
   return false;
 }
 
-#if GLOOM_RUNTIME_IS_BINARY
+#if GLOOM_RUNTIME_HAS_AUTOSAVE
 #define GLOOM_AUTOSAVE_ONE_PLAYER_FILE "GLOOM1P.SAV"
 #define GLOOM_AUTOSAVE_TWO_PLAYER_FILE "GLOOM2P.SAV"
 
@@ -4807,7 +4814,61 @@ static const char *gloom_autosave_path_for_mode(bool two_player_mode) {
   return two_player_mode ? GLOOM_AUTOSAVE_TWO_PLAYER_FILE : GLOOM_AUTOSAVE_ONE_PLAYER_FILE;
 }
 
+#ifdef __EMSCRIPTEN__
+EM_JS(int, gloom_web_autosave_available_js, (const char *key), {
+  try {
+    return localStorage.getItem(UTF8ToString(key)) !== null ? 1 : 0;
+  } catch (error) {
+    console.error("Cannot check autosave localStorage", error);
+    return 0;
+  }
+})
+
+EM_JS(int, gloom_web_autosave_write_js, (const char *key, const char *value), {
+  try {
+    localStorage.setItem(UTF8ToString(key), UTF8ToString(value));
+    return 1;
+  } catch (error) {
+    console.error("Cannot write autosave localStorage", error);
+    return 0;
+  }
+})
+
+EM_JS(char *, gloom_web_autosave_read_js, (const char *key), {
+  try {
+    var value = localStorage.getItem(UTF8ToString(key));
+    var byteCount = 0;
+    var ptr = 0;
+
+    if (value === null) {
+      return 0;
+    }
+    byteCount = lengthBytesUTF8(value) + 1;
+    ptr = _malloc(byteCount);
+    if (ptr === 0) {
+      return 0;
+    }
+    stringToUTF8(value, ptr, byteCount);
+    return ptr;
+  } catch (error) {
+    console.error("Cannot read autosave localStorage", error);
+    return 0;
+  }
+})
+
+EM_JS(void, gloom_web_autosave_delete_js, (const char *key), {
+  try {
+    localStorage.removeItem(UTF8ToString(key));
+  } catch (error) {
+    console.error("Cannot delete autosave localStorage", error);
+  }
+})
+#endif
+
 static bool gloom_autosave_available(bool two_player_mode) {
+#ifdef __EMSCRIPTEN__
+  return gloom_web_autosave_available_js(gloom_autosave_path_for_mode(two_player_mode)) != 0;
+#else
   FILE *file = fopen(gloom_autosave_path_for_mode(two_player_mode), "r");
 
   if (file == NULL) {
@@ -4815,6 +4876,15 @@ static bool gloom_autosave_available(bool two_player_mode) {
   }
   fclose(file);
   return true;
+#endif
+}
+
+static void gloom_autosave_delete(bool two_player_mode) {
+#ifdef __EMSCRIPTEN__
+  gloom_web_autosave_delete_js(gloom_autosave_path_for_mode(two_player_mode));
+#else
+  (void)remove(gloom_autosave_path_for_mode(two_player_mode));
+#endif
 }
 
 static void trim_autosave_line(char *line) {
@@ -4830,9 +4900,134 @@ static void trim_autosave_line(char *line) {
   }
 }
 
+static bool append_autosave_line(char *buffer, size_t buffer_size, size_t *io_offset, const char *fmt, ...) {
+  va_list args;
+  int written = 0;
+
+  if (buffer == NULL || io_offset == NULL || fmt == NULL || *io_offset >= buffer_size) {
+    return false;
+  }
+
+  va_start(args, fmt);
+  written = vsnprintf(buffer + *io_offset, buffer_size - *io_offset, fmt, args);
+  va_end(args);
+  if (written < 0 || (size_t)written >= buffer_size - *io_offset) {
+    return false;
+  }
+  *io_offset += (size_t)written;
+  return true;
+}
+
+static bool write_autosave_text_record(const char *save_path, const char *record) {
+#ifdef __EMSCRIPTEN__
+  if (gloom_web_autosave_write_js(save_path, record) == 0) {
+    fprintf(stderr, "Cannot autosave %s: browser localStorage write failed\n", save_path);
+    return false;
+  }
+  return true;
+#else
+  FILE *file = fopen(save_path, "w");
+
+  if (file == NULL) {
+    fprintf(stderr, "Cannot autosave %s: %s\n", save_path, strerror(errno));
+    return false;
+  }
+  if (fputs(record, file) == EOF) {
+    fprintf(stderr, "Cannot write autosave %s: %s\n", save_path, strerror(errno));
+    fclose(file);
+    return false;
+  }
+  if (fclose(file) != 0) {
+    fprintf(stderr, "Cannot finish autosave %s: %s\n", save_path, strerror(errno));
+    return false;
+  }
+  return true;
+#endif
+}
+
+static char *read_autosave_text_record(const char *save_path) {
+#ifdef __EMSCRIPTEN__
+  char *record = gloom_web_autosave_read_js(save_path);
+
+  if (record == NULL) {
+    fprintf(stderr, "Cannot load autosave %s: browser localStorage entry is missing\n", save_path);
+  }
+  return record;
+#else
+  FILE *file = fopen(save_path, "rb");
+  long size = 0;
+  char *record = NULL;
+
+  if (file == NULL) {
+    fprintf(stderr, "Cannot load autosave %s: %s\n", save_path, strerror(errno));
+    return NULL;
+  }
+  if (fseek(file, 0, SEEK_END) != 0) {
+    fprintf(stderr, "Cannot load autosave %s: failed to measure file size\n", save_path);
+    fclose(file);
+    return NULL;
+  }
+  size = ftell(file);
+  if (size < 0) {
+    fprintf(stderr, "Cannot load autosave %s: failed to read file size\n", save_path);
+    fclose(file);
+    return NULL;
+  }
+  if (fseek(file, 0, SEEK_SET) != 0) {
+    fprintf(stderr, "Cannot load autosave %s: failed to rewind file\n", save_path);
+    fclose(file);
+    return NULL;
+  }
+  record = (char *)malloc((size_t)size + 1u);
+  if (record == NULL) {
+    fprintf(stderr, "Cannot load autosave %s: out of memory\n", save_path);
+    fclose(file);
+    return NULL;
+  }
+  if (size > 0 && fread(record, 1u, (size_t)size, file) != (size_t)size) {
+    fprintf(stderr, "Cannot load autosave %s: failed to read file\n", save_path);
+    free(record);
+    fclose(file);
+    return NULL;
+  }
+  record[(size_t)size] = '\0';
+  fclose(file);
+  return record;
+#endif
+}
+
+static bool autosave_next_line(const char **io_cursor, char *line, size_t line_size) {
+  const char *cursor = NULL;
+  size_t len = 0u;
+
+  if (io_cursor == NULL || *io_cursor == NULL || line == NULL || line_size == 0u || **io_cursor == '\0') {
+    return false;
+  }
+
+  cursor = *io_cursor;
+  while (cursor[len] != '\0' && cursor[len] != '\n') {
+    len += 1u;
+  }
+  if (len >= line_size) {
+    len = line_size - 1u;
+  }
+  memcpy(line, cursor, len);
+  line[len] = '\0';
+  while (*cursor != '\0' && *cursor != '\n') {
+    cursor += 1;
+  }
+  if (*cursor == '\n') {
+    cursor += 1;
+  }
+  *io_cursor = cursor;
+  trim_autosave_line(line);
+  return true;
+}
+
 static bool write_gloom_autosave_record(const GloomAutosaveData *save) {
   const char *save_path = NULL;
-  FILE *file = NULL;
+  char record[2048];
+  size_t offset = 0u;
 
   if (save == NULL || save->map_path[0] == '\0') {
     fprintf(stderr, "Cannot autosave: missing save data or map path\n");
@@ -4843,29 +5038,26 @@ static bool write_gloom_autosave_record(const GloomAutosaveData *save) {
   }
   save_path = gloom_autosave_path_for_mode(save->two_player_mode);
 
-  file = fopen(save_path, "w");
-  if (file == NULL) {
-    fprintf(stderr, "Cannot autosave %s: %s\n", save_path, strerror(errno));
+  if (!append_autosave_line(record, sizeof(record), &offset, "GLOOM_AUTOSAVE 1\n") ||
+      !append_autosave_line(record, sizeof(record), &offset, "map=%s\n", save->map_path) ||
+      !append_autosave_line(record, sizeof(record), &offset, "script_ordinal=%lu\n",
+                            (unsigned long)save->script_ordinal) ||
+      !append_autosave_line(record, sizeof(record), &offset, "two_player=%d\n", save->two_player_mode ? 1 : 0) ||
+      !append_autosave_line(record, sizeof(record), &offset, "combat=%d\n", save->combat_mode ? 1 : 0) ||
+      !append_autosave_line(record, sizeof(record), &offset, "violence=%u\n", (unsigned)save->violence_mode) ||
+      !append_autosave_line(record, sizeof(record), &offset, "barrel_origin=%d\n",
+                            save->barrel_projectile_origin ? 1 : 0) ||
+      !append_autosave_line(record, sizeof(record), &offset, "p1=%d,%d,%u,%u\n", (int)save->player_hitpoints,
+                            (int)save->player_lives, (unsigned)save->player_weapon,
+                            (unsigned)save->player_reload) ||
+      !append_autosave_line(record, sizeof(record), &offset, "p2=%d,%d,%u,%u\n", (int)save->player2_hitpoints,
+                            (int)save->player2_lives, (unsigned)save->player2_weapon,
+                            (unsigned)save->player2_reload)) {
+    fprintf(stderr, "Cannot autosave %s: save record is too large\n", save_path);
     return false;
   }
 
-  fprintf(file, "GLOOM_AUTOSAVE 1\n");
-  fprintf(file, "map=%s\n", save->map_path);
-  fprintf(file, "script_ordinal=%lu\n", (unsigned long)save->script_ordinal);
-  fprintf(file, "two_player=%d\n", save->two_player_mode ? 1 : 0);
-  fprintf(file, "combat=%d\n", save->combat_mode ? 1 : 0);
-  fprintf(file, "violence=%u\n", (unsigned)save->violence_mode);
-  fprintf(file, "barrel_origin=%d\n", save->barrel_projectile_origin ? 1 : 0);
-  fprintf(file, "p1=%d,%d,%u,%u\n", (int)save->player_hitpoints, (int)save->player_lives,
-          (unsigned)save->player_weapon, (unsigned)save->player_reload);
-  fprintf(file, "p2=%d,%d,%u,%u\n", (int)save->player2_hitpoints, (int)save->player2_lives,
-          (unsigned)save->player2_weapon, (unsigned)save->player2_reload);
-
-  if (fclose(file) != 0) {
-    fprintf(stderr, "Cannot finish autosave %s: %s\n", save_path, strerror(errno));
-    return false;
-  }
-  return true;
+  return write_autosave_text_record(save_path, record);
 }
 
 static bool write_gloom_autosave(const AppState *state, const char *resolved_map_path, uint32_t script_ordinal) {
@@ -4930,7 +5122,8 @@ static bool write_gloom_autosave_for_scriptplay(const char *next_map_path, uint3
 
 static bool read_gloom_autosave(bool two_player_mode, GloomAutosaveData *out_save) {
   const char *save_path = gloom_autosave_path_for_mode(two_player_mode);
-  FILE *file = NULL;
+  char *record = NULL;
+  const char *cursor = NULL;
   char line[1200];
   bool have_script_ordinal = false;
   bool have_two_player = false;
@@ -4946,25 +5139,24 @@ static bool read_gloom_autosave(bool two_player_mode, GloomAutosaveData *out_sav
   }
   memset(out_save, 0, sizeof(*out_save));
 
-  file = fopen(save_path, "r");
-  if (file == NULL) {
-    fprintf(stderr, "Cannot load autosave %s: %s\n", save_path, strerror(errno));
+  record = read_autosave_text_record(save_path);
+  if (record == NULL) {
     return false;
   }
+  cursor = record;
 
-  if (fgets(line, sizeof(line), file) == NULL) {
-    fprintf(stderr, "Cannot load autosave %s: file is empty\n", save_path);
-    fclose(file);
+  if (!autosave_next_line(&cursor, line, sizeof(line))) {
+    fprintf(stderr, "Cannot load autosave %s: record is empty\n", save_path);
+    free(record);
     return false;
   }
-  trim_autosave_line(line);
   if (strcmp(line, "GLOOM_AUTOSAVE 1") != 0) {
     fprintf(stderr, "Cannot load autosave %s: unsupported header '%s'\n", save_path, line);
-    fclose(file);
+    free(record);
     return false;
   }
 
-  while (fgets(line, sizeof(line), file) != NULL) {
+  while (autosave_next_line(&cursor, line, sizeof(line))) {
     int a = 0;
     int b = 0;
     unsigned c = 0u;
@@ -4972,7 +5164,6 @@ static bool read_gloom_autosave(bool two_player_mode, GloomAutosaveData *out_sav
     unsigned value = 0u;
     unsigned long long_value = 0ul;
 
-    trim_autosave_line(line);
     if (memcmp(line, "map=", 4u) == 0) {
       if (strlen(line + 4) >= sizeof(out_save->map_path)) {
         path_too_long = true;
@@ -5009,7 +5200,7 @@ static bool read_gloom_autosave(bool two_player_mode, GloomAutosaveData *out_sav
     }
   }
 
-  fclose(file);
+  free(record);
   if (path_too_long) {
     fprintf(stderr, "Cannot load autosave %s: map path is too long\n", save_path);
     return false;
@@ -5020,11 +5211,11 @@ static bool read_gloom_autosave(bool two_player_mode, GloomAutosaveData *out_sav
   }
   if (!have_script_ordinal || !have_two_player || !have_combat || !have_violence || !have_barrel || !have_p1 ||
       !have_p2) {
-    fprintf(stderr, "Cannot load autosave %s: save file is missing required state fields\n", save_path);
+    fprintf(stderr, "Cannot load autosave %s: save record is missing required state fields\n", save_path);
     return false;
   }
   if (out_save->combat_mode) {
-    fprintf(stderr, "Cannot load autosave %s: combat autosaves are not written by this binary\n", save_path);
+    fprintf(stderr, "Cannot load autosave %s: combat autosaves are not written by this runtime\n", save_path);
     return false;
   }
   if (out_save->two_player_mode != two_player_mode) {
@@ -14511,8 +14702,12 @@ static bool cache_start_menu_background_dos_indices(RenderFramebuffer *framebuff
 #endif
 
 static int start_menu_item_count(void) {
-#if GLOOM_RUNTIME_IS_BINARY
+#if GLOOM_RUNTIME_HAS_AUTOSAVE
+#ifdef __EMSCRIPTEN__
+  return 6;
+#else
   return 7;
+#endif
 #elif defined(__EMSCRIPTEN__)
   return 4;
 #else
@@ -14521,7 +14716,7 @@ static int start_menu_item_count(void) {
 }
 
 static bool start_menu_item_enabled(int item_index) {
-#if GLOOM_RUNTIME_IS_BINARY
+#if GLOOM_RUNTIME_HAS_AUTOSAVE
   if (item_index == 1) {
     return gloom_autosave_available(false);
   }
@@ -14606,7 +14801,7 @@ static int activate_start_menu_selection(int selected_index, GloomGameMode *out_
     *out_game_mode = GLOOM_GAME_MODE_ONE_PLAYER;
     return 1;
   }
-#if GLOOM_RUNTIME_IS_BINARY
+#if GLOOM_RUNTIME_HAS_AUTOSAVE
   if (selected_index == 1) {
     if (gloom_autosave_available(false)) {
       *out_game_mode = GLOOM_GAME_MODE_LOAD_ONE_PLAYER;
@@ -14665,7 +14860,7 @@ static void render_start_menu_frame(RenderFramebuffer *framebuffer, const MenuAs
   int item_count = start_menu_item_count();
   char player1_item[32];
   char player2_item[32];
-#if GLOOM_RUNTIME_IS_BINARY
+#if GLOOM_RUNTIME_HAS_AUTOSAVE
   bool one_player_autosave_available = gloom_autosave_available(false);
   bool two_player_autosave_available = gloom_autosave_available(true);
 #endif
@@ -14686,13 +14881,15 @@ static void render_start_menu_frame(RenderFramebuffer *framebuffer, const MenuAs
   (void)snprintf(player2_item, sizeof(player2_item), "PLAYER 2 %s",
                  control_source_menu_name(control_config != NULL ? control_config->player2 : GLOOM_CONTROL_GAMEPAD_1));
   items[0] = "ONE PLAYER GAME";
-#if GLOOM_RUNTIME_IS_BINARY
+#if GLOOM_RUNTIME_HAS_AUTOSAVE
   items[1] = "LOAD ONE PLAYER AUTOSAVE";
   items[2] = "TWO PLAYER GAME";
   items[3] = "LOAD TWO PLAYER AUTOSAVE";
   items[4] = player1_item;
   items[5] = player2_item;
+#ifndef __EMSCRIPTEN__
   items[6] = "EXIT GLOOM";
+#endif
 #else
   items[1] = "TWO PLAYER GAME";
   items[2] = player1_item;
@@ -14723,7 +14920,7 @@ static void render_start_menu_frame(RenderFramebuffer *framebuffer, const MenuAs
   for (i = 0; i < item_count; ++i) {
     uint8_t brightness = (i == selected_index && !selected_visible) ? 96u : 255u;
 
-#if GLOOM_RUNTIME_IS_BINARY
+#if GLOOM_RUNTIME_HAS_AUTOSAVE
     if ((i == 1 && !one_player_autosave_available) || (i == 3 && !two_player_autosave_available)) {
       brightness = 96u;
     }
@@ -14773,13 +14970,13 @@ static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer
     }
   }
   if (*out_game_mode == GLOOM_GAME_MODE_TWO_PLAYER) {
-#if GLOOM_RUNTIME_IS_BINARY
+#if GLOOM_RUNTIME_HAS_AUTOSAVE
     selected_index = 2;
 #else
     selected_index = 1;
 #endif
   } else if (*out_game_mode == GLOOM_GAME_MODE_COMBAT) {
-#if GLOOM_RUNTIME_IS_BINARY
+#if GLOOM_RUNTIME_HAS_AUTOSAVE
     selected_index = 2;
 #else
     selected_index = 1;
@@ -15193,7 +15390,7 @@ static bool run_combat_result_screen(SDL_Renderer *renderer, RenderFramebuffer *
 }
 
 static int pause_menu_item_count(bool two_player_mode) {
-#if GLOOM_RUNTIME_IS_BINARY
+#if GLOOM_RUNTIME_HAS_AUTOSAVE
   return gloom_autosave_available(two_player_mode) ? 3 : 2;
 #else
   (void)two_player_mode;
@@ -15202,7 +15399,7 @@ static int pause_menu_item_count(bool two_player_mode) {
 }
 
 static PauseMenuResult pause_menu_result_for_index(int selected_index, bool two_player_mode) {
-#if GLOOM_RUNTIME_IS_BINARY
+#if GLOOM_RUNTIME_HAS_AUTOSAVE
   if (gloom_autosave_available(two_player_mode)) {
     if (selected_index == 0) return PAUSE_MENU_CONTINUE;
     if (selected_index == 1) return PAUSE_MENU_LOAD_GAME;
@@ -15273,7 +15470,7 @@ static void render_pause_menu_frame(RenderFramebuffer *framebuffer, const HudFon
   }
 #endif
   items[0] = "CONTINUE";
-#if GLOOM_RUNTIME_IS_BINARY
+#if GLOOM_RUNTIME_HAS_AUTOSAVE
   if (gloom_autosave_available(two_player_mode)) {
     items[1] = "LOAD GAME";
     items[2] = "RETURN TO MAIN MENU";
@@ -15969,7 +16166,7 @@ static void render(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const
     apply_player_red_palette(framebuffer, state);
     profile_add_elapsed(&g_profiler.render_red_ms, profile_start_ms);
   }
-#if GLOOM_RUNTIME_IS_BINARY
+#if GLOOM_RUNTIME_HAS_AUTOSAVE
   if (notice_text != NULL && notice_text[0] != '\0') {
     int scale = menu_pixel_scale_for_viewport(render_width, render_height);
     int y = (render_height / 2) - ((GLOOM_MENU_BIG_FONT_HEIGHT * scale) / 2);
@@ -18484,7 +18681,7 @@ static bool load_runtime_level(const char *map_path, AppState *state, WallTextur
   return true;
 }
 
-#if GLOOM_RUNTIME_IS_BINARY
+#if GLOOM_RUNTIME_HAS_AUTOSAVE
 static bool load_autosaved_runtime_game(bool two_player_save, SDL_Renderer *renderer, RenderFramebuffer *framebuffer,
                                         int render_width, int render_height, AppState *state,
                                         WallTextureSet *wall_textures, FlatTextureSet *flat_textures,
@@ -18591,7 +18788,7 @@ static int run_autosave_selftest(void) {
   fill_autosave_selftest_state(&two_player_state, true);
 
   if (!write_gloom_autosave(&one_player_state, one_player_map, 5u)) return 1;
-  if (!autosave_selftest_expect(gloom_autosave_available(false), "one-player autosave file was not created")) return 1;
+  if (!autosave_selftest_expect(gloom_autosave_available(false), "one-player autosave record was not created")) return 1;
   if (!autosave_selftest_expect(!gloom_autosave_available(true), "one-player autosave created two-player file")) return 1;
   if (!read_gloom_autosave(false, &one_player_save)) return 1;
   if (!autosave_selftest_expect(autosave_selftest_matches_state(&one_player_save, &one_player_state,
@@ -18602,7 +18799,7 @@ static int run_autosave_selftest(void) {
 
   if (!write_gloom_autosave(&two_player_state, two_player_map, 10u)) return 1;
   if (!autosave_selftest_expect(gloom_autosave_available(false), "two-player write removed one-player file")) return 1;
-  if (!autosave_selftest_expect(gloom_autosave_available(true), "two-player autosave file was not created")) return 1;
+  if (!autosave_selftest_expect(gloom_autosave_available(true), "two-player autosave record was not created")) return 1;
   if (!read_gloom_autosave(false, &one_player_save)) return 1;
   if (!read_gloom_autosave(true, &two_player_save)) return 1;
   if (!autosave_selftest_expect(autosave_selftest_matches_state(&one_player_save, &one_player_state,
@@ -18616,8 +18813,8 @@ static int run_autosave_selftest(void) {
     return 1;
   }
 
-  (void)remove(GLOOM_AUTOSAVE_ONE_PLAYER_FILE);
-  (void)remove(GLOOM_AUTOSAVE_TWO_PLAYER_FILE);
+  gloom_autosave_delete(false);
+  gloom_autosave_delete(true);
   printf("Autosave selftest passed: separate one-player and two-player saves round-trip independently\n");
   return 0;
 }
@@ -18959,7 +19156,7 @@ static bool run_menu_and_restart_game(SDL_Renderer *renderer, RenderFramebuffer 
   *io_combat_mode = menu_game_mode == GLOOM_GAME_MODE_COMBAT;
   *io_violence_mode = menu_violence_mode;
   state->combat_mode = *io_combat_mode;
-#if GLOOM_RUNTIME_IS_BINARY
+#if GLOOM_RUNTIME_HAS_AUTOSAVE
   if (menu_game_mode == GLOOM_GAME_MODE_LOAD_ONE_PLAYER || menu_game_mode == GLOOM_GAME_MODE_LOAD_TWO_PLAYER) {
     bool load_two_player = menu_game_mode == GLOOM_GAME_MODE_LOAD_TWO_PLAYER;
 
@@ -19092,6 +19289,10 @@ static bool runtime_emscripten_consume_pointer_lock_lost(void) {
   return runtime_emscripten_take_pointer_lock_lost() != 0;
 }
 
+static void runtime_emscripten_discard_pointer_lock_lost(void) {
+  (void)runtime_emscripten_take_pointer_lock_lost();
+}
+
 static bool runtime_emscripten_consume_fullscreen_resize(void) {
   return runtime_emscripten_take_fullscreen_resize() != 0;
 }
@@ -19110,6 +19311,9 @@ void runtime_emscripten_canvas_fullscreen_toggle(void) {
 
 static bool runtime_emscripten_consume_pointer_lock_lost(void) {
   return false;
+}
+
+static void runtime_emscripten_discard_pointer_lock_lost(void) {
 }
 
 static bool runtime_emscripten_consume_fullscreen_resize(void) {
@@ -19280,7 +19484,12 @@ static bool set_runtime_mouse_capture(SDL_Window *window, bool captured) {
 }
 
 static bool set_gameplay_start_mouse_capture(SDL_Window *window) {
-  return set_runtime_mouse_capture(window, true);
+  bool captured = false;
+
+  runtime_emscripten_discard_pointer_lock_lost();
+  captured = set_runtime_mouse_capture(window, true);
+  runtime_emscripten_discard_pointer_lock_lost();
+  return captured;
 }
 
 int main(int argc, char **argv) {
@@ -19329,7 +19538,7 @@ int main(int argc, char **argv) {
 #ifdef GLOOM_DOS_SDL3
   uint32_t dos_event_poll_frame = 0u;
 #endif
-#if GLOOM_RUNTIME_IS_BINARY
+#if GLOOM_RUNTIME_HAS_AUTOSAVE
   char autosave_notice[32] = {0};
   double autosave_notice_timer = 0.0;
 #endif
@@ -19417,7 +19626,7 @@ int main(int argc, char **argv) {
     return run_input_selftest();
   }
 
-#if GLOOM_RUNTIME_IS_BINARY
+#if GLOOM_RUNTIME_HAS_AUTOSAVE
   if (argc > 1 && strcmp(argv[1], "--autosave-selftest") == 0) {
     return run_autosave_selftest();
   }
@@ -19913,7 +20122,7 @@ int main(int argc, char **argv) {
     state.two_player_mode = two_player_mode;
     state.combat_mode = combat_mode;
     state.violence_mode = violence_mode;
-#if GLOOM_RUNTIME_IS_BINARY
+#if GLOOM_RUNTIME_HAS_AUTOSAVE
     if (menu_game_mode == GLOOM_GAME_MODE_LOAD_ONE_PLAYER || menu_game_mode == GLOOM_GAME_MODE_LOAD_TWO_PLAYER) {
       bool load_two_player = menu_game_mode == GLOOM_GAME_MODE_LOAD_TWO_PLAYER;
 
@@ -20073,7 +20282,7 @@ int main(int argc, char **argv) {
     if (elapsed > 0.25) {
       elapsed = 0.25;
     }
-#if GLOOM_RUNTIME_IS_BINARY
+#if GLOOM_RUNTIME_HAS_AUTOSAVE
     if (autosave_notice_timer > 0.0) {
       autosave_notice_timer -= elapsed;
       if (autosave_notice_timer < 0.0) {
@@ -20171,7 +20380,7 @@ int main(int argc, char **argv) {
           interpolate_render_state(&previous_state, &state, render_alpha, render_zones, state.map.zone_count);
       render(renderer, &framebuffer, &render_state, &grid_offsets, &wall_textures, &flat_textures, &object_visuals,
              &weapon_visuals, &hud_font, render_width, render_height,
-#if GLOOM_RUNTIME_IS_BINARY
+#if GLOOM_RUNTIME_HAS_AUTOSAVE
              autosave_notice_timer > 0.0 ? autosave_notice : NULL
 #else
              NULL
@@ -20218,7 +20427,7 @@ int main(int argc, char **argv) {
         title_timer = 1.0;
         continue;
       }
-#if GLOOM_RUNTIME_IS_BINARY
+#if GLOOM_RUNTIME_HAS_AUTOSAVE
       if (pause_result == PAUSE_MENU_LOAD_GAME) {
         if (mouse_captured && set_runtime_mouse_capture(window, false)) {
           mouse_captured = false;
@@ -20317,7 +20526,7 @@ int main(int argc, char **argv) {
     profile_add_elapsed(&g_profiler.interpolate_ms, profile_start_ms);
     render(renderer, &framebuffer, &render_state, &grid_offsets, &wall_textures, &flat_textures, &object_visuals,
            &weapon_visuals, &hud_font, render_width, render_height,
-#if GLOOM_RUNTIME_IS_BINARY
+#if GLOOM_RUNTIME_HAS_AUTOSAVE
            autosave_notice_timer > 0.0 ? autosave_notice : NULL
 #else
            NULL
@@ -20466,7 +20675,7 @@ int main(int argc, char **argv) {
 #ifdef GLOOM_DOS_SDL3
       refresh_dos_index_palette(&framebuffer, window);
 #endif
-#if GLOOM_RUNTIME_IS_BINARY
+#if GLOOM_RUNTIME_HAS_AUTOSAVE
       {
         uint32_t script_ordinal = 0u;
 

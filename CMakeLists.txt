@@ -60,6 +60,10 @@ if(EMSCRIPTEN)
       "${CMAKE_SOURCE_DIR}/package/template.html"
     )
     add_custom_command(TARGET gloom_pc POST_BUILD
+      COMMAND ${CMAKE_COMMAND}
+        -DHTML="$<TARGET_FILE:gloom_pc>"
+        -DVERSION="${PROJECT_VERSION}-web-autosave"
+        -P "${CMAKE_SOURCE_DIR}/cmake/cache_bust_web_shell.cmake"
       COMMAND ${CMAKE_COMMAND} -E copy
         "${CMAKE_SOURCE_DIR}/package/favicon.ico"
         "$<TARGET_FILE_DIR:gloom_pc>/"
