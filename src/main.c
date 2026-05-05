@@ -249,6 +249,7 @@ typedef struct {
   uint8_t *mix_buffer;
   int mix_buffer_size;
   int dos_audio_chunk_size;
+  int dos_audio_ring_bytes;
   int dos_audio_target_bytes;
 #endif
   SDL_AudioSpec obtained;
@@ -1699,6 +1700,10 @@ static void audio_callback(void *userdata, Uint8 *stream, int len) {
 }
 
 #ifdef GLOOM_DOS_SDL3
+enum {
+  GLOOM_DOS_AUDIO_TARGET_CHUNKS = 6
+};
+
 static int16_t audio_clamp_s16(int value) {
   if (value < -32768) {
     return -32768;
@@ -2003,8 +2008,8 @@ static bool audio_start(AudioSystem *audio) {
     return false;
   }
   audio->dos_audio_chunk_size = SDL_DOSSoundBlasterGetAudioChunkSize(audio->device);
-  audio->dos_audio_target_bytes = SDL_DOSSoundBlasterGetAudioBufferSize(audio->device);
-  if (audio->dos_audio_chunk_size <= 0 || audio->dos_audio_target_bytes <= 0) {
+  audio->dos_audio_ring_bytes = SDL_DOSSoundBlasterGetAudioBufferSize(audio->device);
+  if (audio->dos_audio_chunk_size <= 0 || audio->dos_audio_ring_bytes <= 0) {
     fprintf(stderr, "DOS Sound Blaster manual pump did not expose an audio ring buffer\n");
     SDL_DestroyAudioStream(audio->stream);
     audio->stream = NULL;
@@ -2013,6 +2018,10 @@ static bool audio_start(AudioSystem *audio) {
     audio->mix_buffer = NULL;
     audio->mix_buffer_size = 0;
     return false;
+  }
+  audio->dos_audio_target_bytes = audio->dos_audio_chunk_size * GLOOM_DOS_AUDIO_TARGET_CHUNKS;
+  if (audio->dos_audio_target_bytes > audio->dos_audio_ring_bytes) {
+    audio->dos_audio_target_bytes = audio->dos_audio_ring_bytes;
   }
   if (audio->dos_audio_chunk_size > audio->mix_buffer_size) {
     uint8_t *new_buffer = (uint8_t *)realloc(audio->mix_buffer, (size_t)audio->dos_audio_chunk_size);
@@ -2031,9 +2040,10 @@ static bool audio_start(AudioSystem *audio) {
   }
   audio->initialized = true;
   dos_logf("DOS Sound Blaster: opened manual Paula SFX pump at %d Hz format=0x%x channels=%d sample_frames=%d "
-           "chunk=%d ring=%d device=%lu",
+           "chunk=%d ring=%d target=%d device=%lu",
            audio->obtained.freq, (unsigned)audio->obtained.format, audio->obtained.channels, sample_frames,
-           audio->dos_audio_chunk_size, audio->dos_audio_target_bytes, (unsigned long)audio->device);
+           audio->dos_audio_chunk_size, audio->dos_audio_ring_bytes, audio->dos_audio_target_bytes,
+           (unsigned long)audio->device);
   if (!SDL_ResumeAudioStreamDevice(audio->stream)) {
     fprintf(stderr, "SDL_ResumeAudioStreamDevice failed for DOS Sound Blaster Paula SFX: %s\n", SDL_GetError());
     SDL_DestroyAudioStream(audio->stream);
@@ -2094,6 +2104,7 @@ static void audio_shutdown(AudioSystem *audio) {
   audio->mix_buffer = NULL;
   audio->mix_buffer_size = 0;
   audio->dos_audio_chunk_size = 0;
+  audio->dos_audio_ring_bytes = 0;
   audio->dos_audio_target_bytes = 0;
   audio->device = 0u;
 #else
@@ -11334,11 +11345,13 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
   profile_start_ms = profile_now_ms();
   render_flat_textures(framebuffer, state, flats, x, y, w, h, focal, far_depth, view_cos, view_sin, false);
   profile_add_elapsed(&g_profiler.render_flat_ms, profile_start_ms);
+  audio_dos_pump(&g_audio);
 
   profile_start_ms = profile_now_ms();
   render_wall_columns_dos_fixed(framebuffer, state, wall_textures, wall_candidates, wall_candidate_count, x, y, w, h,
                                 horizon_y, view_cos, view_sin, focal);
   profile_add_elapsed(&g_profiler.render_wall_ms, profile_start_ms);
+  audio_dos_pump(&g_audio);
 #else
   profile_start_ms = profile_now_ms();
   render_flat_textures(framebuffer, state, flats, x, y, w, h, focal, far_depth, view_cos, view_sin);
@@ -12242,6 +12255,9 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
     g_profiler.sprites += (uint64_t)sprite_write;
   }
   profile_add_elapsed(&g_profiler.render_sprites_ms, profile_start_ms);
+#ifdef GLOOM_DOS_SDL3
+  audio_dos_pump(&g_audio);
+#endif
 }
 
 static int ui_double_scale_for_viewport(int w, int h) {
@@ -12789,6 +12805,9 @@ static void render_scene_contents(RenderFramebuffer *framebuffer, const AppState
   profile_start_ms = profile_now_ms();
   render_player_weapon_status(framebuffer, state, hud_font, x, y, w, h);
   profile_add_elapsed(&g_profiler.render_hud_ms, profile_start_ms);
+#ifdef GLOOM_DOS_SDL3
+  audio_dos_pump(&g_audio);
+#endif
 }
 
 static void free_menu_image(MenuImage *image) {
@@ -14107,6 +14126,9 @@ static void render(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const
   SDL_RenderPresent(renderer);
   profile_add_elapsed(&g_profiler.render_present_ms, profile_start_ms);
   profile_add_elapsed(&g_profiler.render_ms, profile_render_start_ms);
+#ifdef GLOOM_DOS_SDL3
+  audio_dos_pump(&g_audio);
+#endif
 }
 
 static int16_t interpolate_int16(int16_t previous, int16_t current, float alpha) {

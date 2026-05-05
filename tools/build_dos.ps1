@@ -45,6 +45,16 @@ if (Test-Path -LiteralPath $sdlDosAudio) {
   $audioSource = Get-Content -LiteralPath $sdlDosAudio -Raw
   $patchedAudio = $audioSource
 
+  if ($patchedAudio -notlike '*#define RING_BUFFER_CHUNKS 8*') {
+    $audioPatchSource = '#define RING_BUFFER_CHUNKS 4'
+    if (-not $patchedAudio.Contains($audioPatchSource)) {
+      throw "Unable to patch SDL DOS Sound Blaster ring depth in $sdlDosAudio"
+    }
+    $patchedAudio = $patchedAudio.Replace(
+      '// 4 chunks is ~45 ms at 44100 Hz, enough headroom for 22 fps frame times.',
+      '// 8 chunks is ~186 ms at 22050 Hz with 512-frame chunks, enough headroom for 8 fps frame pacing.')
+    $patchedAudio = $patchedAudio.Replace($audioPatchSource, '#define RING_BUFFER_CHUNKS 8')
+  }
   if ($patchedAudio -notlike '*manual_soundblaster_device*') {
     $audioPatchSource = 'static Uint8 soundblaster_silence_value = 0;'
     if (-not $patchedAudio.Contains($audioPatchSource)) {
