@@ -153,6 +153,7 @@ enum {
   GLOOM_MAX_RUNTIME_GORE = 128,
   GLOOM_MAX_RUNTIME_OBJECTS = 1024,
   GLOOM_PLAYER_INITIAL_RELOAD = 5,
+  GLOOM_KEYBOARD_HELD_FIRE_REPEAT_TICKS = 5,
   GLOOM_PLAYER_FIRE_Y = -60,
   GLOOM_PROJECTILE_RADIUS = 32,
   GLOOM_PROJECTILE_BARREL_FORWARD = (GLOOM_PROJECTILE_RADIUS * 5) / 2,
@@ -464,6 +465,7 @@ typedef struct {
   uint8_t player_reload;
   uint8_t player_bouncy_bullets;
   float player_reload_counter;
+  float player_keyboard_fire_repeat_counter;
   float player_weapon_flash;
   float player_palette_timer;
   float player_mega_timer;
@@ -505,6 +507,7 @@ typedef struct {
   uint8_t player_reload;
   uint8_t player_bouncy_bullets;
   float player_reload_counter;
+  float player_keyboard_fire_repeat_counter;
   float player_weapon_flash;
   float player_palette_timer;
   float player_mega_timer;
@@ -7399,6 +7402,7 @@ static void capture_primary_player_state(const AppState *state, RuntimePlayerSta
   out_player->player_reload = state->player_reload;
   out_player->player_bouncy_bullets = state->player_bouncy_bullets;
   out_player->player_reload_counter = state->player_reload_counter;
+  out_player->player_keyboard_fire_repeat_counter = state->player_keyboard_fire_repeat_counter;
   out_player->player_weapon_flash = state->player_weapon_flash;
   out_player->player_palette_timer = state->player_palette_timer;
   out_player->player_mega_timer = state->player_mega_timer;
@@ -7437,6 +7441,7 @@ static void apply_primary_player_state(AppState *state, const RuntimePlayerState
   state->player_reload = player->player_reload;
   state->player_bouncy_bullets = player->player_bouncy_bullets;
   state->player_reload_counter = player->player_reload_counter;
+  state->player_keyboard_fire_repeat_counter = player->player_keyboard_fire_repeat_counter;
   state->player_weapon_flash = player->player_weapon_flash;
   state->player_palette_timer = player->player_palette_timer;
   state->player_mega_timer = player->player_mega_timer;
@@ -9588,15 +9593,27 @@ static void update_player_weapon(AppState *state, const PlayerControls *controls
       state->player_reload_counter = 0.0f;
     }
   }
+  if (state->player_keyboard_fire_repeat_counter > 0.0f) {
+    state->player_keyboard_fire_repeat_counter -= step_scale;
+    if (state->player_keyboard_fire_repeat_counter < 0.0f) {
+      state->player_keyboard_fire_repeat_counter = 0.0f;
+    }
+  }
 
   fire_pressed = controls != NULL && controls->fire;
   repeat_fire = controls != NULL && controls->keyboard_fire_repeat;
   if (!fire_pressed) {
     state->player_last_fire = false;
+    state->player_keyboard_fire_repeat_counter = 0.0f;
     return;
   }
+  if (!repeat_fire) {
+    state->player_keyboard_fire_repeat_counter = 0.0f;
+  }
 
-  if ((!state->player_last_fire || repeat_fire) && state->player_reload_counter <= 0.0f) {
+  if ((!state->player_last_fire ||
+       (repeat_fire && state->player_keyboard_fire_repeat_counter <= 0.0f)) &&
+      state->player_reload_counter <= 0.0f) {
     bool fired = false;
 
     if (state->player_mega_timer > 0.0f) {
@@ -9622,6 +9639,8 @@ static void update_player_weapon(AppState *state, const PlayerControls *controls
 
     if (fired) {
       state->player_reload_counter = (float)state->player_reload;
+      state->player_keyboard_fire_repeat_counter =
+          repeat_fire ? (float)GLOOM_KEYBOARD_HELD_FIRE_REPEAT_TICKS : 0.0f;
       state->player_weapon_flash = (float)GLOOM_GUN_FLASH_AMIGA_TICKS;
     }
   }
@@ -17688,6 +17707,7 @@ static int run_pickup_selftest(void) {
 
   memset(state.projectiles, 0, sizeof(state.projectiles));
   state.player_reload_counter = 0.0f;
+  state.player_keyboard_fire_repeat_counter = 0.0f;
   state.player_last_fire = true;
   state.player_mega_timer = 0.0f;
   controls.keyboard_fire_repeat = false;
@@ -17697,9 +17717,16 @@ static int run_pickup_selftest(void) {
     return 1;
   }
   controls.keyboard_fire_repeat = true;
+  state.player_keyboard_fire_repeat_counter = (float)GLOOM_KEYBOARD_HELD_FIRE_REPEAT_TICKS;
+  update_player_weapon(&state, &controls);
+  if (combat_selftest_active_projectile_count(&state) != 0u) {
+    fprintf(stderr, "Pickup selftest failed: held keyboard fire repeated before its repeat gate elapsed\n");
+    return 1;
+  }
+  state.player_keyboard_fire_repeat_counter = 0.0f;
   update_player_weapon(&state, &controls);
   if (combat_selftest_active_projectile_count(&state) != 1u) {
-    fprintf(stderr, "Pickup selftest failed: held keyboard fire should repeat after reload\n");
+    fprintf(stderr, "Pickup selftest failed: held keyboard fire should repeat after its repeat gate elapses\n");
     return 1;
   }
   controls.keyboard_fire_repeat = false;
