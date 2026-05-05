@@ -5052,6 +5052,7 @@ static bool resolve_script_level_intro_for_map(const char *map_path, ScriptLevel
 #if GLOOM_RUNTIME_HAS_AUTOSAVE
 #define GLOOM_AUTOSAVE_ONE_PLAYER_FILE "GLOOM1P.SAV"
 #define GLOOM_AUTOSAVE_TWO_PLAYER_FILE "GLOOM2P.SAV"
+#define GLOOM_AUTOSAVE_LEVEL_INTERVAL 3u
 
 typedef struct {
   char map_path[1024];
@@ -5072,6 +5073,10 @@ typedef struct {
 
 static const char *gloom_autosave_path_for_mode(bool two_player_mode) {
   return two_player_mode ? GLOOM_AUTOSAVE_TWO_PLAYER_FILE : GLOOM_AUTOSAVE_ONE_PLAYER_FILE;
+}
+
+static bool gloom_should_autosave_script_ordinal(uint32_t script_ordinal) {
+  return script_ordinal > 1u && ((script_ordinal - 1u) % GLOOM_AUTOSAVE_LEVEL_INTERVAL) == 0u;
 }
 
 #ifdef __EMSCRIPTEN__
@@ -19107,6 +19112,20 @@ static int run_autosave_selftest(void) {
     return 1;
   }
 
+  if (!autosave_selftest_expect(!gloom_should_autosave_script_ordinal(1u), "first level should not autosave")) return 1;
+  if (!autosave_selftest_expect(!gloom_should_autosave_script_ordinal(2u), "second level should not autosave")) return 1;
+  if (!autosave_selftest_expect(!gloom_should_autosave_script_ordinal(3u), "third level load should not autosave")) {
+    return 1;
+  }
+  if (!autosave_selftest_expect(gloom_should_autosave_script_ordinal(4u),
+                                "next map after three completed levels should autosave")) {
+    return 1;
+  }
+  if (!autosave_selftest_expect(gloom_should_autosave_script_ordinal(7u),
+                                "next map after six completed levels should autosave")) {
+    return 1;
+  }
+
   fill_autosave_selftest_state(&one_player_state, false);
   fill_autosave_selftest_state(&two_player_state, true);
 
@@ -21010,7 +21029,8 @@ int main(int argc, char **argv) {
       {
         uint32_t script_ordinal = 0u;
 
-        if (script_play_ordinal_for_map(next_map_path, &script_ordinal) && script_ordinal > 0u &&
+        if (script_play_ordinal_for_map(next_map_path, &script_ordinal) &&
+            gloom_should_autosave_script_ordinal(script_ordinal) &&
             write_gloom_autosave_for_scriptplay(next_map_path, script_ordinal, transition_two_player_mode,
                                                 violence_mode, barrel_projectile_origin, preserved_hitpoints,
                                                 preserved_lives, preserved_weapon, preserved_reload,

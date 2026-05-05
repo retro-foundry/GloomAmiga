@@ -39,8 +39,8 @@
 
        Web builds store the same autosave records in browser localStorage.
 
-       The game autosaves at every campaign level for save-game testing.
-       When a save is written, GAME SAVED appears on screen.
+       The game autosaves after every 3 completed campaign levels. When a
+       save is written, GAME SAVED appears on screen.
 
        The main menu shows LOAD ONE PLAYER AUTOSAVE and LOAD TWO PLAYER
        AUTOSAVE under the matching new-game options. Each load option is
