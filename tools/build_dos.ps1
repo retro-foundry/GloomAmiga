@@ -7,6 +7,11 @@ $sdlSource = Join-Path $repoRoot 'build\dos-sdl\SDL'
 $sdlBuild = Join-Path $repoRoot 'build\dos-sdl\SDL-build'
 $sdlInclude = Join-Path $repoRoot 'build\dos-sdl\SDL\include'
 $sdlLib = Join-Path $repoRoot 'build\dos-sdl\SDL-build\libSDL3.a'
+$xmpSource = Join-Path $repoRoot 'build\_deps\sdl2_mixer-src\external\libxmp'
+$xmpBuild = Join-Path $repoRoot 'build\dos-libxmp'
+$xmpObj = Join-Path $xmpBuild 'obj'
+$xmpInclude = Join-Path $xmpSource 'include'
+$xmpLib = Join-Path $xmpBuild 'libxmp_dos.a'
 $outDir = Join-Path $repoRoot 'build\dos'
 $outExe = Join-Path $outDir 'GLOOMPC.EXE'
 
@@ -228,6 +233,45 @@ if (Test-Path -LiteralPath $sdlBuild) {
 if (-not (Test-Path -LiteralPath $sdlLib)) {
   throw "Missing DOS SDL3 library $sdlLib"
 }
+if (-not (Test-Path -LiteralPath (Join-Path $xmpSource 'cmake\libxmp-sources.cmake'))) {
+  throw "Missing libxmp source under $xmpSource. Run the normal CMake configure once so SDL_mixer/libxmp is fetched."
+}
+
+New-Item -ItemType Directory -Force -Path $xmpObj | Out-Null
+$xmpSourceList = Get-Content -LiteralPath (Join-Path $xmpSource 'cmake\libxmp-sources.cmake') -Raw
+$xmpSourceMatch = [regex]::Match(
+  $xmpSourceList,
+  'set\(LIBXMP_SRC_LIST\s+(?<body>.*?)\)\s*\r?\n\s*set\(LIBXMP_SRC_LIST_PROWIZARD',
+  [Text.RegularExpressions.RegexOptions]::Singleline)
+if (-not $xmpSourceMatch.Success) {
+  throw "Unable to parse libxmp source list from $xmpSource"
+}
+$xmpSources = [regex]::Matches($xmpSourceMatch.Groups['body'].Value, 'src/[A-Za-z0-9_./-]+\.c') |
+  ForEach-Object { $_.Value } |
+  Where-Object { $_ -ne 'src/win32.c' -and $_ -ne 'src/mkstemp.c' }
+$xmpObjects = @()
+foreach ($xmpSourceRel in $xmpSources) {
+  $xmpSourceFile = Join-Path $xmpSource ($xmpSourceRel -replace '/', '\')
+  $xmpObjectName = (($xmpSourceRel -replace '[\\/]', '_') -replace '\.c$', '.o')
+  $xmpObjectFile = Join-Path $xmpObj $xmpObjectName
+
+  & (Join-Path $djgppBin 'i586-pc-msdosdjgpp-gcc.exe') `
+    -O2 -fomit-frame-pointer -march=i386 -mtune=i486 -std=gnu99 `
+    -DLIBXMP_STATIC -DLIBXMP_NO_DEPACKERS -DLIBXMP_NO_PROWIZARD -DHAVE_FNMATCH `
+    "-I$xmpInclude" "-I$(Join-Path $xmpSource 'src')" "-I$(Join-Path $xmpSource 'src\loaders')" `
+    -c $xmpSourceFile -o $xmpObjectFile
+  if ($LASTEXITCODE -ne 0) {
+    throw "Failed to compile DOS libxmp source $xmpSourceRel"
+  }
+  $xmpObjects += $xmpObjectFile
+}
+if (Test-Path -LiteralPath $xmpLib) {
+  Remove-Item -LiteralPath $xmpLib -Force
+}
+& (Join-Path $djgppBin 'i586-pc-msdosdjgpp-ar.exe') rcs $xmpLib @xmpObjects
+if ($LASTEXITCODE -ne 0) {
+  throw "Failed to archive DOS libxmp library $xmpLib"
+}
 
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 Copy-Item -LiteralPath (Join-Path $repoRoot 'package\README.TXT') -Destination (Join-Path $outDir 'README.TXT') -Force
@@ -282,10 +326,10 @@ Push-Location $repoRoot
 try {
   & (Join-Path $djgppBin 'i586-pc-msdosdjgpp-gcc.exe') `
     -O3 -fomit-frame-pointer -march=i386 -mtune=i486 `
-    -std=c17 -Wall -Wextra -Wpedantic -DGLOOM_DOS_SDL3 `
+    -std=c17 -Wall -Wextra -Wpedantic -DGLOOM_DOS_SDL3 -DGLOOM_DOS_MENU_MUSIC `
     -DGLOOM_BINARY_VERSION_MAJOR=1 -DGLOOM_BINARY_VERSION_MINOR=0 -DGLOOM_BINARY_VERSION_PATCH=0 `
-    -Isrc "-I$sdlInclude" `
-    src\main.c src\map.c src\iff.c $sdlLib -lm `
+    -Isrc "-I$sdlInclude" "-I$xmpInclude" `
+    src\main.c src\map.c src\iff.c $sdlLib $xmpLib -lm `
     -o $outExe
 } finally {
   Pop-Location

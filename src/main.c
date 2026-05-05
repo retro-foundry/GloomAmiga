@@ -11,6 +11,13 @@
 #define GLOOM_USE_SDL_MIXER 0
 #endif
 
+#if defined(GLOOM_DOS_SDL3) && defined(GLOOM_DOS_MENU_MUSIC)
+#include <xmp.h>
+#define GLOOM_USE_DOS_MENU_MUSIC 1
+#else
+#define GLOOM_USE_DOS_MENU_MUSIC 0
+#endif
+
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -286,6 +293,14 @@ typedef struct {
   int dos_audio_chunk_size;
   int dos_audio_ring_bytes;
   int dos_audio_target_bytes;
+#if GLOOM_USE_DOS_MENU_MUSIC
+  xmp_context music_context;
+  uint8_t *music_buffer;
+  int music_buffer_size;
+  int music_format_flags;
+  bool music_loaded;
+  bool music_playing;
+#endif
 #endif
   SDL_AudioSpec obtained;
   SfxSample samples[GLOOM_SFX_COUNT];
@@ -2003,6 +2018,11 @@ static bool audio_dos_has_active_output(const AudioSystem *audio) {
   if (audio->ui_beep_remaining > 0u) {
     return true;
   }
+#if GLOOM_USE_DOS_MENU_MUSIC
+  if (audio->music_playing) {
+    return true;
+  }
+#endif
   for (i = 0; i < GLOOM_AUDIO_CHANNEL_COUNT; ++i) {
     if (audio->channels[i].active || audio->channels[i].queued) {
       return true;
@@ -2010,6 +2030,53 @@ static bool audio_dos_has_active_output(const AudioSystem *audio) {
   }
   return false;
 }
+
+#if GLOOM_USE_DOS_MENU_MUSIC
+static void audio_dos_mix_menu_music(AudioSystem *audio, uint8_t *stream, int len) {
+  const int volume = 40;
+  int rc = 0;
+  int i = 0;
+
+  if (audio == NULL || stream == NULL || len <= 0 || !audio->music_playing || audio->music_context == NULL) {
+    return;
+  }
+  if (audio->music_buffer_size < len) {
+    uint8_t *new_buffer = (uint8_t *)realloc(audio->music_buffer, (size_t)len);
+    if (new_buffer == NULL) {
+      audio->music_playing = false;
+      dos_logf("DOS menu music: out of memory resizing mix buffer to %d bytes", len);
+      return;
+    }
+    audio->music_buffer = new_buffer;
+    audio->music_buffer_size = len;
+  }
+  rc = xmp_play_buffer(audio->music_context, audio->music_buffer, len, 0);
+  if (rc != 0) {
+    xmp_restart_module(audio->music_context);
+    rc = xmp_play_buffer(audio->music_context, audio->music_buffer, len, 0);
+    if (rc != 0) {
+      audio->music_playing = false;
+      dos_logf("DOS menu music: xmp_play_buffer failed rc=%d", rc);
+      return;
+    }
+  }
+
+  if (audio->obtained.format == SDL_AUDIO_U8) {
+    for (i = 0; i < len; ++i) {
+      int mixed = (int)stream[i] + ((((int)audio->music_buffer[i] - 128) * volume) / 64);
+      stream[i] = audio_clamp_u8(mixed);
+    }
+  } else {
+    int16_t *dst = (int16_t *)stream;
+    const int16_t *src = (const int16_t *)audio->music_buffer;
+    int samples = len / (int)sizeof(int16_t);
+
+    for (i = 0; i < samples; ++i) {
+      dst[i] = audio_clamp_s16((int)dst[i] + (((int)src[i] * volume) / 64));
+    }
+  }
+}
+#endif
 
 static void audio_dos_mix_device_format(AudioSystem *audio, uint8_t *stream, int len) {
   if (audio == NULL || stream == NULL || len <= 0) {
@@ -2020,6 +2087,9 @@ static void audio_dos_mix_device_format(AudioSystem *audio, uint8_t *stream, int
   } else {
     audio_dos_callback_s16(audio, stream, len);
   }
+#if GLOOM_USE_DOS_MENU_MUSIC
+  audio_dos_mix_menu_music(audio, stream, len);
+#endif
 }
 
 static void audio_dos_pump(AudioSystem *audio) {
@@ -2268,6 +2338,25 @@ static void audio_shutdown(AudioSystem *audio) {
   }
 
 #ifdef GLOOM_DOS_SDL3
+  menu_music_stop();
+#if GLOOM_USE_DOS_MENU_MUSIC
+  if (audio->music_context != NULL) {
+    if (audio->music_loaded) {
+      xmp_end_player(audio->music_context);
+    }
+    if (audio->music_loaded) {
+      xmp_release_module(audio->music_context);
+    }
+    xmp_free_context(audio->music_context);
+    audio->music_context = NULL;
+  }
+  free(audio->music_buffer);
+  audio->music_buffer = NULL;
+  audio->music_buffer_size = 0;
+  audio->music_format_flags = 0;
+  audio->music_loaded = false;
+  audio->music_playing = false;
+#endif
   if (audio->stream != NULL) {
     SDL_DestroyAudioStream(audio->stream);
     audio->stream = NULL;
@@ -2322,6 +2411,55 @@ static bool menu_music_load(void) {
 }
 #endif
 
+#if GLOOM_USE_DOS_MENU_MUSIC
+static bool menu_music_load_dos(AudioSystem *audio) {
+  char path[512];
+  int flags = 0;
+
+  if (audio == NULL || !audio_output_ready(audio)) {
+    return false;
+  }
+  if (audio->music_loaded) {
+    return true;
+  }
+  if (audio->music_context == NULL) {
+    audio->music_context = xmp_create_context();
+    if (audio->music_context == NULL) {
+      dos_logf("DOS menu music: xmp_create_context failed");
+      return false;
+    }
+  }
+  /* Port of amiga/gloom2.s titlemed load/start path: the title MED is sfxs/med1. */
+  if (!resolve_runtime_file_path("amiga/sfxs/med1", path, sizeof(path))) {
+    dos_logf("DOS menu music: unable to find amiga/sfxs/med1");
+    return false;
+  }
+  if (xmp_load_module(audio->music_context, path) != 0) {
+    dos_logf("DOS menu music: xmp_load_module failed for %s", path);
+    return false;
+  }
+  audio->music_loaded = true;
+  if (audio->obtained.format == SDL_AUDIO_U8) {
+    flags |= XMP_FORMAT_8BIT | XMP_FORMAT_UNSIGNED;
+  }
+  if (audio->obtained.channels == 1) {
+    flags |= XMP_FORMAT_MONO;
+  }
+  audio->music_format_flags = flags;
+  if (xmp_start_player(audio->music_context, audio->obtained.freq, flags) != 0) {
+    dos_logf("DOS menu music: xmp_start_player failed at %d Hz flags=0x%x", audio->obtained.freq, flags);
+    xmp_release_module(audio->music_context);
+    audio->music_loaded = false;
+    return false;
+  }
+  (void)xmp_set_player(audio->music_context, XMP_PLAYER_FLAGS, XMP_FLAGS_A500);
+  (void)xmp_set_player(audio->music_context, XMP_PLAYER_INTERP, XMP_INTERP_NEAREST);
+  (void)xmp_set_player(audio->music_context, XMP_PLAYER_VOLUME, 80);
+  dos_logf("DOS menu music: started amiga/sfxs/med1 at %d Hz flags=0x%x", audio->obtained.freq, flags);
+  return true;
+}
+#endif
+
 static void menu_music_start(void) {
 #if GLOOM_USE_SDL_MIXER
   if (!audio_output_ready(&g_audio) || !menu_music_load()) {
@@ -2334,6 +2472,11 @@ static void menu_music_start(void) {
   } else if (Mix_PausedMusic() != 0) {
     Mix_ResumeMusic();
   }
+#elif GLOOM_USE_DOS_MENU_MUSIC
+  if (menu_music_load_dos(&g_audio)) {
+    g_audio.music_playing = true;
+    audio_dos_pump(&g_audio);
+  }
 #endif
 }
 
@@ -2342,6 +2485,11 @@ static void menu_music_stop(void) {
   if (Mix_PlayingMusic() != 0 || Mix_PausedMusic() != 0) {
     Mix_HaltMusic();
   }
+#elif GLOOM_USE_DOS_MENU_MUSIC
+  if (g_audio.music_context != NULL && g_audio.music_playing) {
+    xmp_restart_module(g_audio.music_context);
+  }
+  g_audio.music_playing = false;
 #endif
 }
 
@@ -15278,6 +15426,7 @@ static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer
       redraw = false;
     }
 #ifdef GLOOM_DOS_SDL3
+    audio_dos_pump(&g_audio);
     SDL_Delay(redraw ? 1 : 8);
 #else
     SDL_Delay(1);
