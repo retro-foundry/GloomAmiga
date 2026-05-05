@@ -502,6 +502,10 @@ typedef struct {
   uint32_t *last_frame_pixels;
   float *depth_buffer;
   float *sprite_depth_buffer;
+#ifdef GLOOM_DOS_SDL3
+  int32_t *depth_buffer_int;
+  int32_t *sprite_depth_buffer_int;
+#endif
   uint32_t *filled_stamps;
   uint32_t filled_stamp;
   int pitch_pixels;
@@ -641,6 +645,9 @@ typedef struct {
   int16_t width;
   int16_t height;
   uint32_t *argb_pixels;
+#ifdef GLOOM_DOS_SDL3
+  uint8_t *indexed_pixels;
+#endif
 } ObjectFrame;
 
 typedef struct {
@@ -654,6 +661,9 @@ typedef struct {
   uint16_t collision_radius;
   size_t frame_count;
   char source_name[64];
+#ifdef GLOOM_DOS_SDL3
+  uint32_t shaded_palette[16][256];
+#endif
   ObjectFrame *frames;
 } ObjectVisual;
 
@@ -750,6 +760,25 @@ typedef struct {
   float wall_u;
 } RayWallHit;
 
+#ifdef GLOOM_DOS_SDL3
+typedef struct {
+  const GloomZone *zone;
+  int32_t vx1;
+  int32_t vz1;
+  int32_t vx2;
+  int32_t vz2;
+  int32_t sz;
+  int column_min;
+  int column_max;
+} DosSceneWall;
+
+typedef struct {
+  const DosSceneWall *wall;
+  int32_t depth;
+  int32_t wall_u;
+} DosRayWallHit;
+#endif
+
 typedef struct {
   int16_t joyx;
   int16_t joyy;
@@ -763,8 +792,18 @@ typedef struct {
   float screen_w;
   float screen_h;
   float depth;
+#ifdef GLOOM_DOS_SDL3
+  int32_t screen_x_fixed;
+  int32_t screen_y_fixed;
+  int32_t screen_w_fixed;
+  int32_t screen_h_fixed;
+  int32_t depth_int;
+#endif
   int source_pad;
   const ObjectFrame *frame;
+#ifdef GLOOM_DOS_SDL3
+  const uint32_t (*shaded_palette)[256];
+#endif
 } DebugSprite;
 
 typedef struct {
@@ -773,6 +812,12 @@ typedef struct {
 } RuntimeGamepad;
 
 static float clampf(float value, float lo, float hi);
+#ifdef GLOOM_DOS_SDL3
+static int32_t dos_float_to_fixed16(float value);
+static int dos_fixed16_floor_to_int(int32_t value);
+static int32_t dos_div_fixed16(int64_t numerator_fixed, int32_t denominator_fixed);
+static int32_t dos_fixed16_clamp_unit(int32_t value);
+#endif
 static int32_t amiga_rotation_to_fixed(int16_t rotation);
 static float amiga_rotation_to_radians(int16_t rotation);
 static int16_t player_rotation_fixed_to_amiga(int32_t rotation_fixed);
@@ -3665,6 +3710,48 @@ static void zone_wall_texture_coordinates(const GloomZone *zone, float wall_u, i
   }
 }
 
+#ifdef GLOOM_DOS_SDL3
+static void zone_wall_texture_coordinates_fixed16(const GloomZone *zone, int32_t wall_u_fixed, int *out_tile_index,
+                                                  size_t *out_texture_x) {
+  int32_t scaled_u = 0;
+  int tile_base = 0;
+  int tile_index = 0;
+  size_t texture_x = 0u;
+
+  if (zone == NULL) {
+    if (out_tile_index != NULL) *out_tile_index = 0;
+    if (out_texture_x != NULL) *out_texture_x = 0u;
+    return;
+  }
+
+  wall_u_fixed = dos_fixed16_clamp_unit(wall_u_fixed);
+  if (zone->scale > 0) {
+    scaled_u = (wall_u_fixed * (int32_t)zone->scale) >> 1;
+  } else {
+    int shift = zone->scale < 0 ? -zone->scale : 0;
+
+    if (shift > 30) {
+      shift = 30;
+    }
+    scaled_u = shift > 0 ? (wall_u_fixed >> shift) : wall_u_fixed;
+  }
+
+  tile_base = dos_fixed16_floor_to_int(scaled_u);
+  tile_index = tile_base & 7;
+  texture_x = (size_t)(((uint32_t)(scaled_u & 0xFFFF) * (uint32_t)GLOOM_TEXTURE_WIDTH) >> 16);
+  if (texture_x >= (size_t)GLOOM_TEXTURE_WIDTH) {
+    texture_x = (size_t)GLOOM_TEXTURE_WIDTH - 1u;
+  }
+
+  if (out_tile_index != NULL) {
+    *out_tile_index = tile_index;
+  }
+  if (out_texture_x != NULL) {
+    *out_texture_x = texture_x;
+  }
+}
+#endif
+
 static uint32_t sample_zone_wall_texture_argb(const WallTextureSet *set, const AppState *state,
                                               const GloomZone *zone, float wall_u, float wall_v) {
   float local_u = 0.0f;
@@ -3868,6 +3955,9 @@ static void free_object_visual(ObjectVisual *visual) {
 
   for (i = 0u; i < visual->frame_count; ++i) {
     free(visual->frames[i].argb_pixels);
+#ifdef GLOOM_DOS_SDL3
+    free(visual->frames[i].indexed_pixels);
+#endif
   }
 
   free(visual->frames);
@@ -3962,6 +4052,9 @@ static bool load_object_visual_from_asset(const char *asset_name, const ObjectVi
 
   set_default_texture_palette(palette);
   load_packed_palette(palette, data, data_size, (size_t)palette_offset);
+#ifdef GLOOM_DOS_SDL3
+  build_shaded_palette(out_visual->shaded_palette, palette);
+#endif
 
   for (frame_index = 0u; frame_index < frame_count; ++frame_index) {
     uint32_t frame_offset = main_read_be32(data + 12u + frame_index * 4u);
@@ -3970,6 +4063,9 @@ static bool load_object_visual_from_asset(const char *asset_name, const ObjectVi
     int16_t width = 0;
     int16_t height = 0;
     uint32_t *pixels = NULL;
+#ifdef GLOOM_DOS_SDL3
+    uint8_t *indexed_pixels = NULL;
+#endif
     size_t sx = 0u;
 
     if ((size_t)frame_offset + 8u > data_size) {
@@ -3992,6 +4088,13 @@ static bool load_object_visual_from_asset(const char *asset_name, const ObjectVi
     if (pixels == NULL) {
       goto fail;
     }
+#ifdef GLOOM_DOS_SDL3
+    indexed_pixels = (uint8_t *)malloc((size_t)width * (size_t)height * sizeof(*indexed_pixels));
+    if (indexed_pixels == NULL) {
+      free(pixels);
+      goto fail;
+    }
+#endif
 
     for (sx = 0u; sx < (size_t)width; ++sx) {
       size_t sy = 0u;
@@ -4005,6 +4108,9 @@ static bool load_object_visual_from_asset(const char *asset_name, const ObjectVi
         }
 
         pixels[sy * (size_t)width + sx] = argb;
+#ifdef GLOOM_DOS_SDL3
+        indexed_pixels[sy * (size_t)width + sx] = palette_index;
+#endif
       }
     }
 
@@ -4013,6 +4119,9 @@ static bool load_object_visual_from_asset(const char *asset_name, const ObjectVi
     frames[frame_index].width = width;
     frames[frame_index].height = height;
     frames[frame_index].argb_pixels = pixels;
+#ifdef GLOOM_DOS_SDL3
+    frames[frame_index].indexed_pixels = indexed_pixels;
+#endif
   }
 
   out_visual->loaded = true;
@@ -4033,6 +4142,9 @@ static bool load_object_visual_from_asset(const char *asset_name, const ObjectVi
 fail:
   for (frame_index = 0u; frame_index < frame_count; ++frame_index) {
     free(frames[frame_index].argb_pixels);
+#ifdef GLOOM_DOS_SDL3
+    free(frames[frame_index].indexed_pixels);
+#endif
   }
   free(frames);
   free(data);
@@ -4207,6 +4319,40 @@ static const ObjectFrame *select_object_visual_frame(const ObjectVisual *visual,
   }
 
   return select_object_visual_frame_number(visual, spawn, state, frame_number);
+}
+
+static void bind_debug_sprite_frame(DebugSprite *sprite, const ObjectVisual *visual, const ObjectFrame *frame) {
+  if (sprite == NULL) {
+    return;
+  }
+
+  sprite->frame = frame;
+#ifdef GLOOM_DOS_SDL3
+  sprite->shaded_palette = visual != NULL ? visual->shaded_palette : NULL;
+#else
+  (void)visual;
+#endif
+}
+
+static void bind_debug_sprite_depth(DebugSprite *sprite, float depth) {
+  if (sprite == NULL) {
+    return;
+  }
+
+  sprite->depth = depth;
+#ifdef GLOOM_DOS_SDL3
+  sprite->screen_x_fixed = dos_float_to_fixed16(sprite->screen_x);
+  sprite->screen_y_fixed = dos_float_to_fixed16(sprite->screen_y);
+  sprite->screen_w_fixed = dos_float_to_fixed16(sprite->screen_w);
+  sprite->screen_h_fixed = dos_float_to_fixed16(sprite->screen_h);
+  sprite->depth_int = depth >= 0.0f ? (int32_t)(depth + 0.5f) : (int32_t)(depth - 0.5f);
+  if (sprite->depth_int < 1) {
+    sprite->depth_int = 1;
+  }
+  if (sprite->depth_int >= GLOOM_AMIGA_MAX_Z) {
+    sprite->depth_int = GLOOM_AMIGA_MAX_Z - 1;
+  }
+#endif
 }
 
 static void free_preview_asset(PreviewAsset *asset) {
@@ -7708,14 +7854,20 @@ static int32_t dos_float_to_fixed16(float value) {
 }
 
 static int dos_fixed16_floor_to_int(int32_t value) {
-  if (value >= 0) {
-    return (int)(value >> 16);
+  return (int)(value >> 16);
+}
+
+static int32_t dos_div_fixed16(int64_t numerator_fixed, int32_t denominator_fixed) {
+  int64_t value = 0;
+
+  if (denominator_fixed == 0) {
+    return numerator_fixed < 0 ? INT32_MIN : INT32_MAX;
   }
 
-  {
-    int64_t wide_value = value;
-    return -(int)(((-wide_value) + 65535) >> 16);
-  }
+  value = (numerator_fixed << 16) / (int64_t)denominator_fixed;
+  if (value < INT32_MIN) return INT32_MIN;
+  if (value > INT32_MAX) return INT32_MAX;
+  return (int32_t)value;
 }
 
 static int32_t dos_fixed16_clamp_unit(int32_t value) {
@@ -7793,6 +7945,25 @@ static uint8_t amiga_depth_dark_index(float depth) {
   return g_depth_dark_indices[z];
 }
 
+#ifdef GLOOM_DOS_SDL3
+static uint8_t amiga_depth_dark_index_int(int32_t depth) {
+  int32_t z = depth;
+
+  if (!g_depth_tables_initialized) {
+    initialize_depth_tables();
+  }
+
+  if (z < 0) {
+    z = 0;
+  }
+  if (z >= GLOOM_AMIGA_MAX_Z) {
+    z = GLOOM_AMIGA_MAX_Z - 1;
+  }
+
+  return g_depth_dark_indices[z];
+}
+#endif
+
 static int depth_subtract_for_depth(float depth) {
   int z = floor_to_int(depth);
 
@@ -7866,6 +8037,7 @@ static bool clip_segment_halfspace(float *x1, float *z1, float *x2, float *z2, f
   return true;
 }
 
+#ifndef GLOOM_DOS_SDL3
 static int compare_wall_candidates(const void *a, const void *b) {
   const WallCandidate *wa = (const WallCandidate *)a;
   const WallCandidate *wb = (const WallCandidate *)b;
@@ -7874,6 +8046,15 @@ static int compare_wall_candidates(const void *a, const void *b) {
   if (wa->sort_depth > wb->sort_depth) return 1;
   return 0;
 }
+
+static void sort_wall_candidates(WallCandidate *candidates, size_t candidate_count) {
+  if (candidates == NULL || candidate_count <= 1u) {
+    return;
+  }
+
+  qsort(candidates, candidate_count, sizeof(candidates[0]), compare_wall_candidates);
+}
+#endif
 
 static size_t collect_wall_candidates_from_grid(const GloomMap *map, const GridOffsetSet *grid_offsets, float cam_x,
                                                 float cam_z, WallCandidate *out_candidates,
@@ -7932,10 +8113,12 @@ static size_t collect_wall_candidates_from_grid(const GloomMap *map, const GridO
       size_t zone_index = (size_t)main_read_be16(map->ppnt_blob + (word_offset * 2u));
       const GloomZone *zone = NULL;
       WallCandidate *candidate = NULL;
+#ifndef GLOOM_DOS_SDL3
       float mid_x = 0.0f;
       float mid_z = 0.0f;
       float dx = 0.0f;
       float dz = 0.0f;
+#endif
 
       if (zone_index >= map->zone_count || zone_index >= (size_t)GLOOM_MAX_RENDER_ZONES || seen[zone_index]) {
         continue;
@@ -7951,20 +8134,24 @@ static size_t collect_wall_candidates_from_grid(const GloomMap *map, const GridO
       }
 
       seen[zone_index] = 1u;
+      candidate = &out_candidates[candidate_count++];
+      candidate->zone_index = zone_index;
+#ifdef GLOOM_DOS_SDL3
+      candidate->sort_depth = 0.0f;
+#else
       mid_x = 0.5f * ((float)zone->x1 + (float)zone->x2);
       mid_z = 0.5f * ((float)zone->z1 + (float)zone->z2);
       dx = mid_x - cam_x;
       dz = mid_z - cam_z;
 
-      candidate = &out_candidates[candidate_count++];
-      candidate->zone_index = zone_index;
       candidate->sort_depth = dx * dx + dz * dz;
+#endif
     }
   }
 
-  if (candidate_count > 1u) {
-    qsort(out_candidates, candidate_count, sizeof(*out_candidates), compare_wall_candidates);
-  }
+#ifndef GLOOM_DOS_SDL3
+  sort_wall_candidates(out_candidates, candidate_count);
+#endif
 
   return candidate_count;
 }
@@ -7972,10 +8159,12 @@ static size_t collect_wall_candidates_from_grid(const GloomMap *map, const GridO
 static bool append_wall_candidate_unique(const GloomMap *map, WallCandidate *candidates, size_t *candidate_count,
                                          size_t candidate_capacity, size_t zone_index, float cam_x, float cam_z) {
   const GloomZone *zone = NULL;
+#ifndef GLOOM_DOS_SDL3
   float mid_x = 0.0f;
   float mid_z = 0.0f;
   float dx = 0.0f;
   float dz = 0.0f;
+#endif
   size_t i = 0u;
 
   if (map == NULL || candidates == NULL || candidate_count == NULL || zone_index >= map->zone_count ||
@@ -7998,13 +8187,18 @@ static bool append_wall_candidate_unique(const GloomMap *map, WallCandidate *can
     return true;
   }
 
+  candidates[*candidate_count].zone_index = zone_index;
+#ifdef GLOOM_DOS_SDL3
+  (void)cam_x;
+  (void)cam_z;
+  candidates[*candidate_count].sort_depth = 0.0f;
+#else
   mid_x = 0.5f * ((float)zone->x1 + (float)zone->x2);
   mid_z = 0.5f * ((float)zone->z1 + (float)zone->z2);
   dx = mid_x - cam_x;
   dz = mid_z - cam_z;
-
-  candidates[*candidate_count].zone_index = zone_index;
   candidates[*candidate_count].sort_depth = dx * dx + dz * dz;
+#endif
   *candidate_count += 1u;
   return true;
 }
@@ -8751,6 +8945,10 @@ static void free_render_framebuffer(RenderFramebuffer *framebuffer) {
   free(framebuffer->last_frame_pixels);
   free(framebuffer->depth_buffer);
   free(framebuffer->sprite_depth_buffer);
+#ifdef GLOOM_DOS_SDL3
+  free(framebuffer->depth_buffer_int);
+  free(framebuffer->sprite_depth_buffer_int);
+#endif
   free(framebuffer->filled_stamps);
   memset(framebuffer, 0, sizeof(*framebuffer));
 }
@@ -8758,6 +8956,10 @@ static void free_render_framebuffer(RenderFramebuffer *framebuffer) {
 static bool ensure_render_framebuffer(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, int width, int height) {
   float *depth_buffer = NULL;
   float *sprite_depth_buffer = NULL;
+#ifdef GLOOM_DOS_SDL3
+  int32_t *depth_buffer_int = NULL;
+  int32_t *sprite_depth_buffer_int = NULL;
+#endif
   uint32_t *filled_stamps = NULL;
   uint32_t *last_frame_pixels = NULL;
   SDL_Texture *texture = NULL;
@@ -8770,14 +8972,29 @@ static bool ensure_render_framebuffer(SDL_Renderer *renderer, RenderFramebuffer 
     return true;
   }
 
+#ifndef GLOOM_DOS_SDL3
   depth_buffer = (float *)malloc((size_t)width * sizeof(*depth_buffer));
   sprite_depth_buffer = (float *)malloc((size_t)width * sizeof(*sprite_depth_buffer));
+#else
+  depth_buffer_int = (int32_t *)malloc((size_t)width * sizeof(*depth_buffer_int));
+  sprite_depth_buffer_int = (int32_t *)malloc((size_t)width * sizeof(*sprite_depth_buffer_int));
+#endif
   filled_stamps = (uint32_t *)calloc((size_t)height, sizeof(*filled_stamps));
+#ifndef GLOOM_DOS_SDL3
   last_frame_pixels = (uint32_t *)malloc((size_t)width * (size_t)height * sizeof(*last_frame_pixels));
+#endif
+#ifdef GLOOM_DOS_SDL3
+  if (depth_buffer_int == NULL || sprite_depth_buffer_int == NULL || filled_stamps == NULL) {
+#else
   if (depth_buffer == NULL || sprite_depth_buffer == NULL || filled_stamps == NULL || last_frame_pixels == NULL) {
+#endif
     fprintf(stderr, "Cannot allocate PC renderer scratch buffers %dx%d\n", width, height);
     free(depth_buffer);
     free(sprite_depth_buffer);
+#ifdef GLOOM_DOS_SDL3
+    free(depth_buffer_int);
+    free(sprite_depth_buffer_int);
+#endif
     free(filled_stamps);
     free(last_frame_pixels);
     return false;
@@ -8788,6 +9005,10 @@ static bool ensure_render_framebuffer(SDL_Renderer *renderer, RenderFramebuffer 
     fprintf(stderr, "Cannot create PC renderer framebuffer texture %dx%d: %s\n", width, height, SDL_GetError());
     free(depth_buffer);
     free(sprite_depth_buffer);
+#ifdef GLOOM_DOS_SDL3
+    free(depth_buffer_int);
+    free(sprite_depth_buffer_int);
+#endif
     free(filled_stamps);
     free(last_frame_pixels);
     return false;
@@ -8800,6 +9021,10 @@ static bool ensure_render_framebuffer(SDL_Renderer *renderer, RenderFramebuffer 
   framebuffer->last_frame_pixels = last_frame_pixels;
   framebuffer->depth_buffer = depth_buffer;
   framebuffer->sprite_depth_buffer = sprite_depth_buffer;
+#ifdef GLOOM_DOS_SDL3
+  framebuffer->depth_buffer_int = depth_buffer_int;
+  framebuffer->sprite_depth_buffer_int = sprite_depth_buffer_int;
+#endif
   framebuffer->filled_stamps = filled_stamps;
   framebuffer->filled_stamp = 0u;
   framebuffer->width = width;
@@ -8891,6 +9116,31 @@ static void framebuffer_clear(RenderFramebuffer *framebuffer, uint32_t argb) {
   }
 }
 
+static void framebuffer_clear_row_span(RenderFramebuffer *framebuffer, int dst_y, int x, int w, uint32_t argb) {
+  uint32_t *row = NULL;
+  int col = 0;
+
+  if (framebuffer == NULL || framebuffer->pixels == NULL || dst_y < 0 || dst_y >= framebuffer->height || w <= 0) {
+    return;
+  }
+  if (x < 0) {
+    w += x;
+    x = 0;
+  }
+  if (x + w > framebuffer->width) {
+    w = framebuffer->width - x;
+  }
+  if (w <= 0) {
+    return;
+  }
+
+  row = framebuffer->pixels + ((size_t)dst_y * (size_t)framebuffer->pitch_pixels) + (size_t)x;
+  for (col = 0; col < w; ++col) {
+    row[col] = argb;
+  }
+}
+
+#ifndef GLOOM_DOS_SDL3
 static void snapshot_render_framebuffer(RenderFramebuffer *framebuffer) {
   int y = 0;
 
@@ -8905,6 +9155,7 @@ static void snapshot_render_framebuffer(RenderFramebuffer *framebuffer) {
            (size_t)framebuffer->width * sizeof(*framebuffer->last_frame_pixels));
   }
 }
+#endif
 
 static void apply_player_red_palette_rect(RenderFramebuffer *framebuffer, const AppState *state, int x, int y, int w,
                                           int h) {
@@ -8971,21 +9222,53 @@ static float projection_focal_for_viewport(int w, int h) {
 }
 
 static void render_flat_textures(RenderFramebuffer *framebuffer, const AppState *state, const FlatTextureSet *flats, int x,
-                                 int y, int w, int h, float focal, float far_depth) {
+                                 int y, int w, int h, float focal, float far_depth, float view_cos,
+                                 float view_sin) {
+#ifdef GLOOM_DOS_SDL3
+  int32_t eye_height = 0;
+  int32_t ceiling_delta = 0;
+  int32_t cam_x_fixed = 0;
+  int32_t cam_z_fixed = 0;
+  int32_t cos_fixed = 0;
+  int32_t sin_fixed = 0;
+  int focal_int = 0;
+  int far_depth_int = 0;
+  int row = 0;
+#else
   float eye_height = 0.0f;
   float ceiling_delta = 0.0f;
-  float view_cos = 0.0f;
-  float view_sin = 0.0f;
   int row = 0;
+#endif
 
   if (framebuffer == NULL || state == NULL || flats == NULL || !flats->floor.loaded || !flats->roof.loaded) {
     return;
   }
 
+#ifdef GLOOM_DOS_SDL3
+  eye_height = round_float_to_int32(-state->camera_y);
+  ceiling_delta = round_float_to_int32(255.0f + state->camera_y);
+  cam_x_fixed = dos_float_to_fixed16(state->camera_x);
+  cam_z_fixed = dos_float_to_fixed16(state->camera_z);
+  cos_fixed = round_float_to_int32(view_cos * 32767.0f);
+  sin_fixed = round_float_to_int32(view_sin * 32767.0f);
+  focal_int = round_float_to_int32(focal);
+  far_depth_int = round_float_to_int32(far_depth);
+
+  if (eye_height < 1) {
+    eye_height = 1;
+  }
+  if (ceiling_delta < 1) {
+    ceiling_delta = 1;
+  }
+  if (focal_int < 1) {
+    focal_int = 1;
+  }
+  if (far_depth_int < 2) {
+    far_depth_int = 2;
+  }
+#else
   eye_height = -state->camera_y;
   ceiling_delta = 255.0f + state->camera_y;
-  view_cos = SDL_cosf(state->camera_angle);
-  view_sin = SDL_sinf(state->camera_angle);
 
   if (eye_height < 1.0f) {
     eye_height = 1.0f;
@@ -8993,8 +9276,69 @@ static void render_flat_textures(RenderFramebuffer *framebuffer, const AppState 
   if (ceiling_delta < 1.0f) {
     ceiling_delta = 1.0f;
   }
+#endif
 
   for (row = 0; row < h; ++row) {
+#ifdef GLOOM_DOS_SDL3
+    int centered_y = row - (h / 2);
+    const FlatTexture *texture = NULL;
+    const uint8_t *texels = NULL;
+    const uint32_t *palette = NULL;
+    int32_t plane_distance = 0;
+    int32_t depth = 0;
+    int32_t depth_fixed = 0;
+    int32_t view_x_fixed = 0;
+    int32_t view_x_step_fixed = 0;
+    int32_t world_x_fixed = 0;
+    int32_t world_z_fixed = 0;
+    int32_t world_x_step_fixed = 0;
+    int32_t world_z_step_fixed = 0;
+    uint32_t *dst_row = NULL;
+    int abs_centered_y = 0;
+    int col = 0;
+
+    if (centered_y > 0) {
+      texture = &flats->floor;
+      plane_distance = eye_height;
+      abs_centered_y = centered_y;
+    } else if (centered_y < 0) {
+      texture = &flats->roof;
+      plane_distance = ceiling_delta;
+      abs_centered_y = -centered_y;
+    } else {
+      framebuffer_clear_row_span(framebuffer, y + row, x, w, 0xFF000000u);
+      continue;
+    }
+
+    depth = (int32_t)(((int64_t)plane_distance * (int64_t)focal_int) / (int64_t)abs_centered_y);
+    if (depth < 1 || depth >= far_depth_int) {
+      framebuffer_clear_row_span(framebuffer, y + row, x, w, 0xFF000000u);
+      continue;
+    }
+
+    texels = texture->texels;
+    palette = texture->shaded_palette[amiga_depth_dark_index_int(depth)];
+    depth_fixed = depth << 16;
+    view_x_fixed = (int32_t)((((int64_t)(0 - (w / 2)) * (int64_t)depth) << 16) / (int64_t)focal_int);
+    view_x_step_fixed = (int32_t)(((int64_t)depth << 16) / (int64_t)focal_int);
+    world_x_fixed = cam_x_fixed + (int32_t)(((int64_t)view_x_fixed * (int64_t)cos_fixed) >> 15) +
+                    (int32_t)(((int64_t)depth_fixed * (int64_t)sin_fixed) >> 15);
+    world_z_fixed = cam_z_fixed - (int32_t)(((int64_t)view_x_fixed * (int64_t)sin_fixed) >> 15) +
+                    (int32_t)(((int64_t)depth_fixed * (int64_t)cos_fixed) >> 15);
+    world_x_step_fixed = (int32_t)(((int64_t)view_x_step_fixed * (int64_t)cos_fixed) >> 15);
+    world_z_step_fixed = -(int32_t)(((int64_t)view_x_step_fixed * (int64_t)sin_fixed) >> 15);
+    dst_row = framebuffer->pixels + ((size_t)(y + row) * (size_t)framebuffer->pitch_pixels + (size_t)x);
+
+    for (col = 0; col < w; ++col) {
+      int tx = dos_fixed16_floor_to_int(world_x_fixed) & (GLOOM_FLAT_TEXTURE_SIZE - 1);
+      int tz = dos_fixed16_floor_to_int(world_z_fixed) & (GLOOM_FLAT_TEXTURE_SIZE - 1);
+      uint8_t palette_index = texels[(tx * GLOOM_FLAT_TEXTURE_SIZE) + tz];
+
+      dst_row[col] = palette[palette_index];
+      world_x_fixed += world_x_step_fixed;
+      world_z_fixed += world_z_step_fixed;
+    }
+#else
     float centered_y = (float)(row - (h / 2));
     const FlatTexture *texture = NULL;
     const uint8_t *texels = NULL;
@@ -9018,10 +9362,12 @@ static void render_flat_textures(RenderFramebuffer *framebuffer, const AppState 
       plane_distance = ceiling_delta;
       depth = (plane_distance * focal) / -centered_y;
     } else {
+      framebuffer_clear_row_span(framebuffer, y + row, x, w, 0xFF000000u);
       continue;
     }
 
     if (depth < 1.0f || depth >= far_depth) {
+      framebuffer_clear_row_span(framebuffer, y + row, x, w, 0xFF000000u);
       continue;
     }
 
@@ -9034,27 +9380,6 @@ static void render_flat_textures(RenderFramebuffer *framebuffer, const AppState 
     world_z_step = -view_x_step * view_sin;
     palette = texture->shaded_palette[amiga_depth_dark_index(depth)];
 
-#ifdef GLOOM_DOS_SDL3
-    {
-      uint32_t *dst_row =
-          framebuffer->pixels + ((size_t)(y + row) * (size_t)framebuffer->pitch_pixels + (size_t)x);
-      int32_t world_x_fixed = dos_float_to_fixed16(world_x);
-      int32_t world_z_fixed = dos_float_to_fixed16(world_z);
-      int32_t world_x_step_fixed = dos_float_to_fixed16(world_x_step);
-      int32_t world_z_step_fixed = dos_float_to_fixed16(world_z_step);
-
-      for (col = 0; col < w; ++col) {
-        int tx = dos_fixed16_floor_to_int(world_x_fixed) & (GLOOM_FLAT_TEXTURE_SIZE - 1);
-        int tz = dos_fixed16_floor_to_int(world_z_fixed) & (GLOOM_FLAT_TEXTURE_SIZE - 1);
-        uint8_t palette_index = texels[(tx * GLOOM_FLAT_TEXTURE_SIZE) + tz];
-        uint32_t argb = palette[palette_index];
-
-        dst_row[col] = 0xFF000000u | (argb & 0x00FFFFFFu);
-        world_x_fixed += world_x_step_fixed;
-        world_z_fixed += world_z_step_fixed;
-      }
-    }
-#else
     for (col = 0; col < w; ++col) {
       size_t dst = (size_t)(y + row) * (size_t)framebuffer->pitch_pixels + (size_t)(x + col);
       int tx = floor_to_int(world_x) & (GLOOM_FLAT_TEXTURE_SIZE - 1);
@@ -9069,6 +9394,310 @@ static void render_flat_textures(RenderFramebuffer *framebuffer, const AppState 
 #endif
   }
 }
+
+#ifdef GLOOM_DOS_SDL3
+static int32_t dos_mul_shift15(int32_t a, int32_t b) {
+  return (a * b) >> 15;
+}
+
+static int dos_project_view_x(int32_t view_x, int32_t view_z, int focal, int half_width) {
+  if (view_z == 0) {
+    return view_x < 0 ? -32768 : 32767;
+  }
+
+  return half_width + (int)((view_x * focal) / view_z);
+}
+
+static void render_wall_columns_dos_fixed(RenderFramebuffer *framebuffer, const AppState *state,
+                                          const WallTextureSet *wall_textures,
+                                          const WallCandidate *wall_candidates, size_t wall_candidate_count, int x,
+                                          int y, int w, int h, int horizon_y, float view_cos, float view_sin,
+                                          float focal) {
+  DosSceneWall scene_walls[GLOOM_MAX_WALL_CANDIDATES];
+  int32_t *depth_buffer = framebuffer->depth_buffer_int;
+  uint32_t *filled_stamps = framebuffer->filled_stamps;
+  size_t scene_wall_count = 0u;
+  size_t i = 0u;
+  int focal_int = round_float_to_int32(focal);
+  int half_width = w / 2;
+  int32_t cam_x = round_float_to_int32(state->camera_x);
+  int32_t cam_z = round_float_to_int32(state->camera_z);
+  int32_t cam_y = round_float_to_int32(state->camera_y);
+  int32_t cos_fixed = round_float_to_int32(view_cos * 32767.0f);
+  int32_t sin_fixed = round_float_to_int32(view_sin * 32767.0f);
+
+  if (focal_int < 1) {
+    focal_int = 1;
+  }
+
+  for (i = 0u; i < wall_candidate_count; ++i) {
+    const GloomZone *z = &state->map.zones[wall_candidates[i].zone_index];
+    int32_t x1 = (int32_t)z->x1 - cam_x;
+    int32_t z1 = (int32_t)z->z1 - cam_z;
+    int32_t x2 = (int32_t)z->x2 - cam_x;
+    int32_t z2 = (int32_t)z->z2 - cam_z;
+    int32_t vx1 = dos_mul_shift15(x1, cos_fixed) - dos_mul_shift15(z1, sin_fixed);
+    int32_t vz1 = dos_mul_shift15(x1, sin_fixed) + dos_mul_shift15(z1, cos_fixed);
+    int32_t vx2 = dos_mul_shift15(x2, cos_fixed) - dos_mul_shift15(z2, sin_fixed);
+    int32_t vz2 = dos_mul_shift15(x2, sin_fixed) + dos_mul_shift15(z2, cos_fixed);
+    int32_t face_a = vz1 - vz2;
+    int32_t face_b = vx2 - vx1;
+    int64_t face_c = ((int64_t)vx1 * (int64_t)face_a) + ((int64_t)vz1 * (int64_t)face_b);
+    DosSceneWall *scene_wall = NULL;
+
+    if (vz1 <= 0 && vz2 <= 0) {
+      continue;
+    }
+    if (vz1 >= GLOOM_AMIGA_MAX_Z && vz2 >= GLOOM_AMIGA_MAX_Z) {
+      continue;
+    }
+    if (face_c < 0) {
+      continue;
+    }
+    if (scene_wall_count >= sizeof(scene_walls) / sizeof(scene_walls[0])) {
+      break;
+    }
+
+    scene_wall = &scene_walls[scene_wall_count++];
+    scene_wall->zone = z;
+    scene_wall->vx1 = vx1;
+    scene_wall->vz1 = vz1;
+    scene_wall->vx2 = vx2;
+    scene_wall->vz2 = vz2;
+    scene_wall->sz = vz2 - vz1;
+    scene_wall->column_min = 0;
+    scene_wall->column_max = w - 1;
+
+    if (vz1 > 1 && vz2 > 1) {
+      int sx1 = dos_project_view_x(vx1, vz1, focal_int, half_width);
+      int sx2 = dos_project_view_x(vx2, vz2, focal_int, half_width);
+      int min_x = sx1 < sx2 ? sx1 : sx2;
+      int max_x = sx1 > sx2 ? sx1 : sx2;
+
+      scene_wall->column_min = min_x - 2;
+      scene_wall->column_max = max_x + 2;
+      if (scene_wall->column_min < 0) scene_wall->column_min = 0;
+      if (scene_wall->column_max > w - 1) scene_wall->column_max = w - 1;
+    }
+
+    if (scene_wall->column_min > scene_wall->column_max) {
+      scene_wall_count -= 1u;
+    }
+  }
+
+  {
+    int32_t ray_x = ((-half_width * 65536) / focal_int);
+    int32_t ray_x_step = 65536 / focal_int;
+
+    for (i = 0u; i < (size_t)w; ++i, ray_x += ray_x_step) {
+      int screen_x = x + (int)i;
+      DosRayWallHit hits[GLOOM_MAX_COLUMN_WALL_HITS];
+      size_t hit_count = 0u;
+      size_t wall_index = 0u;
+      size_t hit_index = 0u;
+      uint32_t filled_stamp = 0u;
+
+      framebuffer->filled_stamp += 1u;
+      if (framebuffer->filled_stamp == 0u) {
+        memset(filled_stamps, 0, (size_t)h * sizeof(*filled_stamps));
+        framebuffer->filled_stamp = 1u;
+      }
+      filled_stamp = framebuffer->filled_stamp;
+
+      for (wall_index = 0u; wall_index < scene_wall_count; ++wall_index) {
+        const DosSceneWall *wall = &scene_walls[wall_index];
+        int32_t side1 = wall->vx1 - ((wall->vz1 * ray_x) >> 16);
+        int32_t side2 = wall->vx2 - ((wall->vz2 * ray_x) >> 16);
+        int32_t side_delta = side2 - side1;
+        int32_t depth = 0;
+        int32_t wall_u = 0;
+
+        if ((int)i < wall->column_min || (int)i > wall->column_max || side_delta == 0) {
+          continue;
+        }
+        if ((side1 < 0 && side2 < 0) || (side1 > 0 && side2 > 0)) {
+          continue;
+        }
+
+        wall_u = (-side1 * 65536) / side_delta;
+        if (wall_u < -33 || wall_u > 0x10000 + 33) {
+          continue;
+        }
+        wall_u = dos_fixed16_clamp_unit(wall_u);
+
+        depth = wall->vz1 + ((wall->sz * wall_u) >> 16);
+        if (depth < 1 || depth >= GLOOM_AMIGA_MAX_Z) {
+          continue;
+        }
+
+        if (wall->zone->event_id > 0) {
+          int32_t open_threshold = (int32_t)((uint16_t)wall->zone->event_id << 1u);
+
+          if (wall_u < open_threshold) {
+            continue;
+          }
+        }
+
+        {
+          DosRayWallHit hit;
+          size_t insert_at = hit_count;
+
+          hit.wall = wall;
+          hit.depth = depth;
+          hit.wall_u = wall_u;
+
+          while (insert_at > 0u && hits[insert_at - 1u].depth > hit.depth) {
+            if (insert_at < (size_t)GLOOM_MAX_COLUMN_WALL_HITS) {
+              hits[insert_at] = hits[insert_at - 1u];
+            }
+            insert_at -= 1u;
+          }
+
+          if (insert_at < (size_t)GLOOM_MAX_COLUMN_WALL_HITS) {
+            hits[insert_at] = hit;
+            if (hit_count < (size_t)GLOOM_MAX_COLUMN_WALL_HITS) {
+              hit_count += 1u;
+            }
+          }
+        }
+      }
+
+      for (hit_index = 0u; hit_index < hit_count; ++hit_index) {
+        const DosRayWallHit *hit = &hits[hit_index];
+        int32_t wall_top = horizon_y + (((GLOOM_WALL_TOP_Y - cam_y) * focal_int) / hit->depth);
+        int32_t wall_bottom = horizon_y + (((GLOOM_WALL_BOTTOM_Y - cam_y) * focal_int) / hit->depth);
+        int32_t wall_height = wall_bottom - wall_top;
+        int y0 = (int)wall_top;
+        int y1 = (int)wall_bottom;
+        int draw_y = 0;
+        int dark_index = 0;
+        int subtract = 0;
+        bool fast_wall_column = false;
+        bool transparent_wall_column = false;
+        const uint8_t *wall_texels = NULL;
+        const uint32_t *wall_palette = NULL;
+        size_t wall_texel_base = 0u;
+
+        if (wall_height < 1) {
+          int32_t center_y = (wall_top + wall_bottom) / 2;
+
+          wall_top = center_y;
+          wall_bottom = center_y + 1;
+          wall_height = 1;
+          y0 = (int)wall_top;
+          y1 = (int)wall_bottom;
+        }
+
+        if (y0 < y) y0 = y;
+        if (y1 > y + h - 1) y1 = y + h - 1;
+        if (y0 > y1 || wall_height <= 0) {
+          continue;
+        }
+
+        dark_index = (int)amiga_depth_dark_index_int(hit->depth);
+        subtract = dark_index * 17;
+
+        {
+          const GloomZone *zone = hit->wall->zone;
+          int tile_index = 0;
+          uint8_t texture_index = 0u;
+          size_t screen_index = 0u;
+          size_t local_index = 0u;
+          size_t tx = 0u;
+
+          if (zone != NULL) {
+            zone_wall_texture_coordinates_fixed16(zone, hit->wall_u, &tile_index, &tx);
+            texture_index = remap_wall_texture_index(state, zone->textures[tile_index]);
+            screen_index = texture_index / (uint8_t)GLOOM_TEXTURES_PER_SCREEN;
+            local_index = texture_index % (uint8_t)GLOOM_TEXTURES_PER_SCREEN;
+            if (screen_index < (size_t)GLOOM_TEXTURE_SCREENS && wall_textures->screens[screen_index].loaded &&
+                wall_textures->screens[screen_index].texels != NULL &&
+                local_index < wall_textures->screens[screen_index].texture_count) {
+              const WallTextureScreen *screen = &wall_textures->screens[screen_index];
+
+              wall_texels = screen->texels;
+              wall_palette = screen->shaded_palette[dark_index];
+              wall_texel_base = local_index * ((size_t)GLOOM_TEXTURE_WIDTH * (size_t)GLOOM_TEXTURE_HEIGHT) + tx;
+              transparent_wall_column =
+                  screen->column_flags != NULL &&
+                  screen->column_flags[(local_index * (size_t)GLOOM_TEXTURE_WIDTH) + tx] != 0u;
+              fast_wall_column = true;
+            }
+          }
+        }
+
+        {
+          int32_t wall_v_fixed = ((((int32_t)y0 - wall_top) << 16) + 32768) / wall_height;
+          int32_t wall_v_step_fixed = (int32_t)(0x10000 / wall_height);
+          int32_t tex_y_fixed = wall_v_fixed * (GLOOM_TEXTURE_HEIGHT - 1);
+          int32_t tex_y_step_fixed = wall_v_step_fixed * (GLOOM_TEXTURE_HEIGHT - 1);
+
+          for (draw_y = y0; draw_y <= y1; ++draw_y) {
+            int32_t wall_v_current_fixed = wall_v_fixed;
+            uint32_t argb = 0u;
+
+            wall_v_fixed += wall_v_step_fixed;
+            if (filled_stamps[draw_y - y] == filled_stamp) {
+              tex_y_fixed += tex_y_step_fixed;
+              continue;
+            }
+
+            if (fast_wall_column) {
+              int32_t tex_y_clamped = tex_y_fixed;
+              size_t ty = 0u;
+              uint8_t palette_index = 0u;
+
+              if (tex_y_clamped < 0) {
+                tex_y_clamped = 0;
+              }
+              if (tex_y_clamped > ((GLOOM_TEXTURE_HEIGHT - 1) << 16)) {
+                tex_y_clamped = (GLOOM_TEXTURE_HEIGHT - 1) << 16;
+              }
+              ty = (size_t)(tex_y_clamped >> 16);
+              palette_index = wall_texels[wall_texel_base + (ty * (size_t)GLOOM_TEXTURE_WIDTH)];
+
+              if (transparent_wall_column && palette_index == 0u) {
+                tex_y_fixed += tex_y_step_fixed;
+                continue;
+              }
+              argb = wall_palette[palette_index];
+              framebuffer->pixels[(size_t)draw_y * (size_t)framebuffer->pitch_pixels + (size_t)screen_x] =
+                  0xFF000000u | (argb & 0x00FFFFFFu);
+              filled_stamps[draw_y - y] = filled_stamp;
+              if (hit->depth < depth_buffer[i]) {
+                depth_buffer[i] = hit->depth;
+              }
+              tex_y_fixed += tex_y_step_fixed;
+              continue;
+            } else {
+              uint8_t alpha = 0u;
+              float wall_u = (float)hit->wall_u / 65536.0f;
+              float wall_v = (float)wall_v_current_fixed / 65536.0f;
+
+              argb = sample_zone_wall_texture_argb(wall_textures, state, hit->wall->zone, wall_u, wall_v);
+              argb = shade_argb_subtract(argb, subtract);
+              tex_y_fixed += tex_y_step_fixed;
+              alpha = (uint8_t)(argb >> 24);
+
+              if (alpha == 0u) {
+                continue;
+              }
+            }
+
+            framebuffer->pixels[(size_t)draw_y * (size_t)framebuffer->pitch_pixels + (size_t)screen_x] =
+                0xFF000000u | (argb & 0x00FFFFFFu);
+            filled_stamps[draw_y - y] = filled_stamp;
+
+            if (hit->depth < depth_buffer[i]) {
+              depth_buffer[i] = hit->depth;
+            }
+          }
+        }
+      }
+    }
+  }
+}
+#endif
 
 static void append_player_debug_sprite(const AppState *state, const ObjectVisualSet *object_visuals,
                                        const RuntimePlayerState *player, int16_t object_type, DebugSprite *sprites,
@@ -9131,9 +9760,9 @@ static void append_player_debug_sprite(const AppState *state, const ObjectVisual
   sp->screen_y = (float)horizon_y + (top_view_y / svz) * focal;
   sp->screen_w = ((float)frame->width * scale * focal) / svz;
   sp->screen_h = ((float)frame->height * scale * focal) / svz;
-  sp->depth = svz;
+  bind_debug_sprite_depth(sp, svz);
   sp->source_pad = 0;
-  sp->frame = frame;
+  bind_debug_sprite_frame(sp, visual, frame);
 
   if (sp->screen_w >= 1.0f && sp->screen_h >= 1.0f) {
     *sprite_write += 1u;
@@ -9168,14 +9797,23 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
   float focal = projection_focal_for_viewport(w, h);
   float frustum_ratio = ((float)w * 0.5f) / focal;
   float far_depth = (float)GLOOM_AMIGA_MAX_Z;
+#ifdef GLOOM_DOS_SDL3
+  int32_t *depth_buffer_int = NULL;
+  int32_t *sprite_depth_buffer_int = NULL;
+#else
   float *depth_buffer = NULL;
   float *sprite_depth_buffer = NULL;
+#endif
   uint32_t *filled_stamps = NULL;
   DebugSprite debug_sprites[GLOOM_MAX_DEBUG_SPRITES];
   WallCandidate wall_candidates[GLOOM_MAX_WALL_CANDIDATES];
+#ifndef GLOOM_DOS_SDL3
   SceneWall scene_walls[GLOOM_MAX_WALL_CANDIDATES];
+#endif
   size_t wall_candidate_count = 0;
+#ifndef GLOOM_DOS_SDL3
   size_t scene_wall_count = 0;
+#endif
   size_t sprite_write = 0;
   size_t i = 0;
   int horizon_y = y + (h / 2);
@@ -9188,10 +9826,19 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
     return;
   }
 
+#ifdef GLOOM_DOS_SDL3
+  depth_buffer_int = framebuffer != NULL ? framebuffer->depth_buffer_int : NULL;
+  sprite_depth_buffer_int = framebuffer != NULL ? framebuffer->sprite_depth_buffer_int : NULL;
+#else
   depth_buffer = framebuffer != NULL ? framebuffer->depth_buffer : NULL;
   sprite_depth_buffer = framebuffer != NULL ? framebuffer->sprite_depth_buffer : NULL;
+#endif
   filled_stamps = framebuffer != NULL ? framebuffer->filled_stamps : NULL;
+#ifdef GLOOM_DOS_SDL3
+  if (depth_buffer_int == NULL || sprite_depth_buffer_int == NULL || filled_stamps == NULL) {
+#else
   if (depth_buffer == NULL || sprite_depth_buffer == NULL || filled_stamps == NULL) {
+#endif
     return;
   }
   memset(debug_sprites, 0, sizeof(debug_sprites));
@@ -9201,17 +9848,26 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
                                         sizeof(wall_candidates) / sizeof(wall_candidates[0]));
   append_runtime_rotpoly_wall_candidates(state, wall_candidates, &wall_candidate_count,
                                          sizeof(wall_candidates) / sizeof(wall_candidates[0]), cam_x, cam_z);
-  if (wall_candidate_count > 1u) {
-    qsort(wall_candidates, wall_candidate_count, sizeof(wall_candidates[0]), compare_wall_candidates);
-  }
+#ifndef GLOOM_DOS_SDL3
+  sort_wall_candidates(wall_candidates, wall_candidate_count);
+#endif
 
-  render_flat_textures(framebuffer, state, flats, x, y, w, h, focal, far_depth);
+  render_flat_textures(framebuffer, state, flats, x, y, w, h, focal, far_depth, view_cos, view_sin);
 
   for (i = 0; i < (size_t)w; ++i) {
+#ifdef GLOOM_DOS_SDL3
+    depth_buffer_int[i] = INT32_MAX;
+    sprite_depth_buffer_int[i] = INT32_MAX;
+#else
     depth_buffer[i] = 1.0e9f;
     sprite_depth_buffer[i] = 1.0e9f;
+#endif
   }
 
+#ifdef GLOOM_DOS_SDL3
+  render_wall_columns_dos_fixed(framebuffer, state, wall_textures, wall_candidates, wall_candidate_count, x, y, w, h,
+                                horizon_y, view_cos, view_sin, focal);
+#else
   for (i = 0; i < wall_candidate_count; ++i) {
     const GloomZone *z = &state->map.zones[wall_candidates[i].zone_index];
     float x1 = (float)z->x1 - cam_x;
@@ -9495,6 +10151,7 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
 #endif
     }
   }
+#endif
 
   if (state->map.object_spawn_count > 0u && object_visuals != NULL) {
     for (i = 0; i < state->map.object_spawn_count && sprite_write < GLOOM_MAX_DEBUG_SPRITES; ++i) {
@@ -9563,9 +10220,9 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
         sp->screen_y = (float)horizon_y + (top_view_y / svz) * focal;
         sp->screen_w = ((float)frame->width * scale * focal) / svz;
         sp->screen_h = ((float)frame->height * scale * focal) / svz;
-        sp->depth = svz;
+        bind_debug_sprite_depth(sp, svz);
         sp->source_pad = 0;
-        sp->frame = frame;
+        bind_debug_sprite_frame(sp, visual, frame);
 
         if (sp->screen_w >= 1.0f && sp->screen_h >= 1.0f) {
           sprite_write += 1u;
@@ -9641,9 +10298,9 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
       debug_sprites[sprite_write].screen_y = (float)horizon_y + ((top_view_y - source_pad_view) / svz) * focal;
       debug_sprites[sprite_write].screen_w = (padded_width * focal) / svz;
       debug_sprites[sprite_write].screen_h = (padded_height * focal) / svz;
-      debug_sprites[sprite_write].depth = svz;
+      bind_debug_sprite_depth(&debug_sprites[sprite_write], svz);
       debug_sprites[sprite_write].source_pad = source_pad;
-      debug_sprites[sprite_write].frame = frame;
+      bind_debug_sprite_frame(&debug_sprites[sprite_write], visual, frame);
 
       if (debug_sprites[sprite_write].screen_w >= 1.0f && debug_sprites[sprite_write].screen_h >= 1.0f) {
         sprite_write += 1u;
@@ -9696,9 +10353,9 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
       debug_sprites[sprite_write].screen_y = (float)horizon_y + (top_view_y / svz) * focal;
       debug_sprites[sprite_write].screen_w = ((float)frame->width * scale * focal) / svz;
       debug_sprites[sprite_write].screen_h = ((float)frame->height * scale * focal) / svz;
-      debug_sprites[sprite_write].depth = svz;
+      bind_debug_sprite_depth(&debug_sprites[sprite_write], svz);
       debug_sprites[sprite_write].source_pad = 0;
-      debug_sprites[sprite_write].frame = frame;
+      bind_debug_sprite_frame(&debug_sprites[sprite_write], visual, frame);
 
       if (debug_sprites[sprite_write].screen_w >= 1.0f && debug_sprites[sprite_write].screen_h >= 1.0f) {
         sprite_write += 1u;
@@ -9753,9 +10410,9 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
       debug_sprites[sprite_write].screen_y = (float)horizon_y + (top_view_y / svz) * focal;
       debug_sprites[sprite_write].screen_w = ((float)frame->width * scale * focal) / svz;
       debug_sprites[sprite_write].screen_h = ((float)frame->height * scale * focal) / svz;
-      debug_sprites[sprite_write].depth = svz;
+      bind_debug_sprite_depth(&debug_sprites[sprite_write], svz);
       debug_sprites[sprite_write].source_pad = 0;
-      debug_sprites[sprite_write].frame = frame;
+      bind_debug_sprite_frame(&debug_sprites[sprite_write], visual, frame);
 
       if (debug_sprites[sprite_write].screen_w >= 1.0f && debug_sprites[sprite_write].screen_h >= 1.0f) {
         sprite_write += 1u;
@@ -9808,9 +10465,9 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
       debug_sprites[sprite_write].screen_y = (float)horizon_y + (top_view_y / svz) * focal;
       debug_sprites[sprite_write].screen_w = ((float)frame->width * scale * focal) / svz;
       debug_sprites[sprite_write].screen_h = ((float)frame->height * scale * focal) / svz;
-      debug_sprites[sprite_write].depth = svz;
+      bind_debug_sprite_depth(&debug_sprites[sprite_write], svz);
       debug_sprites[sprite_write].source_pad = 0;
-      debug_sprites[sprite_write].frame = frame;
+      bind_debug_sprite_frame(&debug_sprites[sprite_write], visual, frame);
 
       if (debug_sprites[sprite_write].screen_w >= 1.0f && debug_sprites[sprite_write].screen_h >= 1.0f) {
         sprite_write += 1u;
@@ -9859,10 +10516,28 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
   }
 
   for (i = 0; i < (size_t)w; ++i) {
+#ifdef GLOOM_DOS_SDL3
+    sprite_depth_buffer_int[i] = depth_buffer_int[i];
+#else
     sprite_depth_buffer[i] = depth_buffer[i];
+#endif
   }
 
   if (sprite_write > 1u) {
+#ifdef GLOOM_DOS_SDL3
+    size_t a = 0;
+
+    for (a = 1u; a < sprite_write; ++a) {
+      DebugSprite sprite = debug_sprites[a];
+      size_t insert_at = a;
+
+      while (insert_at > 0u && debug_sprites[insert_at - 1u].depth_int < sprite.depth_int) {
+        debug_sprites[insert_at] = debug_sprites[insert_at - 1u];
+        insert_at -= 1u;
+      }
+      debug_sprites[insert_at] = sprite;
+    }
+#else
     size_t a = 0;
     for (a = 0; a + 1u < sprite_write; ++a) {
       size_t b = 0;
@@ -9874,6 +10549,7 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
         }
       }
     }
+#endif
   }
 
   for (i = 0; i < sprite_write; ++i) {
@@ -9884,8 +10560,20 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
     int y0 = 0;
     int y1 = 0;
     int screen_x = 0;
+#ifndef GLOOM_DOS_SDL3
     int subtract = 0;
+#endif
 
+#ifdef GLOOM_DOS_SDL3
+    if (frame == NULL || sp->screen_w_fixed < 0x10000 || sp->screen_h_fixed < 0x10000) {
+      continue;
+    }
+
+    x0 = dos_fixed16_floor_to_int(sp->screen_x_fixed);
+    x1 = dos_fixed16_floor_to_int(sp->screen_x_fixed + sp->screen_w_fixed);
+    y0 = dos_fixed16_floor_to_int(sp->screen_y_fixed);
+    y1 = dos_fixed16_floor_to_int(sp->screen_y_fixed + sp->screen_h_fixed);
+#else
     if (frame == NULL || sp->screen_w < 1.0f || sp->screen_h < 1.0f) {
       continue;
     }
@@ -9894,6 +10582,7 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
     x1 = (int)(sp->screen_x + sp->screen_w);
     y0 = (int)sp->screen_y;
     y1 = (int)(sp->screen_y + sp->screen_h);
+#endif
 
     if (x1 < x || x0 > x + w - 1 || y1 < y || y0 > y + h - 1) {
       continue;
@@ -9904,6 +10593,90 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
     if (y0 < y) y0 = y;
     if (y1 > y + h - 1) y1 = y + h - 1;
 
+#ifdef GLOOM_DOS_SDL3
+    {
+      int64_t tu_numerator_fixed = (((int64_t)x0 << 16) + 32768) - (int64_t)sp->screen_x_fixed;
+      int64_t tv_numerator_fixed = (((int64_t)y0 << 16) + 32768) - (int64_t)sp->screen_y_fixed;
+      int32_t tu_fixed = dos_div_fixed16(tu_numerator_fixed, sp->screen_w_fixed);
+      int32_t tu_step_fixed = dos_div_fixed16(0x10000, sp->screen_w_fixed);
+      int32_t tv_start_fixed = dos_div_fixed16(tv_numerator_fixed, sp->screen_h_fixed);
+      int32_t tv_step_fixed = dos_div_fixed16(0x10000, sp->screen_h_fixed);
+      int padded_width = frame->width + (sp->source_pad * 2);
+      int padded_height = frame->height + (sp->source_pad * 2);
+      int32_t source_x_fixed = sp->source_pad > 0 ? (tu_fixed * padded_width) - ((int32_t)sp->source_pad << 16)
+                                                   : tu_fixed * (frame->width - 1);
+      int32_t source_x_step_fixed =
+          sp->source_pad > 0 ? tu_step_fixed * padded_width : tu_step_fixed * (frame->width - 1);
+      int32_t source_y_start_fixed =
+          sp->source_pad > 0 ? (tv_start_fixed * padded_height) - ((int32_t)sp->source_pad << 16)
+                             : tv_start_fixed * (frame->height - 1);
+      int32_t source_y_step_fixed =
+          sp->source_pad > 0 ? tv_step_fixed * padded_height : tv_step_fixed * (frame->height - 1);
+      int dark_index = (int)amiga_depth_dark_index_int(sp->depth_int);
+      const uint8_t *indexed_pixels = frame->indexed_pixels;
+      const uint32_t *sprite_palette = sp->shaded_palette != NULL ? sp->shaded_palette[dark_index] : NULL;
+
+      if (indexed_pixels == NULL || sprite_palette == NULL) {
+        continue;
+      }
+
+      for (screen_x = x0; screen_x <= x1; ++screen_x, source_x_fixed += source_x_step_fixed) {
+        int rel_x = screen_x - x;
+        int draw_y = 0;
+        int sx = 0;
+        bool column_drawn = false;
+        int32_t source_y_fixed = source_y_start_fixed;
+
+        if (sp->depth_int >= sprite_depth_buffer_int[rel_x]) {
+          continue;
+        }
+
+        if (sp->source_pad > 0) {
+          if (source_x_fixed < 0 || source_x_fixed >= ((int32_t)frame->width << 16)) {
+            continue;
+          }
+          sx = source_x_fixed >> 16;
+        } else {
+          if (source_x_fixed < 0 || source_x_fixed > ((int32_t)(frame->width - 1) << 16)) {
+            continue;
+          }
+          sx = source_x_fixed >> 16;
+        }
+
+        for (draw_y = y0; draw_y <= y1; ++draw_y, source_y_fixed += source_y_step_fixed) {
+          uint8_t palette_index = 0u;
+          uint32_t argb = 0;
+          int sy = 0;
+
+          if (sp->source_pad > 0) {
+            if (source_y_fixed < 0 || source_y_fixed >= ((int32_t)frame->height << 16)) {
+              continue;
+            }
+            sy = source_y_fixed >> 16;
+          } else {
+            if (source_y_fixed < 0 || source_y_fixed > ((int32_t)(frame->height - 1) << 16)) {
+              continue;
+            }
+            sy = source_y_fixed >> 16;
+          }
+
+          palette_index = indexed_pixels[(size_t)sy * (size_t)frame->width + (size_t)sx];
+          if (palette_index == 0u) {
+            continue;
+          }
+
+          argb = sprite_palette[palette_index];
+          framebuffer->pixels[(size_t)draw_y * (size_t)framebuffer->pitch_pixels + (size_t)screen_x] =
+              0xFF000000u | (argb & 0x00FFFFFFu);
+          column_drawn = true;
+        }
+
+        if (column_drawn) {
+          sprite_depth_buffer_int[rel_x] = sp->depth_int;
+        }
+      }
+    }
+#else
     subtract = depth_subtract_for_depth(sp->depth);
     for (screen_x = x0; screen_x <= x1; ++screen_x) {
       int rel_x = screen_x - x;
@@ -9960,6 +10733,7 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
         sprite_depth_buffer[rel_x] = sp->depth;
       }
     }
+#endif
   }
 
 }
@@ -10032,6 +10806,7 @@ static void render_argb_pixels_scaled(RenderFramebuffer *framebuffer, const uint
   }
 }
 
+#ifndef GLOOM_DOS_SDL3
 static void render_object_frame_scaled(RenderFramebuffer *framebuffer, const ObjectFrame *frame, int screen_x,
                                        int screen_y, int scale) {
   if (frame == NULL) {
@@ -10040,6 +10815,61 @@ static void render_object_frame_scaled(RenderFramebuffer *framebuffer, const Obj
 
   render_argb_pixels_scaled(framebuffer, frame->argb_pixels, frame->width, frame->height, screen_x, screen_y, scale);
 }
+#endif
+
+#ifdef GLOOM_DOS_SDL3
+static void render_object_frame_scaled_dos_indexed(RenderFramebuffer *framebuffer, const ObjectVisual *visual,
+                                                   const ObjectFrame *frame, int screen_x, int screen_y, int scale) {
+  const uint32_t *palette = visual != NULL ? visual->shaded_palette[0] : NULL;
+  int sy = 0;
+
+  if (framebuffer == NULL || framebuffer->pixels == NULL || visual == NULL || frame == NULL ||
+      frame->indexed_pixels == NULL || palette == NULL || frame->width <= 0 || frame->height <= 0 || scale <= 0) {
+    return;
+  }
+
+  if (screen_x + (frame->width * scale) <= 0 || screen_y + (frame->height * scale) <= 0 ||
+      screen_x >= framebuffer->width || screen_y >= framebuffer->height) {
+    return;
+  }
+
+  for (sy = 0; sy < frame->height; ++sy) {
+    int dst_y0 = screen_y + (sy * scale);
+    int dst_y1 = dst_y0 + scale;
+    int sx = 0;
+
+    if (dst_y1 <= 0 || dst_y0 >= framebuffer->height) {
+      continue;
+    }
+    if (dst_y0 < 0) dst_y0 = 0;
+    if (dst_y1 > framebuffer->height) dst_y1 = framebuffer->height;
+
+    for (sx = 0; sx < frame->width; ++sx) {
+      uint8_t palette_index = frame->indexed_pixels[(size_t)sy * (size_t)frame->width + (size_t)sx];
+      uint32_t argb = 0u;
+      int dst_x0 = screen_x + (sx * scale);
+      int dst_x1 = dst_x0 + scale;
+      int draw_y = 0;
+
+      if (palette_index == 0u || dst_x1 <= 0 || dst_x0 >= framebuffer->width) {
+        continue;
+      }
+      if (dst_x0 < 0) dst_x0 = 0;
+      if (dst_x1 > framebuffer->width) dst_x1 = framebuffer->width;
+
+      argb = palette[palette_index];
+      for (draw_y = dst_y0; draw_y < dst_y1; ++draw_y) {
+        uint32_t *row = framebuffer->pixels + ((size_t)draw_y * (size_t)framebuffer->pitch_pixels);
+        int draw_x = 0;
+
+        for (draw_x = dst_x0; draw_x < dst_x1; ++draw_x) {
+          row[draw_x] = argb;
+        }
+      }
+    }
+  }
+}
+#endif
 
 static size_t player_weapon_muzzle_frame_index(const AppState *state) {
   static const uint8_t flash_by_weapon[GLOOM_WEAPON_COUNT] = {0u, 1u, 1u, 2u, 2u};
@@ -10139,13 +10969,21 @@ static void render_player_weapon(RenderFramebuffer *framebuffer, const AppState 
           round_float_to_int32(muzzle_anchor_y -
                                (float)((muzzle_frame->handle_y + player_weapon_muzzle_frame_y_offset(muzzle_frame_index)) *
                                        ui_scale));
+#ifdef GLOOM_DOS_SDL3
+      render_object_frame_scaled_dos_indexed(framebuffer, gun, muzzle_frame, muzzle_draw_x, muzzle_draw_y, ui_scale);
+#else
       render_object_frame_scaled(framebuffer, muzzle_frame, muzzle_draw_x, muzzle_draw_y, ui_scale);
+#endif
     }
   }
 
   body_draw_x = round_float_to_int32(anchor_x - (float)(base_frame->handle_x * ui_scale));
   body_draw_y = round_float_to_int32(anchor_y - (float)(base_frame->handle_y * ui_scale));
+#ifdef GLOOM_DOS_SDL3
+  render_object_frame_scaled_dos_indexed(framebuffer, gun, base_frame, body_draw_x, body_draw_y, ui_scale);
+#else
   render_object_frame_scaled(framebuffer, base_frame, body_draw_x, body_draw_y, ui_scale);
+#endif
 }
 
 static void render_hud_glyph_scaled(RenderFramebuffer *framebuffer, const HudGlyph *glyph, int x, int y, int scale) {
@@ -11274,6 +12112,7 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
     pause_background = new_background;
     pause_background_capacity = required_pixels;
   }
+#ifndef GLOOM_DOS_SDL3
   if (pause_background != NULL && framebuffer->last_frame_pixels != NULL && framebuffer->width == render_width &&
       framebuffer->height == render_height) {
     int py = 0;
@@ -11285,6 +12124,7 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
     }
     pause_background_valid = true;
   }
+#endif
   audio_pause_output(&g_audio, true, true);
   audio_pause_output(&g_audio, false, false);
   audio_play_ui_activate();
@@ -11595,7 +12435,10 @@ static void render(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const
   if (!begin_render_framebuffer(framebuffer)) {
     return;
   }
-  framebuffer_clear(framebuffer, 0xFF000000u);
+  if (state == NULL || flat_textures == NULL || !flat_textures->floor.loaded || !flat_textures->roof.loaded ||
+      wall_textures == NULL || wall_textures->loaded_count == 0u) {
+    framebuffer_clear(framebuffer, 0xFF000000u);
+  }
   if (state != NULL && state->two_player_mode) {
     AppState player2_state = *state;
     RuntimePlayerState player1_state;
@@ -11617,11 +12460,15 @@ static void render(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const
                           hud_font, 0, 0, render_width, render_height);
     apply_player_red_palette(framebuffer, state);
   }
+#ifndef GLOOM_DOS_SDL3
   snapshot_render_framebuffer(framebuffer);
+#endif
   end_render_framebuffer(framebuffer);
 
+#ifndef GLOOM_DOS_SDL3
   SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
   SDL_RenderClear(renderer);
+#endif
 
   if (pixsize > 1) {
     if (!render_pixelate_texture(renderer, framebuffer->texture, render_width, render_height, pixsize)) {
