@@ -254,6 +254,18 @@ foreach ($runtimeDir in $runtimeDirs) {
   }
 }
 
+$runtimeRootFiles = @(
+  @{ Source = 'blackmagic.iff'; Dest = 'BLACKMAG.IFF' }
+)
+
+foreach ($runtimeRootFile in $runtimeRootFiles) {
+  $sourceFile = Join-Path $repoRoot "amiga\$($runtimeRootFile.Source)"
+  $destFile = Join-Path $outDir "amiga\$($runtimeRootFile.Dest)"
+  if (Test-Path -LiteralPath $sourceFile) {
+    Copy-Item -LiteralPath $sourceFile -Destination $destFile -Force
+  }
+}
+
 $dosMiscDir = Join-Path $outDir 'amiga\misc'
 New-Item -ItemType Directory -Force -Path $dosMiscDir | Out-Null
 Copy-Item -LiteralPath (Join-Path $repoRoot 'amiga\misc\palette_8') -Destination (Join-Path $dosMiscDir 'PAL8.BIN') -Force
