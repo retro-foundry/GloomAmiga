@@ -14527,17 +14527,15 @@ static int start_menu_next_enabled_index(int selected_index, int direction) {
   return selected_index >= 0 && selected_index < item_count ? selected_index : 0;
 }
 
-static int menu_row_at_point(int render_width, int render_height, int item_count, int x, int y) {
+static int menu_row_at_point_from_y(int render_width, int render_height, int item_count, int menu_y, int x, int y) {
   int scale = menu_pixel_scale_for_viewport(render_width, render_height);
   int row_height = GLOOM_MENU_BIG_FONT_HEIGHT * scale;
-  int menu_y = 0;
   int index = 0;
 
   if (render_width <= 0 || render_height <= 0 || item_count <= 0 || x < 0 || x >= render_width || y < 0 ||
       y >= render_height) {
     return -1;
   }
-  menu_y = start_menu_y_for_viewport(render_width, render_height, item_count);
   if (y < menu_y || y >= menu_y + (item_count * row_height)) {
     return -1;
   }
@@ -14545,8 +14543,13 @@ static int menu_row_at_point(int render_width, int render_height, int item_count
   return index >= 0 && index < item_count ? index : -1;
 }
 
+static int menu_row_at_point(int render_width, int render_height, int item_count, int x, int y) {
+  return menu_row_at_point_from_y(render_width, render_height, item_count,
+                                  start_menu_y_for_viewport(render_width, render_height, item_count), x, y);
+}
+
 static int menu_row_at_event_point(SDL_Renderer *renderer, int render_width, int render_height, int item_count,
-                                   float window_x, float window_y) {
+                                    float window_x, float window_y) {
 #ifdef GLOOM_DOS_SDL3
   float render_x = window_x;
   float render_y = window_y;
@@ -15180,6 +15183,33 @@ static PauseMenuResult pause_menu_result_for_index(int selected_index, bool two_
   return selected_index == 0 ? PAUSE_MENU_CONTINUE : PAUSE_MENU_MAIN_MENU;
 }
 
+static int pause_menu_y_for_viewport(int render_width, int render_height, int item_count) {
+  int scale = menu_pixel_scale_for_viewport(render_width, render_height);
+
+  return (render_height / 2) - ((item_count * GLOOM_MENU_BIG_FONT_HEIGHT * scale) / 2);
+}
+
+static int pause_menu_row_at_point(int render_width, int render_height, int item_count, int x, int y) {
+  return menu_row_at_point_from_y(render_width, render_height, item_count,
+                                  pause_menu_y_for_viewport(render_width, render_height, item_count), x, y);
+}
+
+static int pause_menu_row_at_event_point(SDL_Renderer *renderer, int render_width, int render_height, int item_count,
+                                         float window_x, float window_y) {
+#ifdef GLOOM_DOS_SDL3
+  float render_x = window_x;
+  float render_y = window_y;
+
+  if (renderer != NULL &&
+      SDL_RenderCoordinatesFromWindow(renderer, window_x, window_y, &render_x, &render_y)) {
+    return pause_menu_row_at_point(render_width, render_height, item_count, (int)render_x, (int)render_y);
+  }
+#else
+  (void)renderer;
+#endif
+  return pause_menu_row_at_point(render_width, render_height, item_count, (int)window_x, (int)window_y);
+}
+
 static void render_pause_menu_frame(RenderFramebuffer *framebuffer, const HudFont *font, const uint32_t *background,
                                     const uint8_t *dos_index_background, int background_pitch_pixels,
                                     int render_width, int render_height,
@@ -15221,7 +15251,7 @@ static void render_pause_menu_frame(RenderFramebuffer *framebuffer, const HudFon
     items[1] = "RETURN TO MAIN MENU";
   }
   scale = menu_pixel_scale_for_viewport(render_width, render_height);
-  y = (render_height / 2) - ((item_count * GLOOM_MENU_BIG_FONT_HEIGHT * scale) / 2);
+  y = pause_menu_y_for_viewport(render_width, render_height, item_count);
   for (i = 0; i < item_count; ++i) {
     uint8_t brightness = (i == selected_index && !selected_visible) ? 96u : 255u;
 
@@ -15375,7 +15405,8 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
       if (runtime_menu_accepts_mouse() && event.type == SDL_MOUSEBUTTONDOWN && event.button.clicks >= 2) {
         if (event.button.button == SDL_BUTTON_LEFT) {
           int click_index =
-              menu_row_at_event_point(renderer, render_width, render_height, item_count, event.button.x, event.button.y);
+              pause_menu_row_at_event_point(renderer, render_width, render_height, item_count, event.button.x,
+                                            event.button.y);
 
           if (click_index >= 0) {
             PauseMenuResult result = pause_menu_result_for_index(click_index, two_player_mode);
@@ -15397,7 +15428,8 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
       } else if (runtime_menu_accepts_mouse() && event.type == SDL_MOUSEBUTTONDOWN &&
                  event.button.button == SDL_BUTTON_LEFT) {
         int click_index =
-            menu_row_at_event_point(renderer, render_width, render_height, item_count, event.button.x, event.button.y);
+            pause_menu_row_at_event_point(renderer, render_width, render_height, item_count, event.button.x,
+                                          event.button.y);
 
         if (click_index >= 0) {
           PauseMenuResult result = pause_menu_result_for_index(click_index, two_player_mode);
@@ -15412,7 +15444,8 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
       }
       if (runtime_menu_accepts_mouse() && event.type == SDL_MOUSEMOTION) {
         int hover_index =
-            menu_row_at_event_point(renderer, render_width, render_height, item_count, event.motion.x, event.motion.y);
+            pause_menu_row_at_event_point(renderer, render_width, render_height, item_count, event.motion.x,
+                                          event.motion.y);
 
         if (hover_index >= 0 && hover_index != selected_index) {
           selected_index = hover_index;
@@ -17227,6 +17260,22 @@ static int run_menu_selftest(void) {
     fprintf(stderr, "Menu selftest failed: bigfont lacks printmess2 glyph mappings\n");
     free_menu_assets(&assets);
     return 1;
+  }
+  {
+    const int render_width = 320;
+    const int render_height = 200;
+    const int item_count = 2;
+    const int scale = menu_pixel_scale_for_viewport(render_width, render_height);
+    const int row_height = GLOOM_MENU_BIG_FONT_HEIGHT * scale;
+    const int pause_y = pause_menu_y_for_viewport(render_width, render_height, item_count);
+
+    if (pause_menu_row_at_point(render_width, render_height, item_count, render_width / 2, pause_y) != 0 ||
+        pause_menu_row_at_point(render_width, render_height, item_count, render_width / 2,
+                                pause_y + row_height) != 1) {
+      fprintf(stderr, "Menu selftest failed: pause-menu mouse rows did not match pause-menu text layout\n");
+      free_menu_assets(&assets);
+      return 1;
+    }
   }
 
   free_menu_assets(&assets);
