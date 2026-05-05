@@ -524,6 +524,7 @@ typedef struct {
   SDL_Palette *index_palette;
   uint8_t *index_pixels;
   uint8_t *index_coverage;
+  uint8_t *last_frame_indices;
 #endif
   uint32_t *pixels;
   uint32_t *last_frame_pixels;
@@ -579,6 +580,10 @@ typedef struct {
 
 typedef struct {
   uint32_t *argb_pixels;
+#ifdef GLOOM_DOS_SDL3
+  uint8_t *indexed_pixels;
+  uint8_t *coverage;
+#endif
   int width;
   int height;
 } HudGlyph;
@@ -588,11 +593,20 @@ typedef struct {
   char source_name[64];
   size_t glyph_count;
   HudGlyph *glyphs;
+#ifdef GLOOM_DOS_SDL3
+  uint32_t palette[256];
+  uint8_t palette_used[256];
+#endif
 } HudFont;
 
 typedef struct {
   bool loaded;
   uint32_t *pixels;
+#ifdef GLOOM_DOS_SDL3
+  uint8_t *indices;
+  uint32_t palette[256];
+  uint8_t palette_used[256];
+#endif
   int width;
   int height;
 } MenuImage;
@@ -996,7 +1010,11 @@ static bool g_dos_index_palette_dirty = false;
 static SDL_Color g_dos_index_palette_colors[256];
 static uint32_t g_dos_index_palette_argb[256];
 static uint8_t g_dos_rgb444_to_index[4096];
+static SDL_Color g_dos_game_index_palette_colors[256];
+static uint32_t g_dos_game_index_palette_argb[256];
+static uint8_t g_dos_game_rgb444_to_index[4096];
 static uint8_t g_dos_red_palette_indices[256];
+static bool g_dos_menu_palette_active = false;
 #endif
 
 static uint64_t sim_ticks_to_amiga_ticks(uint64_t ticks) {
@@ -2940,6 +2958,55 @@ static uint16_t dos_argb_to_rgb444(uint32_t argb) {
   return (uint16_t)((r << 8u) | (g << 4u) | b);
 }
 
+static void dos_rebuild_rgb444_to_nearest_palette(uint8_t remap[4096], const uint32_t palette[256],
+                                                  const uint8_t palette_used[256]) {
+  uint8_t used_indices[256];
+  size_t used_count = 0u;
+  size_t i = 0u;
+  uint16_t rgb = 0u;
+
+  if (remap == NULL || palette == NULL) {
+    return;
+  }
+
+  for (i = 0u; i < 256u; ++i) {
+    if (palette_used == NULL || palette_used[i]) {
+      used_indices[used_count++] = (uint8_t)i;
+    }
+  }
+  if (used_count == 0u) {
+    used_indices[used_count++] = 0u;
+  }
+
+  for (rgb = 0u; rgb < 4096u; ++rgb) {
+    int r = (int)(((rgb >> 8u) & 0xFu) * 17u);
+    int g = (int)(((rgb >> 4u) & 0xFu) * 17u);
+    int b = (int)((rgb & 0xFu) * 17u);
+    int best_distance = 1 << 30;
+    uint8_t best_index = used_indices[0];
+    size_t used_index = 0u;
+
+    for (used_index = 0u; used_index < used_count; ++used_index) {
+      uint8_t candidate = used_indices[used_index];
+      uint32_t argb = palette[candidate];
+      int dr = r - (int)((argb >> 16u) & 0xFFu);
+      int dg = g - (int)((argb >> 8u) & 0xFFu);
+      int db = b - (int)(argb & 0xFFu);
+      int distance = (dr * dr) + (dg * dg) + (db * db);
+
+      if (distance < best_distance) {
+        best_distance = distance;
+        best_index = candidate;
+        if (distance == 0) {
+          break;
+        }
+      }
+    }
+
+    remap[rgb] = best_index;
+  }
+}
+
 static void dos_fail_missing_original_palette_table(const char *path) {
   dos_logf("Missing original AGA palette/remap table %s required by amiga/gloom2.s calcpalettes", path);
   fprintf(stderr, "Missing original AGA palette/remap table %s required by amiga/gloom2.s calcpalettes\n", path);
@@ -3010,12 +3077,24 @@ static void initialize_dos_index_palette_tables(void) {
     g_dos_red_palette_indices[i] = 0u;
   }
   memcpy(g_dos_rgb444_to_index, remap_data, 4096u);
+  memcpy(g_dos_game_index_palette_colors, g_dos_index_palette_colors, sizeof(g_dos_game_index_palette_colors));
+  memcpy(g_dos_game_index_palette_argb, g_dos_index_palette_argb, sizeof(g_dos_game_index_palette_argb));
+  memcpy(g_dos_game_rgb444_to_index, g_dos_rgb444_to_index, sizeof(g_dos_game_rgb444_to_index));
 
   g_dos_index_palette_dirty = true;
   g_dos_index_palette_initialized = true;
   free(palette_data);
   free(remap_data);
   dos_logf("DOS indexed framebuffer: loaded original AGA misc/palette_8 and misc/remap_8");
+}
+
+static void dos_restore_game_index_palette_tables(void) {
+  initialize_dos_index_palette_tables();
+  memcpy(g_dos_index_palette_colors, g_dos_game_index_palette_colors, sizeof(g_dos_index_palette_colors));
+  memcpy(g_dos_index_palette_argb, g_dos_game_index_palette_argb, sizeof(g_dos_index_palette_argb));
+  memcpy(g_dos_rgb444_to_index, g_dos_game_rgb444_to_index, sizeof(g_dos_rgb444_to_index));
+  g_dos_index_palette_dirty = true;
+  g_dos_menu_palette_active = false;
 }
 
 static uint8_t dos_argb_to_index(uint32_t argb) {
@@ -3131,10 +3210,7 @@ static void apply_dos_index_palette_to_window(SDL_Window *window) {
   (void)SDL_SetWindowSurfaceVSync(window, 0);
 }
 
-static void refresh_dos_index_palette(RenderFramebuffer *framebuffer, SDL_Window *window) {
-  initialize_dos_index_palette_tables();
-  dos_rebuild_red_palette_indices();
-
+static void apply_dos_current_index_palette(RenderFramebuffer *framebuffer, SDL_Window *window) {
   if (framebuffer != NULL && framebuffer->index_palette != NULL) {
     if (!SDL_SetPaletteColors(framebuffer->index_palette, g_dos_index_palette_colors, 0, 256)) {
       dos_logf("DOS indexed framebuffer: cannot refresh texture palette: %s", SDL_GetError());
@@ -3142,6 +3218,12 @@ static void refresh_dos_index_palette(RenderFramebuffer *framebuffer, SDL_Window
   }
   apply_dos_index_palette_to_window(window);
   g_dos_index_palette_dirty = false;
+}
+
+static void refresh_dos_index_palette(RenderFramebuffer *framebuffer, SDL_Window *window) {
+  dos_restore_game_index_palette_tables();
+  dos_rebuild_red_palette_indices();
+  apply_dos_current_index_palette(framebuffer, window);
 }
 
 static void configure_dos_index_display_mode(SDL_Window *window, int render_width, int render_height) {
@@ -3400,6 +3482,56 @@ static void rebuild_dos_runtime_index_mappings(WallTextureSet *wall_textures, Fl
 static void register_dos_hud_font_palette(const HudFont *font) {
   (void)font;
 }
+
+static void build_dos_menu_display_palette(const MenuImage *image, const HudFont *font, uint32_t palette[256],
+                                           uint8_t palette_used[256]) {
+  size_t i = 0u;
+
+  if (palette == NULL || palette_used == NULL) {
+    return;
+  }
+
+  memset(palette_used, 0, 256u * sizeof(*palette_used));
+  for (i = 0u; i < 256u; ++i) {
+    palette[i] = 0xFF000000u;
+  }
+  if (image != NULL) {
+    for (i = 0u; i < 256u; ++i) {
+      if (image->palette_used[i]) {
+        palette[i] = image->palette[i];
+        palette_used[i] = 1u;
+      }
+    }
+  }
+  if (font != NULL) {
+    for (i = 0u; i < 4u; ++i) {
+      palette[i] = i == 0u ? 0xFF000000u : font->palette[i];
+      palette_used[i] = 1u;
+    }
+  }
+  palette_used[0] = 1u;
+}
+
+static void apply_dos_menu_display_palette(RenderFramebuffer *framebuffer, const MenuImage *image,
+                                           const HudFont *font) {
+  uint32_t palette[256];
+  uint8_t palette_used[256];
+  size_t i = 0u;
+
+  if (framebuffer == NULL) {
+    return;
+  }
+
+  initialize_dos_index_palette_tables();
+  build_dos_menu_display_palette(image, font, palette, palette_used);
+  for (i = 0u; i < 256u; ++i) {
+    dos_set_index_palette_entry(i, palette[i]);
+  }
+  dos_rebuild_rgb444_to_nearest_palette(g_dos_rgb444_to_index, g_dos_index_palette_argb, palette_used);
+  g_dos_index_palette_dirty = true;
+  g_dos_menu_palette_active = true;
+  apply_dos_current_index_palette(framebuffer, gloom_dos_window);
+}
 #endif
 
 static void free_hud_font(HudFont *font) {
@@ -3411,6 +3543,10 @@ static void free_hud_font(HudFont *font) {
 
   for (i = 0u; i < font->glyph_count; ++i) {
     free(font->glyphs[i].argb_pixels);
+#ifdef GLOOM_DOS_SDL3
+    free(font->glyphs[i].indexed_pixels);
+    free(font->glyphs[i].coverage);
+#endif
   }
 
   free(font->glyphs);
@@ -3687,6 +3823,9 @@ static bool load_menu_big_font(HudFont *font) {
   size_t glyph_count = 0u;
   HudGlyph *glyphs = NULL;
   uint32_t palette[256];
+#ifdef GLOOM_DOS_SDL3
+  uint8_t palette_used[256];
+#endif
   size_t glyph_index = 0u;
 
   if (font == NULL) {
@@ -3735,7 +3874,11 @@ static bool load_menu_big_font(HudFont *font) {
   }
 
   set_default_texture_palette(palette);
+#ifdef GLOOM_DOS_SDL3
+  (void)load_packed_palette_with_used(palette, data, data_size, (size_t)palette_offset, palette_used);
+#else
   load_packed_palette(palette, data, data_size, (size_t)palette_offset);
+#endif
 
   for (glyph_index = 0u; glyph_index < glyph_count; ++glyph_index) {
     uint32_t glyph_offset = main_read_be32(data + 4u + glyph_index * 4u);
@@ -3752,6 +3895,10 @@ static bool load_menu_big_font(HudFont *font) {
     int pixel_width = 0;
     int pixel_height = 0;
     uint32_t *pixels = NULL;
+#ifdef GLOOM_DOS_SDL3
+    uint8_t *indexed_pixels = NULL;
+    uint8_t *coverage = NULL;
+#endif
     int py = 0;
 
     if (glyph_offset + 8u > glyph_limit || glyph_limit > palette_offset || glyph_limit > data_size) {
@@ -3785,6 +3932,16 @@ static bool load_menu_big_font(HudFont *font) {
     if (pixels == NULL) {
       goto fail;
     }
+#ifdef GLOOM_DOS_SDL3
+    indexed_pixels = (uint8_t *)malloc((size_t)pixel_width * (size_t)pixel_height * sizeof(*indexed_pixels));
+    coverage = (uint8_t *)malloc((size_t)pixel_width * (size_t)pixel_height * sizeof(*coverage));
+    if (indexed_pixels == NULL || coverage == NULL) {
+      free(pixels);
+      free(indexed_pixels);
+      free(coverage);
+      goto fail;
+    }
+#endif
 
     for (py = 0; py < pixel_height; ++py) {
       int px = 0;
@@ -3811,11 +3968,23 @@ static bool load_menu_big_font(HudFont *font) {
           }
         }
 
-        pixels[(size_t)py * (size_t)pixel_width + (size_t)px] = covered ? palette[palette_index] : 0x00000000u;
+        {
+          size_t dst_index = (size_t)py * (size_t)pixel_width + (size_t)px;
+
+          pixels[dst_index] = covered ? palette[palette_index] : 0x00000000u;
+#ifdef GLOOM_DOS_SDL3
+          indexed_pixels[dst_index] = palette_index;
+          coverage[dst_index] = covered ? 1u : 0u;
+#endif
+        }
       }
     }
 
     glyphs[glyph_index].argb_pixels = pixels;
+#ifdef GLOOM_DOS_SDL3
+    glyphs[glyph_index].indexed_pixels = indexed_pixels;
+    glyphs[glyph_index].coverage = coverage;
+#endif
     glyphs[glyph_index].width = pixel_width;
     glyphs[glyph_index].height = pixel_height;
   }
@@ -3823,6 +3992,10 @@ static bool load_menu_big_font(HudFont *font) {
   font->loaded = true;
   font->glyph_count = glyph_count;
   font->glyphs = glyphs;
+#ifdef GLOOM_DOS_SDL3
+  memcpy(font->palette, palette, sizeof(font->palette));
+  memcpy(font->palette_used, palette_used, sizeof(font->palette_used));
+#endif
   (void)snprintf(font->source_name, sizeof(font->source_name), "%s", resolved_path);
   free(data);
   dos_logf("DOS checkpoint: menu big font loaded %zu glyphs", glyph_count);
@@ -3832,6 +4005,10 @@ static bool load_menu_big_font(HudFont *font) {
 fail:
   for (glyph_index = 0u; glyph_index < glyph_count; ++glyph_index) {
     free(glyphs[glyph_index].argb_pixels);
+#ifdef GLOOM_DOS_SDL3
+    free(glyphs[glyph_index].indexed_pixels);
+    free(glyphs[glyph_index].coverage);
+#endif
   }
   free(glyphs);
   free(data);
@@ -10024,6 +10201,7 @@ static void free_render_framebuffer(RenderFramebuffer *framebuffer) {
     SDL_DestroyPalette(framebuffer->index_palette);
   }
   free(framebuffer->index_coverage);
+  free(framebuffer->last_frame_indices);
 #endif
   free(framebuffer->last_frame_pixels);
   free(framebuffer->depth_buffer);
@@ -10049,6 +10227,7 @@ static bool ensure_render_framebuffer(SDL_Renderer *renderer, RenderFramebuffer 
 #ifdef GLOOM_DOS_SDL3
   SDL_Palette *index_palette = NULL;
   uint8_t *index_coverage = NULL;
+  uint8_t *last_frame_indices = NULL;
 #endif
 
   if (renderer == NULL || framebuffer == NULL || width <= 0 || height <= 0) {
@@ -10067,11 +10246,14 @@ static bool ensure_render_framebuffer(SDL_Renderer *renderer, RenderFramebuffer 
   sprite_depth_buffer_int = (int32_t *)malloc((size_t)width * sizeof(*sprite_depth_buffer_int));
 #endif
   filled_stamps = (uint32_t *)calloc((size_t)height, sizeof(*filled_stamps));
-#ifndef GLOOM_DOS_SDL3
+#ifdef GLOOM_DOS_SDL3
+  last_frame_indices = (uint8_t *)malloc((size_t)width * (size_t)height * sizeof(*last_frame_indices));
+#else
   last_frame_pixels = (uint32_t *)malloc((size_t)width * (size_t)height * sizeof(*last_frame_pixels));
 #endif
 #ifdef GLOOM_DOS_SDL3
-  if (depth_buffer_int == NULL || sprite_depth_buffer_int == NULL || filled_stamps == NULL) {
+  if (depth_buffer_int == NULL || sprite_depth_buffer_int == NULL || filled_stamps == NULL ||
+      last_frame_indices == NULL) {
 #else
   if (depth_buffer == NULL || sprite_depth_buffer == NULL || filled_stamps == NULL || last_frame_pixels == NULL) {
 #endif
@@ -10082,6 +10264,7 @@ static bool ensure_render_framebuffer(SDL_Renderer *renderer, RenderFramebuffer 
     free(depth_buffer_int);
     free(sprite_depth_buffer_int);
     free(index_coverage);
+    free(last_frame_indices);
 #endif
     free(filled_stamps);
     free(last_frame_pixels);
@@ -10101,6 +10284,7 @@ static bool ensure_render_framebuffer(SDL_Renderer *renderer, RenderFramebuffer 
     free(depth_buffer_int);
     free(sprite_depth_buffer_int);
     free(index_coverage);
+    free(last_frame_indices);
 #endif
     free(filled_stamps);
     free(last_frame_pixels);
@@ -10114,6 +10298,7 @@ static bool ensure_render_framebuffer(SDL_Renderer *renderer, RenderFramebuffer 
     free(depth_buffer_int);
     free(sprite_depth_buffer_int);
     free(index_coverage);
+    free(last_frame_indices);
     free(filled_stamps);
     free(last_frame_pixels);
     return false;
@@ -10127,6 +10312,7 @@ static bool ensure_render_framebuffer(SDL_Renderer *renderer, RenderFramebuffer 
 #ifdef GLOOM_DOS_SDL3
   framebuffer->index_palette = index_palette;
   framebuffer->index_coverage = index_coverage;
+  framebuffer->last_frame_indices = last_frame_indices;
 #endif
   framebuffer->last_frame_pixels = last_frame_pixels;
   framebuffer->depth_buffer = depth_buffer;
@@ -10337,10 +10523,21 @@ static void framebuffer_clear_row_span(RenderFramebuffer *framebuffer, int dst_y
 #endif
 }
 
-#ifndef GLOOM_DOS_SDL3
 static void snapshot_render_framebuffer(RenderFramebuffer *framebuffer) {
   int y = 0;
 
+#ifdef GLOOM_DOS_SDL3
+  if (framebuffer == NULL || framebuffer->index_pixels == NULL || framebuffer->last_frame_indices == NULL ||
+      framebuffer->width <= 0 || framebuffer->height <= 0 || framebuffer->index_pitch_pixels < framebuffer->width) {
+    return;
+  }
+
+  for (y = 0; y < framebuffer->height; ++y) {
+    memcpy(framebuffer->last_frame_indices + ((size_t)y * (size_t)framebuffer->width),
+           framebuffer->index_pixels + ((size_t)y * (size_t)framebuffer->index_pitch_pixels),
+           (size_t)framebuffer->width * sizeof(*framebuffer->last_frame_indices));
+  }
+#else
   if (framebuffer == NULL || framebuffer->pixels == NULL || framebuffer->last_frame_pixels == NULL ||
       framebuffer->width <= 0 || framebuffer->height <= 0 || framebuffer->pitch_pixels < framebuffer->width) {
     return;
@@ -10351,8 +10548,8 @@ static void snapshot_render_framebuffer(RenderFramebuffer *framebuffer) {
            framebuffer->pixels + ((size_t)y * (size_t)framebuffer->pitch_pixels),
            (size_t)framebuffer->width * sizeof(*framebuffer->last_frame_pixels));
   }
-}
 #endif
+}
 
 static void apply_player_red_palette_rect(RenderFramebuffer *framebuffer, const AppState *state, int x, int y, int w,
                                           int h) {
@@ -12528,11 +12725,66 @@ static void render_player_weapon(RenderFramebuffer *framebuffer, const AppState 
 #endif
 }
 
+#ifdef GLOOM_DOS_SDL3
+static void render_hud_glyph_scaled_dos_indexed(RenderFramebuffer *framebuffer, const HudGlyph *glyph, int x, int y,
+                                                int scale) {
+  int sy = 0;
+
+  if (framebuffer == NULL || glyph == NULL || glyph->indexed_pixels == NULL || glyph->coverage == NULL ||
+      scale <= 0 || framebuffer->index_pixels == NULL || framebuffer->index_pitch_pixels < framebuffer->width ||
+      glyph->width <= 0 || glyph->height <= 0) {
+    return;
+  }
+
+  if (x + (glyph->width * scale) <= 0 || y + (glyph->height * scale) <= 0 || x >= framebuffer->width ||
+      y >= framebuffer->height) {
+    return;
+  }
+
+  for (sy = 0; sy < glyph->height; ++sy) {
+    int dst_y0 = y + (sy * scale);
+    int dst_y1 = dst_y0 + scale;
+    int sx = 0;
+
+    if (dst_y1 <= 0 || dst_y0 >= framebuffer->height) {
+      continue;
+    }
+    if (dst_y0 < 0) dst_y0 = 0;
+    if (dst_y1 > framebuffer->height) dst_y1 = framebuffer->height;
+
+    for (sx = 0; sx < glyph->width; ++sx) {
+      size_t src_index = (size_t)sy * (size_t)glyph->width + (size_t)sx;
+      uint8_t color_index = glyph->indexed_pixels[src_index];
+      int dst_x0 = x + (sx * scale);
+      int dst_x1 = dst_x0 + scale;
+      int draw_y = 0;
+
+      if (!glyph->coverage[src_index] || dst_x1 <= 0 || dst_x0 >= framebuffer->width) {
+        continue;
+      }
+      if (dst_x0 < 0) dst_x0 = 0;
+      if (dst_x1 > framebuffer->width) dst_x1 = framebuffer->width;
+
+      for (draw_y = dst_y0; draw_y < dst_y1; ++draw_y) {
+        uint8_t *row = framebuffer->index_pixels + ((size_t)draw_y * (size_t)framebuffer->index_pitch_pixels);
+        memset(row + dst_x0, color_index, (size_t)(dst_x1 - dst_x0));
+      }
+    }
+  }
+}
+#endif
+
 static void render_hud_glyph_scaled(RenderFramebuffer *framebuffer, const HudGlyph *glyph, int x, int y, int scale) {
   if (glyph == NULL) {
     return;
   }
 
+#ifdef GLOOM_DOS_SDL3
+  if (g_dos_menu_palette_active && glyph->indexed_pixels != NULL && glyph->coverage != NULL) {
+    render_hud_glyph_scaled_dos_indexed(framebuffer, glyph, x, y, scale);
+    return;
+  }
+#endif
   render_argb_pixels_scaled(framebuffer, glyph->argb_pixels, glyph->width, glyph->height, x, y, scale);
 }
 
@@ -12816,6 +13068,9 @@ static void free_menu_image(MenuImage *image) {
   }
 
   free(image->pixels);
+#ifdef GLOOM_DOS_SDL3
+  free(image->indices);
+#endif
   memset(image, 0, sizeof(*image));
 }
 
@@ -12842,6 +13097,10 @@ static bool load_menu_title_image(MenuImage *out_image) {
     GloomIffImage image;
     char error[256] = {0};
     uint32_t *pixels = NULL;
+#ifdef GLOOM_DOS_SDL3
+    uint8_t *indices = NULL;
+    size_t source_palette_count = 0u;
+#endif
     size_t pixel_index = 0u;
 
     memset(&image, 0, sizeof(image));
@@ -12865,13 +13124,36 @@ static bool load_menu_title_image(MenuImage *out_image) {
       gloom_iff_free(&image);
       return false;
     }
+#ifdef GLOOM_DOS_SDL3
+    indices = (uint8_t *)malloc(image.pixel_count * sizeof(*indices));
+    if (indices == NULL) {
+      free(pixels);
+      gloom_iff_free(&image);
+      return false;
+    }
+#endif
 
     for (pixel_index = 0u; pixel_index < image.pixel_count; ++pixel_index) {
       pixels[pixel_index] = palette_to_argb(&image, image.pixels[pixel_index]);
+#ifdef GLOOM_DOS_SDL3
+      indices[pixel_index] = image.pixels[pixel_index];
+#endif
     }
 
     out_image->loaded = true;
     out_image->pixels = pixels;
+#ifdef GLOOM_DOS_SDL3
+    source_palette_count = image.palette_count > 0u ? image.palette_count : ((size_t)1u << image.planes);
+    if (source_palette_count > 256u) {
+      source_palette_count = 256u;
+    }
+    out_image->indices = indices;
+    memset(out_image->palette_used, 0, sizeof(out_image->palette_used));
+    for (pixel_index = 0u; pixel_index < 256u; ++pixel_index) {
+      out_image->palette[pixel_index] = palette_to_argb(&image, (uint8_t)pixel_index);
+      out_image->palette_used[pixel_index] = pixel_index < source_palette_count ? 1u : 0u;
+    }
+#endif
     out_image->width = (int)image.width;
     out_image->height = (int)image.height;
     gloom_iff_free(&image);
@@ -12898,6 +13180,10 @@ static bool load_iff_menu_image_from_candidates(const char *const *candidates, s
     GloomIffImage image;
     char error[256] = {0};
     uint32_t *pixels = NULL;
+#ifdef GLOOM_DOS_SDL3
+    uint8_t *indices = NULL;
+    size_t source_palette_count = 0u;
+#endif
     size_t pixel_index = 0u;
 
     memset(&image, 0, sizeof(image));
@@ -12918,13 +13204,36 @@ static bool load_iff_menu_image_from_candidates(const char *const *candidates, s
       gloom_iff_free(&image);
       return false;
     }
+#ifdef GLOOM_DOS_SDL3
+    indices = (uint8_t *)malloc(image.pixel_count * sizeof(*indices));
+    if (indices == NULL) {
+      free(pixels);
+      gloom_iff_free(&image);
+      return false;
+    }
+#endif
 
     for (pixel_index = 0u; pixel_index < image.pixel_count; ++pixel_index) {
       pixels[pixel_index] = palette_to_argb(&image, image.pixels[pixel_index]);
+#ifdef GLOOM_DOS_SDL3
+      indices[pixel_index] = image.pixels[pixel_index];
+#endif
     }
 
     out_image->loaded = true;
     out_image->pixels = pixels;
+#ifdef GLOOM_DOS_SDL3
+    source_palette_count = image.palette_count > 0u ? image.palette_count : ((size_t)1u << image.planes);
+    if (source_palette_count > 256u) {
+      source_palette_count = 256u;
+    }
+    out_image->indices = indices;
+    memset(out_image->palette_used, 0, sizeof(out_image->palette_used));
+    for (pixel_index = 0u; pixel_index < 256u; ++pixel_index) {
+      out_image->palette[pixel_index] = palette_to_argb(&image, (uint8_t)pixel_index);
+      out_image->palette_used[pixel_index] = pixel_index < source_palette_count ? 1u : 0u;
+    }
+#endif
     out_image->width = (int)image.width;
     out_image->height = (int)image.height;
     gloom_iff_free(&image);
@@ -12991,7 +13300,7 @@ static void render_menu_image(RenderFramebuffer *framebuffer, const MenuImage *i
                               int render_height) {
   int dst_y = 0;
 
-  if (framebuffer == NULL || image == NULL || !image->loaded || image->pixels == NULL) {
+  if (framebuffer == NULL || image == NULL || !image->loaded) {
     return;
   }
 
@@ -12999,10 +13308,16 @@ static void render_menu_image(RenderFramebuffer *framebuffer, const MenuImage *i
     return;
   }
 #ifdef GLOOM_DOS_SDL3
+  if (image->indices == NULL && image->pixels == NULL) {
+    return;
+  }
   if (framebuffer->index_pixels == NULL || framebuffer->index_pitch_pixels < framebuffer->width) {
     return;
   }
 #else
+  if (image->pixels == NULL) {
+    return;
+  }
   if (framebuffer->pixels == NULL || framebuffer->pitch_pixels < framebuffer->width) {
     return;
   }
@@ -13041,7 +13356,11 @@ static void render_menu_image(RenderFramebuffer *framebuffer, const MenuImage *i
       if (src_x >= image->width) src_x = image->width - 1;
       if (src_y >= image->height) src_y = image->height - 1;
 #ifdef GLOOM_DOS_SDL3
-      dst_row[dst_x] = dos_argb_to_index(image->pixels[(size_t)src_y * (size_t)image->width + (size_t)src_x]);
+      if (g_dos_menu_palette_active && image->indices != NULL) {
+        dst_row[dst_x] = image->indices[(size_t)src_y * (size_t)image->width + (size_t)src_x];
+      } else {
+        dst_row[dst_x] = dos_argb_to_index(image->pixels[(size_t)src_y * (size_t)image->width + (size_t)src_x]);
+      }
 #else
       dst_row[dst_x] = image->pixels[(size_t)src_y * (size_t)image->width + (size_t)src_x];
 #endif
@@ -13051,11 +13370,12 @@ static void render_menu_image(RenderFramebuffer *framebuffer, const MenuImage *i
 
 static int start_menu_item_count(void);
 
-static void copy_menu_background(RenderFramebuffer *framebuffer, const uint32_t *background, int render_width,
-                                 int render_height) {
+static void copy_argb_background(RenderFramebuffer *framebuffer, const uint32_t *background,
+                                 int background_pitch_pixels, int render_width, int render_height) {
   int y = 0;
 
-  if (framebuffer == NULL || background == NULL || render_width <= 0 || render_height <= 0) {
+  if (framebuffer == NULL || background == NULL || background_pitch_pixels < render_width || render_width <= 0 ||
+      render_height <= 0) {
     return;
   }
 
@@ -13066,12 +13386,15 @@ static void copy_menu_background(RenderFramebuffer *framebuffer, const uint32_t 
 
   for (y = 0; y < render_height; ++y) {
     uint8_t *dst_row = framebuffer->index_pixels + ((size_t)y * (size_t)framebuffer->index_pitch_pixels);
-    const uint32_t *src_row = background + ((size_t)y * (size_t)render_width);
+    const uint32_t *src_row = background + ((size_t)y * (size_t)background_pitch_pixels);
     int x = 0;
 
     for (x = 0; x < render_width; ++x) {
       dst_row[x] = dos_argb_to_index(src_row[x]);
     }
+  }
+  if (framebuffer->index_coverage != NULL) {
+    memset(framebuffer->index_coverage, 0, (size_t)framebuffer->width * (size_t)framebuffer->height);
   }
 #else
   if (framebuffer->pixels == NULL || framebuffer->pitch_pixels < framebuffer->width) {
@@ -13080,11 +13403,37 @@ static void copy_menu_background(RenderFramebuffer *framebuffer, const uint32_t 
 
   for (y = 0; y < render_height; ++y) {
     memcpy(framebuffer->pixels + ((size_t)y * (size_t)framebuffer->pitch_pixels),
-           background + ((size_t)y * (size_t)render_width), (size_t)render_width * sizeof(*background));
+           background + ((size_t)y * (size_t)background_pitch_pixels), (size_t)render_width * sizeof(*background));
   }
 #endif
 }
 
+static void copy_menu_background(RenderFramebuffer *framebuffer, const uint32_t *background, int render_width,
+                                 int render_height) {
+  copy_argb_background(framebuffer, background, render_width, render_width, render_height);
+}
+
+#ifdef GLOOM_DOS_SDL3
+static void copy_dos_index_background(RenderFramebuffer *framebuffer, const uint8_t *background, int render_width,
+                                      int render_height) {
+  int y = 0;
+
+  if (framebuffer == NULL || background == NULL || render_width <= 0 || render_height <= 0 ||
+      framebuffer->index_pixels == NULL || framebuffer->index_pitch_pixels < framebuffer->width) {
+    return;
+  }
+
+  for (y = 0; y < render_height; ++y) {
+    memcpy(framebuffer->index_pixels + ((size_t)y * (size_t)framebuffer->index_pitch_pixels),
+           background + ((size_t)y * (size_t)render_width), (size_t)render_width * sizeof(*background));
+  }
+  if (framebuffer->index_coverage != NULL) {
+    memset(framebuffer->index_coverage, 0, (size_t)framebuffer->width * (size_t)framebuffer->height);
+  }
+}
+#endif
+
+#ifndef GLOOM_DOS_SDL3
 static bool cache_start_menu_background(RenderFramebuffer *framebuffer, const MenuAssets *assets, int render_width,
                                         int render_height, uint32_t **io_cache, size_t *io_capacity) {
   int title_scale = 4;
@@ -13145,6 +13494,63 @@ static bool cache_start_menu_background(RenderFramebuffer *framebuffer, const Me
 #endif
   return true;
 }
+#endif
+
+#ifdef GLOOM_DOS_SDL3
+static bool cache_start_menu_background_dos_indices(RenderFramebuffer *framebuffer, const MenuAssets *assets,
+                                                   int render_width, int render_height, uint8_t **io_cache,
+                                                   size_t *io_capacity) {
+  int title_scale = 4;
+  int title_width = 0;
+  int scale = 0;
+  int y = 0;
+  int title_y = 0;
+  size_t required = 0u;
+
+  if (framebuffer == NULL || assets == NULL || io_cache == NULL || io_capacity == NULL || render_width <= 0 ||
+      render_height <= 0) {
+    return false;
+  }
+
+  required = (size_t)render_width * (size_t)render_height;
+  if (*io_capacity < required) {
+    uint8_t *new_cache = (uint8_t *)realloc(*io_cache, required * sizeof(**io_cache));
+
+    if (new_cache == NULL) {
+      return false;
+    }
+    *io_cache = new_cache;
+    *io_capacity = required;
+  }
+
+  framebuffer_clear(framebuffer, 0xFF000000u);
+  render_menu_image(framebuffer, &assets->title, render_width, render_height);
+
+  scale = menu_pixel_scale_for_viewport(render_width, render_height);
+  title_width = (int)(strlen("GLOOM WITH FRIENDS") * (size_t)GLOOM_MENU_BIG_FONT_WIDTH * (size_t)title_scale);
+  while (title_scale > 1 && title_width > render_width) {
+    title_scale /= 2;
+    title_width = (int)(strlen("GLOOM WITH FRIENDS") * (size_t)GLOOM_MENU_BIG_FONT_WIDTH * (size_t)title_scale);
+  }
+  y = (render_height / 2) - ((start_menu_item_count() * GLOOM_MENU_BIG_FONT_HEIGHT * scale) / 2);
+  title_y = y - (GLOOM_MENU_BIG_FONT_HEIGHT * title_scale) - ((GLOOM_MENU_BIG_FONT_HEIGHT * scale * 21) / 2);
+  if (title_y < GLOOM_MENU_BIG_FONT_HEIGHT) {
+    title_y = GLOOM_MENU_BIG_FONT_HEIGHT;
+  }
+  render_menu_text_brightness(framebuffer, &assets->big_font, "GLOOM WITH FRIENDS", render_width / 2, title_y,
+                              title_scale, 255u);
+
+  if (framebuffer->index_pixels == NULL || framebuffer->index_pitch_pixels < framebuffer->width) {
+    return false;
+  }
+  for (y = 0; y < render_height; ++y) {
+    memcpy(*io_cache + ((size_t)y * (size_t)render_width),
+           framebuffer->index_pixels + ((size_t)y * (size_t)framebuffer->index_pitch_pixels),
+           (size_t)render_width * sizeof(**io_cache));
+  }
+  return true;
+}
+#endif
 
 static int start_menu_item_count(void) {
 #ifdef __EMSCRIPTEN__
@@ -13221,7 +13627,8 @@ static int activate_start_menu_selection(int selected_index, GloomGameMode *out_
 }
 
 static void render_start_menu_frame(RenderFramebuffer *framebuffer, const MenuAssets *assets,
-                                    const uint32_t *background, int render_width, int render_height,
+                                    const uint32_t *background, const uint8_t *dos_index_background,
+                                    int render_width, int render_height,
                                     int selected_index, bool selected_visible,
                                     uint8_t violence_mode, const RuntimeControlConfig *control_config) {
   const char *items[6];
@@ -13236,6 +13643,9 @@ static void render_start_menu_frame(RenderFramebuffer *framebuffer, const MenuAs
     return;
   }
   (void)violence_mode;
+#ifndef GLOOM_DOS_SDL3
+  (void)dos_index_background;
+#endif
 
   (void)snprintf(player1_item, sizeof(player1_item), "PLAYER 1 %s",
                  control_source_menu_name(control_config != NULL ? control_config->player1 : GLOOM_CONTROL_KEYBOARD));
@@ -13247,12 +13657,23 @@ static void render_start_menu_frame(RenderFramebuffer *framebuffer, const MenuAs
   items[3] = player2_item;
   items[4] = "EXIT GLOOM";
 
+#ifdef GLOOM_DOS_SDL3
+  if (dos_index_background != NULL) {
+    copy_dos_index_background(framebuffer, dos_index_background, render_width, render_height);
+  } else if (background != NULL) {
+    copy_menu_background(framebuffer, background, render_width, render_height);
+  } else {
+    framebuffer_clear(framebuffer, 0xFF000000u);
+    render_menu_image(framebuffer, &assets->title, render_width, render_height);
+  }
+#else
   if (background != NULL) {
     copy_menu_background(framebuffer, background, render_width, render_height);
   } else {
     framebuffer_clear(framebuffer, 0xFF000000u);
     render_menu_image(framebuffer, &assets->title, render_width, render_height);
   }
+#endif
 
   scale = menu_pixel_scale_for_viewport(render_width, render_height);
   y = (render_height / 2) - ((item_count * GLOOM_MENU_BIG_FONT_HEIGHT * scale) / 2);
@@ -13267,8 +13688,13 @@ static void render_start_menu_frame(RenderFramebuffer *framebuffer, const MenuAs
 static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const MenuAssets *assets,
                           int render_width, int render_height, GloomGameMode *out_game_mode,
                           uint8_t *io_violence_mode, RuntimeControlConfig *io_control_config) {
+#ifdef GLOOM_DOS_SDL3
+  static uint8_t *menu_background_index_cache = NULL;
+  static size_t menu_background_index_capacity = 0u;
+#else
   static uint32_t *menu_background_cache = NULL;
   static size_t menu_background_capacity = 0u;
+#endif
   int selected_index = 0;
   int flash_ticks = GLOOM_MENU_FLASH_TICKS;
   bool selected_visible = false;
@@ -13290,9 +13716,17 @@ static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer
   } else if (*out_game_mode == GLOOM_GAME_MODE_COMBAT) {
     selected_index = 1;
   }
+#ifdef GLOOM_DOS_SDL3
+  apply_dos_menu_display_palette(framebuffer, &assets->title, &assets->big_font);
+#endif
   if (begin_render_framebuffer(framebuffer)) {
+#ifdef GLOOM_DOS_SDL3
+    (void)cache_start_menu_background_dos_indices(framebuffer, assets, render_width, render_height,
+                                                  &menu_background_index_cache, &menu_background_index_capacity);
+#else
     (void)cache_start_menu_background(framebuffer, assets, render_width, render_height, &menu_background_cache,
                                       &menu_background_capacity);
+#endif
     end_render_framebuffer(framebuffer);
   }
 
@@ -13422,8 +13856,13 @@ static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer
     }
 
     if (redraw && begin_render_framebuffer(framebuffer)) {
-      render_start_menu_frame(framebuffer, assets, menu_background_cache, render_width, render_height, selected_index,
+#ifdef GLOOM_DOS_SDL3
+      render_start_menu_frame(framebuffer, assets, NULL, menu_background_index_cache, render_width, render_height,
+                              selected_index, selected_visible, *io_violence_mode, io_control_config);
+#else
+      render_start_menu_frame(framebuffer, assets, menu_background_cache, NULL, render_width, render_height, selected_index,
                               selected_visible, *io_violence_mode, io_control_config);
+#endif
       end_render_framebuffer(framebuffer);
       present_framebuffer_texture(renderer, framebuffer, render_width, render_height);
 #ifdef GLOOM_DOS_SDL3
@@ -13506,6 +13945,9 @@ static int run_combat_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffe
     free_hud_font(&font);
     return -1;
   }
+#ifdef GLOOM_DOS_SDL3
+  apply_dos_menu_display_palette(framebuffer, &image, &font);
+#endif
 
   while (true) {
     SDL_Event event;
@@ -13636,6 +14078,9 @@ static bool run_combat_result_screen(SDL_Renderer *renderer, RenderFramebuffer *
     free_hud_font(&font);
     return false;
   }
+#ifdef GLOOM_DOS_SDL3
+  apply_dos_menu_display_palette(framebuffer, &image, &font);
+#endif
 
   while (running) {
     SDL_Event event;
@@ -13676,7 +14121,8 @@ static bool run_combat_result_screen(SDL_Renderer *renderer, RenderFramebuffer *
 }
 
 static void render_pause_menu_frame(RenderFramebuffer *framebuffer, const HudFont *font, const uint32_t *background,
-                                    int background_pitch_pixels, int render_width, int render_height,
+                                    const uint8_t *dos_index_background, int background_pitch_pixels,
+                                    int render_width, int render_height,
                                     int selected_index, bool selected_visible) {
   const char *items[2] = {"CONTINUE", "RETURN TO MAIN MENU"};
   int scale = 1;
@@ -13687,18 +14133,22 @@ static void render_pause_menu_frame(RenderFramebuffer *framebuffer, const HudFon
     return;
   }
 
-  if (background != NULL && background_pitch_pixels > 0 && framebuffer->pixels != NULL) {
-    int py = 0;
-
-    for (py = 0; py < render_height; ++py) {
-      uint32_t *dst_row = framebuffer->pixels + ((size_t)py * (size_t)framebuffer->pitch_pixels);
-      const uint32_t *src_row = background + ((size_t)py * (size_t)background_pitch_pixels);
-
-      memcpy(dst_row, src_row, (size_t)render_width * sizeof(*dst_row));
-    }
+#ifdef GLOOM_DOS_SDL3
+  if (dos_index_background != NULL) {
+    copy_dos_index_background(framebuffer, dos_index_background, render_width, render_height);
+  } else if (background != NULL && background_pitch_pixels >= render_width) {
+    copy_argb_background(framebuffer, background, background_pitch_pixels, render_width, render_height);
   } else {
     framebuffer_clear(framebuffer, 0xFF000000u);
   }
+#else
+  (void)dos_index_background;
+  if (background != NULL && background_pitch_pixels >= render_width) {
+    copy_argb_background(framebuffer, background, background_pitch_pixels, render_width, render_height);
+  } else {
+    framebuffer_clear(framebuffer, 0xFF000000u);
+  }
+#endif
   scale = menu_pixel_scale_for_viewport(render_width, render_height);
   y = (render_height / 2) - (((int)(sizeof(items) / sizeof(items[0])) * GLOOM_MENU_BIG_FONT_HEIGHT * scale) / 2);
   for (i = 0; i < (int)(sizeof(items) / sizeof(items[0])); ++i) {
@@ -13712,8 +14162,13 @@ static void render_pause_menu_frame(RenderFramebuffer *framebuffer, const HudFon
 static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer, RenderFramebuffer *framebuffer,
                                       int render_width, int render_height, bool *io_mouse_captured,
                                       double *io_mouse_dx_accum, bool *io_suppress_mouse_fire_until_button_up) {
+#ifdef GLOOM_DOS_SDL3
+  static uint8_t *pause_background_indices = NULL;
+  static size_t pause_background_index_capacity = 0u;
+#else
   static uint32_t *pause_background = NULL;
   static size_t pause_background_capacity = 0u;
+#endif
   HudFont font;
   int selected_index = 0;
   int flash_ticks = GLOOM_MENU_FLASH_TICKS;
@@ -13733,6 +14188,29 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
     return PAUSE_MENU_QUIT;
   }
   required_pixels = (size_t)render_width * (size_t)render_height;
+#ifdef GLOOM_DOS_SDL3
+  if (required_pixels > 0u && pause_background_index_capacity < required_pixels) {
+    uint8_t *new_background = (uint8_t *)realloc(pause_background_indices, required_pixels * sizeof(*pause_background_indices));
+
+    if (new_background == NULL) {
+      free_hud_font(&font);
+      return PAUSE_MENU_QUIT;
+    }
+    pause_background_indices = new_background;
+    pause_background_index_capacity = required_pixels;
+  }
+  if (pause_background_indices != NULL && framebuffer->last_frame_indices != NULL && framebuffer->width == render_width &&
+      framebuffer->height == render_height) {
+    int py = 0;
+
+    for (py = 0; py < render_height; ++py) {
+      memcpy(pause_background_indices + ((size_t)py * (size_t)render_width),
+             framebuffer->last_frame_indices + ((size_t)py * (size_t)render_width),
+             (size_t)render_width * sizeof(*pause_background_indices));
+    }
+    pause_background_valid = true;
+  }
+#else
   if (required_pixels > 0u && pause_background_capacity < required_pixels) {
     uint32_t *new_background = (uint32_t *)realloc(pause_background, required_pixels * sizeof(*pause_background));
 
@@ -13743,7 +14221,6 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
     pause_background = new_background;
     pause_background_capacity = required_pixels;
   }
-#ifndef GLOOM_DOS_SDL3
   if (pause_background != NULL && framebuffer->last_frame_pixels != NULL && framebuffer->width == render_width &&
       framebuffer->height == render_height) {
     int py = 0;
@@ -13897,8 +14374,13 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
     }
 
     if (redraw && begin_render_framebuffer(framebuffer)) {
-      render_pause_menu_frame(framebuffer, &font, pause_background_valid ? pause_background : NULL, render_width,
+#ifdef GLOOM_DOS_SDL3
+      render_pause_menu_frame(framebuffer, &font, NULL, pause_background_valid ? pause_background_indices : NULL,
+                              render_width, render_width, render_height, selected_index, selected_visible);
+#else
+      render_pause_menu_frame(framebuffer, &font, pause_background_valid ? pause_background : NULL, NULL, render_width,
                               render_width, render_height, selected_index, selected_visible);
+#endif
       end_render_framebuffer(framebuffer);
       SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
       SDL_RenderClear(renderer);
@@ -13961,6 +14443,9 @@ static bool run_completion_screen(SDL_Renderer *renderer, RenderFramebuffer *fra
     free_menu_image(&image);
     return false;
   }
+#ifdef GLOOM_DOS_SDL3
+  apply_dos_menu_display_palette(framebuffer, &image, &font);
+#endif
 
   while (running) {
     SDL_Event event;
@@ -14101,9 +14586,7 @@ static void render(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const
     apply_player_red_palette(framebuffer, state);
     profile_add_elapsed(&g_profiler.render_red_ms, profile_start_ms);
   }
-#ifndef GLOOM_DOS_SDL3
   snapshot_render_framebuffer(framebuffer);
-#endif
   end_render_framebuffer(framebuffer);
 
   profile_start_ms = profile_now_ms();
@@ -16771,6 +17254,9 @@ static bool run_menu_and_restart_game(SDL_Renderer *renderer, RenderFramebuffer 
     free_menu_assets(&menu_assets);
     return false;
   }
+#ifdef GLOOM_DOS_SDL3
+  refresh_dos_index_palette(framebuffer, gloom_dos_window);
+#endif
   free_menu_assets(&menu_assets);
 
   *io_two_player_mode = menu_game_mode != GLOOM_GAME_MODE_ONE_PLAYER;
@@ -16784,6 +17270,9 @@ static bool run_menu_and_restart_game(SDL_Renderer *renderer, RenderFramebuffer 
     if (run_combat_menu(renderer, framebuffer, render_width, render_height, &series, &lives) != 0) {
       return false;
     }
+#ifdef GLOOM_DOS_SDL3
+    refresh_dos_index_palette(framebuffer, gloom_dos_window);
+#endif
     initialize_combat_rotation_state(state, series, lives);
     if (!resolve_next_combat_map(state, first_map_path, sizeof(first_map_path))) {
       fprintf(stderr, "Failed to pick original combat map\n");
@@ -17671,6 +18160,9 @@ int main(int argc, char **argv) {
       return 0;
     }
 
+#ifdef GLOOM_DOS_SDL3
+    refresh_dos_index_palette(&framebuffer, window);
+#endif
     free_menu_assets(&menu_assets);
     two_player_mode = menu_game_mode != GLOOM_GAME_MODE_ONE_PLAYER;
     combat_mode = menu_game_mode == GLOOM_GAME_MODE_COMBAT;
@@ -17700,6 +18192,9 @@ int main(int argc, char **argv) {
         gloom_map_free(&state.map);
         return 0;
       }
+#ifdef GLOOM_DOS_SDL3
+      refresh_dos_index_palette(&framebuffer, window);
+#endif
       initialize_combat_rotation_state(&state, series, lives);
       if (!resolve_next_combat_map(&state, selected_map_path, sizeof(selected_map_path))) {
         fprintf(stderr, "Failed to pick original combat map\n");
