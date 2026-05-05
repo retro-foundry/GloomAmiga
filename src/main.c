@@ -905,7 +905,9 @@ typedef struct {
   int16_t joyx;
   int16_t joyy;
   int16_t joys;
+  int16_t turn;
   bool fire;
+  bool keyboard_fire_repeat;
 } PlayerControls;
 
 typedef struct {
@@ -6952,11 +6954,10 @@ static PlayerControls read_gamepad_player_controls(size_t gamepad_index, unsigne
                   gamepad_button_down(gamepad_index, SDL_CONTROLLER_BUTTON_A) ||
                   gamepad_button_down(gamepad_index, SDL_CONTROLLER_BUTTON_RIGHTSHOULDER);
 
+  controls.turn = turn;
   if (strafe != 0) {
     controls.joyx = strafe;
     controls.joys = -1;
-  } else {
-    controls.joyx = turn;
   }
 
   return controls;
@@ -6973,7 +6974,11 @@ static void merge_player_controls(PlayerControls *dst, const PlayerControls *src
     dst->joyx = src->joyx;
     dst->joys = src->joys;
   }
+  if (src->turn != 0) {
+    dst->turn = src->turn;
+  }
   dst->fire = dst->fire || src->fire;
+  dst->keyboard_fire_repeat = dst->keyboard_fire_repeat || src->keyboard_fire_repeat;
 }
 
 static int gamepad_look_delta(size_t gamepad_index) {
@@ -7150,14 +7155,14 @@ static PlayerControls read_modern_player_controls(const uint8_t *keyboard, bool 
   strafe = player_control_axis(keyboard[SDL_SCANCODE_A], keyboard[SDL_SCANCODE_D]);
   turn = player_control_axis(keyboard[SDL_SCANCODE_LEFT] || keyboard[SDL_SCANCODE_Q],
                              keyboard[SDL_SCANCODE_RIGHT] || keyboard[SDL_SCANCODE_E]);
-  controls.fire = keyboard[SDL_SCANCODE_SPACE] || keyboard[SDL_SCANCODE_LCTRL] || keyboard[SDL_SCANCODE_RCTRL] ||
-                  mouse_fire;
+  controls.keyboard_fire_repeat =
+      keyboard[SDL_SCANCODE_SPACE] || keyboard[SDL_SCANCODE_LCTRL] || keyboard[SDL_SCANCODE_RCTRL];
+  controls.fire = controls.keyboard_fire_repeat || mouse_fire;
 
+  controls.turn = turn;
   if (strafe != 0) {
     controls.joyx = strafe;
     controls.joys = -1;
-  } else {
-    controls.joyx = turn;
   }
 
   return controls;
@@ -7176,13 +7181,13 @@ static PlayerControls read_second_player_controls(const uint8_t *keyboard) {
   controls.joyy = player_control_axis(keyboard[SDL_SCANCODE_I], keyboard[SDL_SCANCODE_K]);
   strafe = player_control_axis(keyboard[SDL_SCANCODE_U], keyboard[SDL_SCANCODE_O]);
   turn = player_control_axis(keyboard[SDL_SCANCODE_J], keyboard[SDL_SCANCODE_L]);
-  controls.fire = keyboard[SDL_SCANCODE_RETURN] || keyboard[SDL_SCANCODE_RCTRL];
+  controls.keyboard_fire_repeat = keyboard[SDL_SCANCODE_RETURN] || keyboard[SDL_SCANCODE_RCTRL];
+  controls.fire = controls.keyboard_fire_repeat;
 
+  controls.turn = turn;
   if (strafe != 0) {
     controls.joyx = strafe;
     controls.joys = -1;
-  } else {
-    controls.joyx = turn;
   }
 
   return controls;
@@ -7205,12 +7210,11 @@ static PlayerControls read_webrtc_player2_controls(void) {
   turn = player_control_axis((g_webrtc_guest_player2_input & GLOOM_WEBRTC_INPUT_LEFT) != 0u,
                              (g_webrtc_guest_player2_input & GLOOM_WEBRTC_INPUT_RIGHT) != 0u);
   controls.fire = (g_webrtc_guest_player2_input & GLOOM_WEBRTC_INPUT_FIRE) != 0u;
+  controls.turn = turn;
 
   if (strafe != 0) {
     controls.joyx = strafe;
     controls.joys = -1;
-  } else {
-    controls.joyx = turn;
   }
 
   return controls;
@@ -7279,8 +7283,8 @@ static void update_player_keyboard_rotation(AppState *state, const PlayerControl
   }
 
   if (controls != NULL) {
-    joyx = controls->joyx;
-    joys = controls->joys;
+    joyx = controls->turn != 0 ? controls->turn : controls->joyx;
+    joys = controls->turn != 0 ? 0 : controls->joys;
   }
 
   if (joys == 0 && joyx != 0) {
@@ -9560,6 +9564,7 @@ static bool update_player_pixsize_transition(AppState *state) {
 static void update_player_weapon(AppState *state, const PlayerControls *controls) {
   float step_scale = fixed_step_amiga_scale();
   bool fire_pressed = false;
+  bool repeat_fire = false;
 
   if (state == NULL) {
     return;
@@ -9580,12 +9585,13 @@ static void update_player_weapon(AppState *state, const PlayerControls *controls
   }
 
   fire_pressed = controls != NULL && controls->fire;
+  repeat_fire = controls != NULL && controls->keyboard_fire_repeat;
   if (!fire_pressed) {
     state->player_last_fire = false;
     return;
   }
 
-  if (!state->player_last_fire && state->player_reload_counter <= 0.0f) {
+  if ((!state->player_last_fire || repeat_fire) && state->player_reload_counter <= 0.0f) {
     bool fired = false;
 
     if (state->player_mega_timer > 0.0f) {
@@ -16685,6 +16691,7 @@ static int run_input_selftest(void) {
   PlayerControls keyboard_controls;
   PlayerControls gamepad_controls;
   RuntimeControlConfig config;
+  uint8_t keyboard_state[SDL_SCANCODE_RCTRL + 1];
 
   if (!input_selftest_expect(gamepad_axis_with_deadzone(0, GLOOM_GAMEPAD_MOVE_DEADZONE) == 0,
                              "zero axis stays neutral")) {
@@ -16711,6 +16718,18 @@ static int run_input_selftest(void) {
   if (!input_selftest_expect(gamepad_axis_to_mouse_delta(32767) > 0 &&
                                  gamepad_axis_to_mouse_delta(-32767) < 0,
                              "look axis produces signed mouse deltas")) {
+    return 1;
+  }
+
+  memset(&keyboard_controls, 0, sizeof(keyboard_controls));
+  memset(&gamepad_controls, 0, sizeof(gamepad_controls));
+  memset(keyboard_state, 0, sizeof(keyboard_state));
+  keyboard_state[SDL_SCANCODE_A] = 1u;
+  keyboard_state[SDL_SCANCODE_RIGHT] = 1u;
+  keyboard_controls = read_modern_player_controls(keyboard_state, false);
+  if (!input_selftest_expect(keyboard_controls.joyx == -1 && keyboard_controls.joys == -1 &&
+                                 keyboard_controls.turn == 1,
+                             "keyboard controls allow strafe and turn together")) {
     return 1;
   }
 
@@ -17661,6 +17680,24 @@ static int run_pickup_selftest(void) {
     fprintf(stderr, "Pickup selftest failed: ultra mega overkill did not fire original three-shot spread\n");
     return 1;
   }
+
+  memset(state.projectiles, 0, sizeof(state.projectiles));
+  state.player_reload_counter = 0.0f;
+  state.player_last_fire = true;
+  state.player_mega_timer = 0.0f;
+  controls.keyboard_fire_repeat = false;
+  update_player_weapon(&state, &controls);
+  if (combat_selftest_active_projectile_count(&state) != 0u) {
+    fprintf(stderr, "Pickup selftest failed: held non-keyboard fire should keep original edge-trigger behavior\n");
+    return 1;
+  }
+  controls.keyboard_fire_repeat = true;
+  update_player_weapon(&state, &controls);
+  if (combat_selftest_active_projectile_count(&state) != 1u) {
+    fprintf(stderr, "Pickup selftest failed: held keyboard fire should repeat after reload\n");
+    return 1;
+  }
+  controls.keyboard_fire_repeat = false;
 
   state.player_hyper_timer = -512.0f;
   update_player_power_timers(&state);
@@ -18673,8 +18710,9 @@ static bool replay_run_once(const char *map_path, const ReplayInputStep *steps, 
 
 static int run_replay_selftest(int argc, char **argv) {
   static const ReplayInputStep default_steps[] = {
-      {30u, {0, -1, 0, false}, 0}, {18u, {1, -1, -1, false}, 0}, {12u, {0, 0, 0, true}, 2},
-      {20u, {-1, 0, 0, false}, -1}, {25u, {0, 1, 0, false}, 0}, {10u, {0, 0, 0, true}, 0}};
+      {30u, {0, -1, 0, 0, false, false}, 0}, {18u, {1, -1, -1, 0, false, false}, 0},
+      {12u, {0, 0, 0, 0, true, false}, 2},    {20u, {-1, 0, 0, 0, false, false}, -1},
+      {25u, {0, 1, 0, 0, false, false}, 0},   {10u, {0, 0, 0, 0, true, false}, 0}};
   ReplayInputStep file_steps[256];
   const ReplayInputStep *steps = default_steps;
   size_t step_count = sizeof(default_steps) / sizeof(default_steps[0]);
