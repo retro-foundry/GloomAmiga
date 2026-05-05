@@ -20402,6 +20402,8 @@ int main(int argc, char **argv) {
 
       memset(&completion, 0, sizeof(completion));
       level_transition_pending = false;
+      audio_pause_output(&g_audio, true, true);
+      audio_pause_output(&g_audio, false, false);
       next_result =
           resolve_next_script_play_map_or_done(resolved_map_path, next_map_path, sizeof(next_map_path), &completion);
       if (next_result == SCRIPT_PLAY_NEXT_ERROR) {
