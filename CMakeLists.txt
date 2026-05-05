@@ -89,6 +89,9 @@ add_custom_command(TARGET gloom_pc POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:gloom_pc>/amiga/misc"
   COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:gloom_pc>/amiga/sfxs"
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${CMAKE_SOURCE_DIR}/package/README.TXT"
+    "$<TARGET_FILE_DIR:gloom_pc>/README.TXT"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
     "${CMAKE_SOURCE_DIR}/amiga/combat.iff"
     "${CMAKE_SOURCE_DIR}/amiga/blackmagic.iff"
     "${CMAKE_SOURCE_DIR}/amiga/bullet1.bin"

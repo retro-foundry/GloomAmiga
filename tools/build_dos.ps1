@@ -230,6 +230,7 @@ if (-not (Test-Path -LiteralPath $sdlLib)) {
 }
 
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
+Copy-Item -LiteralPath (Join-Path $repoRoot 'package\README.TXT') -Destination (Join-Path $outDir 'README.TXT') -Force
 $env:Path = "$djgppBin;$env:Path"
 
 $runtimeDirs = @(
