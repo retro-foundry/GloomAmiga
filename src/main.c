@@ -1045,6 +1045,7 @@ static void runtime_emscripten_discard_pointer_lock_lost(void);
 void runtime_emscripten_canvas_cursor_default(void);
 void runtime_emscripten_install_fullscreen_listeners(void);
 void runtime_emscripten_canvas_fullscreen_toggle(void);
+void runtime_emscripten_hide_loading_overlay(void);
 static bool runtime_emscripten_consume_fullscreen_resize(void);
 #ifndef GLOOM_DOS_SDL3
 static void select_aspect_720p_resolution(int *io_width, int *io_height);
@@ -15251,6 +15252,9 @@ static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer
 #ifdef GLOOM_DOS_SDL3
   bool dos_logged_first_frame = false;
 #endif
+#ifdef __EMSCRIPTEN__
+  bool web_loading_overlay_hidden = false;
+#endif
 
   if (renderer == NULL || framebuffer == NULL || assets == NULL || out_game_mode == NULL ||
       io_violence_mode == NULL || io_control_config == NULL) {
@@ -15445,6 +15449,12 @@ static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer
 #endif
       end_render_framebuffer(framebuffer);
       present_framebuffer_texture(renderer, framebuffer, render_width, render_height);
+#ifdef __EMSCRIPTEN__
+      if (!web_loading_overlay_hidden) {
+        runtime_emscripten_hide_loading_overlay();
+        web_loading_overlay_hidden = true;
+      }
+#endif
 #ifdef GLOOM_DOS_SDL3
       if (!dos_logged_first_frame) {
         dos_logf("DOS checkpoint: start menu first frame presented");
@@ -19630,6 +19640,10 @@ EM_JS(void, runtime_emscripten_canvas_fullscreen_toggle, (void), {
   if (Module['gloomToggleCanvasFullscreen']) Module['gloomToggleCanvasFullscreen']();
 });
 
+EM_JS(void, runtime_emscripten_hide_loading_overlay, (void), {
+  if (typeof window.gloomHideLoadingOverlay === 'function') window.gloomHideLoadingOverlay();
+});
+
 EM_JS(int, runtime_emscripten_take_pointer_lock_lost, (void), {
   var v = Module['gloomPointerLockLost'] | 0;
   Module['gloomPointerLockLost'] = 0;
@@ -19676,6 +19690,9 @@ void runtime_emscripten_install_fullscreen_listeners(void) {
 }
 
 void runtime_emscripten_canvas_fullscreen_toggle(void) {
+}
+
+void runtime_emscripten_hide_loading_overlay(void) {
 }
 
 static bool runtime_emscripten_consume_pointer_lock_lost(void) {
