@@ -88,6 +88,8 @@ add_custom_command(TARGET gloom_pc POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:gloom_pc>/amiga/prog/objs"
   COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:gloom_pc>/amiga/misc"
   COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:gloom_pc>/amiga/sfxs"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:gloom_pc>/amiga/pics"
+  COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:gloom_pc>/amiga/data/pics"
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
     "${CMAKE_SOURCE_DIR}/package/README.TXT"
     "$<TARGET_FILE_DIR:gloom_pc>/README.TXT"
@@ -105,6 +107,9 @@ add_custom_command(TARGET gloom_pc POST_BUILD
     "${CMAKE_SOURCE_DIR}/amiga/sparks4.bin"
     "${CMAKE_SOURCE_DIR}/amiga/sparks5.bin"
     "${CMAKE_SOURCE_DIR}/amiga/gridoffs4.bin"
+    "${CMAKE_SOURCE_DIR}/amiga/spacehulk.iff"
+    "${CMAKE_SOURCE_DIR}/amiga/gothic.iff"
+    "${CMAKE_SOURCE_DIR}/amiga/hell.iff"
     "${CMAKE_SOURCE_DIR}/amiga/theend.iff"
     "$<TARGET_FILE_DIR:gloom_pc>/amiga/"
   COMMAND ${CMAKE_COMMAND} -E copy_directory
@@ -137,6 +142,12 @@ add_custom_command(TARGET gloom_pc POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_directory
     "${CMAKE_SOURCE_DIR}/amiga/ggfx"
     "$<TARGET_FILE_DIR:gloom_pc>/amiga/ggfx"
+  COMMAND ${CMAKE_COMMAND} -E copy_directory
+    "${CMAKE_SOURCE_DIR}/amiga/pics"
+    "$<TARGET_FILE_DIR:gloom_pc>/amiga/pics"
+  COMMAND ${CMAKE_COMMAND} -E copy_directory
+    "${CMAKE_SOURCE_DIR}/amiga/data/pics"
+    "$<TARGET_FILE_DIR:gloom_pc>/amiga/data/pics"
   COMMENT "Copying runtime map/texture/object data to output directory"
 )
 endif()

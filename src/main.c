@@ -572,6 +572,7 @@ typedef struct {
 } ScriptCompletion;
 
 typedef struct {
+  char picture[64];
   char text[192];
 } ScriptLevelIntro;
 
@@ -4711,6 +4712,7 @@ static bool script_play_ordinal_for_map(const char *map_path, uint32_t *out_ordi
 
 static bool resolve_script_level_intro_for_map(const char *map_path, ScriptLevelIntro *out_intro) {
   char map_name[64] = {0};
+  char current_picture[sizeof(((ScriptLevelIntro *)0)->picture)] = {0};
   char current_text[sizeof(((ScriptLevelIntro *)0)->text)] = {0};
   uint8_t *script = NULL;
   size_t script_size = 0u;
@@ -4748,7 +4750,12 @@ static bool resolve_script_level_intro_for_map(const char *map_path, ScriptLevel
       line_len -= 1u;
     }
 
-    if (line_len > 5u && memcmp(line, "text_", 5u) == 0) {
+    if (line_len > 5u && memcmp(line, "pict_", 5u) == 0) {
+      if (!copy_script_token(current_picture, sizeof(current_picture), line + 5u, line_len - 5u)) {
+        free(script);
+        return false;
+      }
+    } else if (line_len > 5u && memcmp(line, "text_", 5u) == 0) {
       if (!copy_script_token(current_text, sizeof(current_text), line + 5u, line_len - 5u)) {
         free(script);
         return false;
@@ -4758,16 +4765,19 @@ static bool resolve_script_level_intro_for_map(const char *map_path, ScriptLevel
       size_t script_map_len = line_len - 5u;
 
       if (script_map_len == strlen(map_name) && memcmp(script_map_name, map_name, script_map_len) == 0) {
+        if (current_picture[0] != '\0') {
+          (void)snprintf(out_intro->picture, sizeof(out_intro->picture), "%s", current_picture);
+        }
         if (current_text[0] != '\0') {
           (void)snprintf(out_intro->text, sizeof(out_intro->text), "%s", current_text);
         }
         free(script);
-        return out_intro->text[0] != '\0';
+        return out_intro->picture[0] != '\0' && out_intro->text[0] != '\0';
       }
     }
   }
 
-  fprintf(stderr, "No script intro text found for map %s\n", map_name);
+  fprintf(stderr, "No script intro picture/text found for map %s\n", map_name);
   free(script);
   return false;
 }
@@ -13849,16 +13859,38 @@ static bool load_script_picture_image(const char *picture, MenuImage *out_image)
   char path1[256] = {0};
   char path2[256] = {0};
   char path3[256] = {0};
-  const char *candidates[4] = {path0, path1, path2, path3};
+  char path4[256] = {0};
+  char path5[256] = {0};
+  char path6[256] = {0};
+  char path7[256] = {0};
+  char path8[256] = {0};
+  const char *candidates[9] = {path0, path1, path2, path3, path4, path5, path6, path7, path8};
+  const char *dos_alias = NULL;
 
   if (picture == NULL || picture[0] == '\0' || out_image == NULL) {
     return false;
   }
+  if (strcmp(picture, "spacehulk") == 0) {
+    dos_alias = "SPACEHUL.IFF";
+  } else if (strcmp(picture, "gothic") == 0) {
+    dos_alias = "GOTHIC.IFF";
+  } else if (strcmp(picture, "hell") == 0) {
+    dos_alias = "HELL.IFF";
+  } else if (strcmp(picture, "theend") == 0) {
+    dos_alias = "THEEND.IFF";
+  }
 
-  (void)snprintf(path0, sizeof(path0), "amiga/%s.iff", picture);
-  (void)snprintf(path1, sizeof(path1), "amiga/pics/%s.iff", picture);
-  (void)snprintf(path2, sizeof(path2), "amiga/data/pics/%s.iff", picture);
-  (void)snprintf(path3, sizeof(path3), "%s.iff", picture);
+  (void)snprintf(path0, sizeof(path0), "amiga/pics/%s", picture);
+  (void)snprintf(path1, sizeof(path1), "amiga/data/pics/%s", picture);
+  (void)snprintf(path2, sizeof(path2), "amiga/%s.iff", picture);
+  (void)snprintf(path3, sizeof(path3), "amiga/%s", picture);
+  (void)snprintf(path4, sizeof(path4), "amiga/pics/%s.iff", picture);
+  (void)snprintf(path5, sizeof(path5), "amiga/data/pics/%s.iff", picture);
+  (void)snprintf(path6, sizeof(path6), "%s.iff", picture);
+  (void)snprintf(path7, sizeof(path7), "%s", picture);
+  if (dos_alias != NULL) {
+    (void)snprintf(path8, sizeof(path8), "amiga/%s", dos_alias);
+  }
   return load_iff_menu_image_from_candidates(candidates, sizeof(candidates) / sizeof(candidates[0]), out_image);
 }
 
@@ -15608,8 +15640,8 @@ static bool run_completion_screen(SDL_Renderer *renderer, RenderFramebuffer *fra
   return true;
 }
 
-static void render_script_intro_text(RenderFramebuffer *framebuffer, const HudFont *font, const char *text,
-                                     int render_width, int render_height) {
+static void render_script_intro_frame(RenderFramebuffer *framebuffer, const MenuImage *image, const HudFont *font,
+                                      const char *text, int render_width, int render_height) {
   char line[96];
   const char *cursor = text;
   int scale = 1;
@@ -15622,6 +15654,7 @@ static void render_script_intro_text(RenderFramebuffer *framebuffer, const HudFo
     return;
   }
   framebuffer_clear(framebuffer, 0xFF000000u);
+  render_menu_image(framebuffer, image, render_width, render_height);
   if (font == NULL || text == NULL || text[0] == '\0') {
     return;
   }
@@ -15692,6 +15725,8 @@ static void render_script_intro_text(RenderFramebuffer *framebuffer, const HudFo
 
 static bool run_script_intro_screen(SDL_Renderer *renderer, RenderFramebuffer *framebuffer,
                                     const ScriptLevelIntro *intro, int render_width, int render_height) {
+  static MenuImage image;
+  static char cached_picture[sizeof(((ScriptLevelIntro *)0)->picture)] = {0};
   static HudFont font;
   static bool font_loaded = false;
   bool running = true;
@@ -15705,10 +15740,18 @@ static bool run_script_intro_screen(SDL_Renderer *renderer, RenderFramebuffer *f
   const double auto_continue_seconds = 5.0;
 #endif
 
-  if (renderer == NULL || framebuffer == NULL || intro == NULL || intro->text[0] == '\0') {
+  if (renderer == NULL || framebuffer == NULL || intro == NULL || intro->picture[0] == '\0' ||
+      intro->text[0] == '\0') {
     return true;
   }
   runtime_prepare_menu_input();
+  if (!image.loaded || strcmp(cached_picture, intro->picture) != 0) {
+    if (!load_script_picture_image(intro->picture, &image)) {
+      fprintf(stderr, "Cannot execute script intro screen: missing original pict_%s image\n", intro->picture);
+      return false;
+    }
+    (void)snprintf(cached_picture, sizeof(cached_picture), "%s", intro->picture);
+  }
   if (!font_loaded) {
     memset(&font, 0, sizeof(font));
     if (!load_menu_big_font(&font)) {
@@ -15717,7 +15760,7 @@ static bool run_script_intro_screen(SDL_Renderer *renderer, RenderFramebuffer *f
     font_loaded = true;
   }
 #ifdef GLOOM_DOS_SDL3
-  apply_dos_menu_display_palette(framebuffer, NULL, NULL, &font);
+  apply_dos_menu_display_palette(framebuffer, &image, NULL, &font);
 #endif
   intro_start = SDL_GetPerformanceCounter();
   performance_frequency = SDL_GetPerformanceFrequency();
@@ -15760,7 +15803,7 @@ static bool run_script_intro_screen(SDL_Renderer *renderer, RenderFramebuffer *f
     }
 
     if (begin_render_framebuffer(framebuffer)) {
-      render_script_intro_text(framebuffer, &font, intro->text, render_width, render_height);
+      render_script_intro_frame(framebuffer, &image, &font, intro->text, render_width, render_height);
       end_render_framebuffer(framebuffer);
       SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
       SDL_RenderClear(renderer);
@@ -18605,6 +18648,7 @@ static int run_level_transition_selftest(void) {
   ScriptCompletion completion;
   ScriptLevelIntro intro;
   MenuImage completion_image;
+  MenuImage intro_image;
   int16_t preserved_lives = 1;
   int16_t preserved_p2_lives = 3;
   size_t chain_index = 0u;
@@ -18614,6 +18658,7 @@ static int run_level_transition_selftest(void) {
   memset(&completion, 0, sizeof(completion));
   memset(&intro, 0, sizeof(intro));
   memset(&completion_image, 0, sizeof(completion_image));
+  memset(&intro_image, 0, sizeof(intro_image));
   state = (AppState *)calloc(1u, sizeof(*state));
   wall_textures = (WallTextureSet *)calloc(1u, sizeof(*wall_textures));
   flat_textures = (FlatTextureSet *)calloc(1u, sizeof(*flat_textures));
@@ -18636,13 +18681,27 @@ static int run_level_transition_selftest(void) {
     goto cleanup;
   }
   if (!resolve_script_level_intro_for_map("amiga/maps/map1_1", &intro) ||
+      strcmp(intro.picture, "spacehulk") != 0 ||
       strcmp(intro.text, "simple stuff!\\watch out for ambushes though...") != 0) {
-    fprintf(stderr, "Level transition selftest failed: original map1_1 intro text was not resolved\n");
+    fprintf(stderr, "Level transition selftest failed: original map1_1 intro picture/text was not resolved\n");
     goto cleanup;
   }
   if (!resolve_script_level_intro_for_map(next_map_path, &intro) ||
+      strcmp(intro.picture, "spacehulk") != 0 ||
       strcmp(intro.text, "stay alert! watch out for aggro skinheads!") != 0) {
-    fprintf(stderr, "Level transition selftest failed: original map1_2 intro text was not resolved\n");
+    fprintf(stderr, "Level transition selftest failed: original map1_2 intro picture/text was not resolved\n");
+    goto cleanup;
+  }
+  if (!resolve_script_level_intro_for_map("amiga/data/maps/map3_1", &intro) ||
+      strcmp(intro.picture, "gothic") != 0 ||
+      strcmp(intro.text, "raptor madness in the gothic tomb!") != 0) {
+    fprintf(stderr, "Level transition selftest failed: original map3_1 intro picture/text was not resolved\n");
+    goto cleanup;
+  }
+  if (!resolve_script_level_intro_for_map("amiga/data/maps/map4_1", &intro) ||
+      strcmp(intro.picture, "hell") != 0 ||
+      strcmp(intro.text, "welcome to hell!") != 0) {
+    fprintf(stderr, "Level transition selftest failed: original map4_1 intro picture/text was not resolved\n");
     goto cleanup;
   }
   if (resolve_next_script_play_map_or_done("amiga/maps/map4_7", next_map_path, sizeof(next_map_path), &completion) !=
@@ -18655,6 +18714,19 @@ static int run_level_transition_selftest(void) {
   if (!load_script_picture_image(completion.picture, &completion_image)) {
     fprintf(stderr, "Level transition selftest failed: original completion picture could not be loaded\n");
     goto cleanup;
+  }
+  {
+    static const char *expected_intro_pictures[] = {"spacehulk", "gothic", "hell"};
+    size_t picture_index = 0u;
+
+    for (picture_index = 0u; picture_index < sizeof(expected_intro_pictures) / sizeof(expected_intro_pictures[0]);
+         ++picture_index) {
+      if (!load_script_picture_image(expected_intro_pictures[picture_index], &intro_image)) {
+        fprintf(stderr, "Level transition selftest failed: original pict_%s image could not be loaded\n",
+                expected_intro_pictures[picture_index]);
+        goto cleanup;
+      }
+    }
   }
 
   for (chain_index = 0u; chain_index + 1u < sizeof(expected_play_chain) / sizeof(expected_play_chain[0]);
@@ -18730,6 +18802,7 @@ static int run_level_transition_selftest(void) {
 
 cleanup:
   free_menu_image(&completion_image);
+  free_menu_image(&intro_image);
   free_object_visual_set(object_visuals);
   free_flat_texture_set(flat_textures);
   free_wall_texture_set(wall_textures);

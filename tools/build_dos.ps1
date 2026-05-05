@@ -243,7 +243,9 @@ $runtimeDirs = @(
   'prog\objs',
   'misc',
   'sfxs',
-  'ggfx'
+  'ggfx',
+  'pics',
+  'data\pics'
 )
 
 foreach ($runtimeDir in $runtimeDirs) {
@@ -256,7 +258,11 @@ foreach ($runtimeDir in $runtimeDirs) {
 }
 
 $runtimeRootFiles = @(
-  @{ Source = 'blackmagic.iff'; Dest = 'BLACKMAG.IFF' }
+  @{ Source = 'blackmagic.iff'; Dest = 'BLACKMAG.IFF' },
+  @{ Source = 'spacehulk.iff'; Dest = 'SPACEHUL.IFF' },
+  @{ Source = 'gothic.iff'; Dest = 'GOTHIC.IFF' },
+  @{ Source = 'hell.iff'; Dest = 'HELL.IFF' },
+  @{ Source = 'theend.iff'; Dest = 'THEEND.IFF' }
 )
 
 foreach ($runtimeRootFile in $runtimeRootFiles) {
