@@ -248,6 +248,8 @@ typedef struct {
   SDL_AudioStream *stream;
   uint8_t *mix_buffer;
   int mix_buffer_size;
+  int dos_audio_chunk_size;
+  int dos_audio_target_bytes;
 #endif
   SDL_AudioSpec obtained;
   SfxSample samples[GLOOM_SFX_COUNT];
@@ -928,6 +930,13 @@ static void audio_shutdown(AudioSystem *audio);
 static void audio_play_sfx(int sfx_id, int volume, int priority);
 static void audio_vblank_tick(void);
 static void audio_pause_output(AudioSystem *audio, bool paused, bool clear_channels);
+#ifdef GLOOM_DOS_SDL3
+extern int SDL_DOSSoundBlasterGetQueuedAudioSize(SDL_AudioDeviceID devid);
+extern int SDL_DOSSoundBlasterGetAudioBufferSize(SDL_AudioDeviceID devid);
+extern int SDL_DOSSoundBlasterGetAudioChunkSize(SDL_AudioDeviceID devid);
+extern bool SDL_DOSSoundBlasterQueueAudio(SDL_AudioDeviceID devid, const void *buffer, int len);
+extern void SDL_DOSSoundBlasterClearQueuedAudio(SDL_AudioDeviceID devid);
+#endif
 static void gamepad_init(void);
 static void gamepad_shutdown(void);
 static void gamepad_handle_device_added(int device_index);
@@ -1763,6 +1772,147 @@ static void audio_dos_callback_s16(void *userdata, Uint8 *stream, int len) {
   }
 }
 
+static uint8_t audio_clamp_u8(int value) {
+  if (value < 0) {
+    return 0u;
+  }
+  if (value > 255) {
+    return 255u;
+  }
+  return (uint8_t)value;
+}
+
+static void audio_dos_callback_u8(void *userdata, Uint8 *stream, int len, int channels) {
+  AudioSystem *audio = (AudioSystem *)userdata;
+  int frames = channels > 0 ? len / channels : 0;
+  int frame = 0;
+
+  if (channels != 1 && channels != 2) {
+    memset(stream, 128, (size_t)len);
+    return;
+  }
+  memset(stream, 128, (size_t)len);
+  if (audio == NULL) {
+    return;
+  }
+
+  for (frame = 0; frame < frames; ++frame) {
+    int left = 0;
+    int right = 0;
+    int channel_index = 0;
+
+    for (channel_index = 0; channel_index < GLOOM_AUDIO_CHANNEL_COUNT; ++channel_index) {
+      AudioChannel *channel = &audio->channels[channel_index];
+      const SfxSample *sample = NULL;
+      uint32_t sample_index = 0u;
+      int scaled = 0;
+
+      if (!channel->active || channel->sfx_id < 0 || channel->sfx_id >= GLOOM_SFX_COUNT) {
+        continue;
+      }
+
+      sample = &audio->samples[channel->sfx_id];
+      sample_index = channel->position_fp >> 16;
+      if (!sample->loaded || sample->samples == NULL || sample_index >= sample->sample_count) {
+        channel->active = false;
+        continue;
+      }
+
+      if (channel->busy_passes > 0u) {
+        scaled = ((int)sample->samples[sample_index] * channel->volume) / 64;
+        if (channel_index == 1 || channel_index == 2) {
+          right += scaled;
+        } else {
+          left += scaled;
+        }
+      }
+
+      channel->position_fp += channel->increment_fp;
+      if ((channel->position_fp >> 16) >= sample->sample_count) {
+        channel->active = false;
+      }
+    }
+
+    if (audio->ui_beep_remaining > 0u && audio->ui_beep_total > 0u) {
+      int value = (audio->ui_beep_phase_fp & 0x80000000u) != 0u ? -audio->ui_beep_volume_s16
+                                                                : audio->ui_beep_volume_s16;
+      value = (int)(((int64_t)value * (int64_t)audio->ui_beep_remaining) / (int64_t)audio->ui_beep_total);
+      value /= 256;
+      left += value;
+      right += value;
+      audio->ui_beep_phase_fp += audio->ui_beep_phase_step_fp;
+      audio->ui_beep_remaining -= 1u;
+    }
+
+    if (channels == 1) {
+      stream[frame] = audio_clamp_u8(128 + ((left + right) / 2));
+    } else {
+      stream[frame * 2] = audio_clamp_u8(128 + left);
+      stream[(frame * 2) + 1] = audio_clamp_u8(128 + right);
+    }
+  }
+}
+
+static bool audio_dos_has_active_output(const AudioSystem *audio) {
+  int i = 0;
+
+  if (audio == NULL) {
+    return false;
+  }
+  if (audio->ui_beep_remaining > 0u) {
+    return true;
+  }
+  for (i = 0; i < GLOOM_AUDIO_CHANNEL_COUNT; ++i) {
+    if (audio->channels[i].active || audio->channels[i].queued) {
+      return true;
+    }
+  }
+  return false;
+}
+
+static void audio_dos_mix_device_format(AudioSystem *audio, uint8_t *stream, int len) {
+  if (audio == NULL || stream == NULL || len <= 0) {
+    return;
+  }
+  if (audio->obtained.format == SDL_AUDIO_U8) {
+    audio_dos_callback_u8(audio, stream, len, audio->obtained.channels);
+  } else {
+    audio_dos_callback_s16(audio, stream, len);
+  }
+}
+
+static void audio_dos_pump(AudioSystem *audio) {
+  int queued = 0;
+  int buffer_size = 0;
+  int chunk_size = 0;
+
+  if (audio == NULL || !audio->initialized || audio->device == 0u || audio->mix_buffer == NULL ||
+      audio->mix_buffer_size <= 0 || !audio_dos_has_active_output(audio)) {
+    return;
+  }
+  if (audio->stream != NULL && SDL_AudioStreamDevicePaused(audio->stream)) {
+    return;
+  }
+
+  queued = SDL_DOSSoundBlasterGetQueuedAudioSize(audio->device);
+  buffer_size = audio->dos_audio_target_bytes > 0 ? audio->dos_audio_target_bytes
+                                                  : SDL_DOSSoundBlasterGetAudioBufferSize(audio->device);
+  chunk_size = audio->dos_audio_chunk_size > 0 ? audio->dos_audio_chunk_size
+                                               : SDL_DOSSoundBlasterGetAudioChunkSize(audio->device);
+  if (queued < 0 || buffer_size <= 0 || chunk_size <= 0 || chunk_size > audio->mix_buffer_size) {
+    return;
+  }
+
+  while (queued + chunk_size <= buffer_size && audio_dos_has_active_output(audio)) {
+    audio_dos_mix_device_format(audio, audio->mix_buffer, chunk_size);
+    if (!SDL_DOSSoundBlasterQueueAudio(audio->device, audio->mix_buffer, chunk_size)) {
+      dos_logf("DOS Sound Blaster: manual queue failed: %s", SDL_GetError());
+      break;
+    }
+    queued += chunk_size;
+  }
+}
+
 static void audio_dos_stream_callback(void *userdata, SDL_AudioStream *stream, int additional_amount,
                                       int total_amount) {
   AudioSystem *audio = (AudioSystem *)userdata;
@@ -1798,6 +1948,7 @@ static void audio_dos_stream_callback(void *userdata, SDL_AudioStream *stream, i
 static bool audio_start(AudioSystem *audio) {
 #ifdef GLOOM_DOS_SDL3
   SDL_AudioSpec desired;
+  int sample_frames = 0;
 
   if (audio == NULL) {
     return false;
@@ -1816,6 +1967,8 @@ static bool audio_start(AudioSystem *audio) {
   }
 
   SDL_SetHint(SDL_HINT_AUDIO_DRIVER, "soundblaster");
+  SDL_SetHint("SDL_DOS_MANUAL_AUDIO_FREQ", "22050");
+  SDL_SetHint("SDL_DOS_MANUAL_AUDIO_PUMP", "1");
   audio->stream =
       SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &desired, audio_dos_stream_callback, audio);
   if (audio->stream == NULL) {
@@ -1827,10 +1980,60 @@ static bool audio_start(AudioSystem *audio) {
   }
 
   audio->device = SDL_GetAudioStreamDevice(audio->stream);
-  audio->obtained = desired;
+  if (!SDL_GetAudioDeviceFormat(audio->device, &audio->obtained, &sample_frames)) {
+    fprintf(stderr, "SDL_GetAudioDeviceFormat failed for DOS Sound Blaster Paula SFX: %s\n", SDL_GetError());
+    SDL_DestroyAudioStream(audio->stream);
+    audio->stream = NULL;
+    audio->device = 0u;
+    free(audio->mix_buffer);
+    audio->mix_buffer = NULL;
+    audio->mix_buffer_size = 0;
+    return false;
+  }
+  if (!((audio->obtained.format == SDL_AUDIO_S16LE && audio->obtained.channels == 2) ||
+        (audio->obtained.format == SDL_AUDIO_U8 &&
+         (audio->obtained.channels == 1 || audio->obtained.channels == 2)))) {
+    fprintf(stderr, "DOS Sound Blaster returned unsupported Paula SFX format/channels\n");
+    SDL_DestroyAudioStream(audio->stream);
+    audio->stream = NULL;
+    audio->device = 0u;
+    free(audio->mix_buffer);
+    audio->mix_buffer = NULL;
+    audio->mix_buffer_size = 0;
+    return false;
+  }
+  audio->dos_audio_chunk_size = SDL_DOSSoundBlasterGetAudioChunkSize(audio->device);
+  audio->dos_audio_target_bytes = SDL_DOSSoundBlasterGetAudioBufferSize(audio->device);
+  if (audio->dos_audio_chunk_size <= 0 || audio->dos_audio_target_bytes <= 0) {
+    fprintf(stderr, "DOS Sound Blaster manual pump did not expose an audio ring buffer\n");
+    SDL_DestroyAudioStream(audio->stream);
+    audio->stream = NULL;
+    audio->device = 0u;
+    free(audio->mix_buffer);
+    audio->mix_buffer = NULL;
+    audio->mix_buffer_size = 0;
+    return false;
+  }
+  if (audio->dos_audio_chunk_size > audio->mix_buffer_size) {
+    uint8_t *new_buffer = (uint8_t *)realloc(audio->mix_buffer, (size_t)audio->dos_audio_chunk_size);
+    if (new_buffer == NULL) {
+      fprintf(stderr, "Out of memory while resizing DOS Sound Blaster Paula mixer buffer\n");
+      SDL_DestroyAudioStream(audio->stream);
+      audio->stream = NULL;
+      audio->device = 0u;
+      free(audio->mix_buffer);
+      audio->mix_buffer = NULL;
+      audio->mix_buffer_size = 0;
+      return false;
+    }
+    audio->mix_buffer = new_buffer;
+    audio->mix_buffer_size = audio->dos_audio_chunk_size;
+  }
   audio->initialized = true;
-  dos_logf("DOS Sound Blaster: opened Paula SFX stream at %d Hz device=%lu", desired.freq,
-           (unsigned long)audio->device);
+  dos_logf("DOS Sound Blaster: opened manual Paula SFX pump at %d Hz format=0x%x channels=%d sample_frames=%d "
+           "chunk=%d ring=%d device=%lu",
+           audio->obtained.freq, (unsigned)audio->obtained.format, audio->obtained.channels, sample_frames,
+           audio->dos_audio_chunk_size, audio->dos_audio_target_bytes, (unsigned long)audio->device);
   if (!SDL_ResumeAudioStreamDevice(audio->stream)) {
     fprintf(stderr, "SDL_ResumeAudioStreamDevice failed for DOS Sound Blaster Paula SFX: %s\n", SDL_GetError());
     SDL_DestroyAudioStream(audio->stream);
@@ -1890,6 +2093,8 @@ static void audio_shutdown(AudioSystem *audio) {
   free(audio->mix_buffer);
   audio->mix_buffer = NULL;
   audio->mix_buffer_size = 0;
+  audio->dos_audio_chunk_size = 0;
+  audio->dos_audio_target_bytes = 0;
   audio->device = 0u;
 #else
   if (audio->device != 0u) {
@@ -2135,6 +2340,7 @@ static void audio_pause_output(AudioSystem *audio, bool paused, bool clear_chann
     if (audio->stream != NULL) {
       (void)SDL_UnlockAudioStream(audio->stream);
       (void)SDL_ClearAudioStream(audio->stream);
+      SDL_DOSSoundBlasterClearQueuedAudio(audio->device);
     }
 #else
     SDL_UnlockAudioDevice(audio->device);
@@ -10017,6 +10223,9 @@ static void present_framebuffer_texture(SDL_Renderer *renderer, const RenderFram
   SDL_RenderClear(renderer);
   (void)SDL_RenderCopy(renderer, framebuffer->texture, NULL, &dst);
   SDL_RenderPresent(renderer);
+#ifdef GLOOM_DOS_SDL3
+  audio_dos_pump(&g_audio);
+#endif
 }
 
 static bool runtime_menu_accepts_mouse(void) {
@@ -17227,6 +17436,8 @@ int main(int argc, char **argv) {
 #ifdef GLOOM_DOS_SDL3
   SDL_SetHint(SDL_HINT_AUDIO_DRIVER, "soundblaster");
   SDL_SetHint(SDL_HINT_DOS_ALLOW_DIRECT_FRAMEBUFFER, "1");
+  SDL_SetHint("SDL_DOS_MANUAL_AUDIO_FREQ", "22050");
+  SDL_SetHint("SDL_DOS_MANUAL_AUDIO_PUMP", "1");
   SDL_SetHint("SDL_DOS_SKIP_EVENT_YIELD", "1");
   SDL_SetHint("SDL_DOS_SKIP_MOUSE_PUMP", "1");
   if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_AUDIO) != 0) {
@@ -17713,6 +17924,9 @@ int main(int argc, char **argv) {
       accumulator -= dt;
     }
     profile_add_elapsed(&g_profiler.update_ms, profile_start_ms);
+#ifdef GLOOM_DOS_SDL3
+    audio_dos_pump(&g_audio);
+#endif
 
     if (title_timer >= 1.0) {
 #ifndef __EMSCRIPTEN__
