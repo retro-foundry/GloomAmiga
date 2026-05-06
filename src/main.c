@@ -21115,6 +21115,21 @@ int main(int argc, char **argv) {
         running = false;
       }
     }
+#ifdef __EMSCRIPTEN__
+    if (!g_profiler.enabled) {
+      uint64_t frame_end = SDL_GetPerformanceCounter();
+      double frame_elapsed = perf_frequency > 0u ? (double)(frame_end - perf_now) / (double)perf_frequency : 0.0;
+      int sleep_ms = 0;
+
+      if (frame_elapsed < (1.0 / 60.0)) {
+        sleep_ms = (int)(((1.0 / 60.0) - frame_elapsed) * 1000.0);
+        if (sleep_ms < 1) {
+          sleep_ms = 1;
+        }
+      }
+      emscripten_sleep(sleep_ms);
+    }
+#endif
   }
 
   profile_report(render_width, render_height);

@@ -404,12 +404,8 @@
             if (window.WEBRTC_JOIN_MODE) return;
             const canvas = document.getElementById('canvas');
             if (!canvas || typeof Module === 'undefined' || !Module.canvas) return;
-            const w = Math.max(1, window.innerWidth);
-            const h = Math.max(1, window.innerHeight);
-            if (canvas.width !== w || canvas.height !== h) {
-                canvas.width = w;
-                canvas.height = h;
-            }
+            canvas.style.width = '100%';
+            canvas.style.height = '100%';
         }
         var Module = {
             print(text) {

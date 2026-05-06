@@ -12,6 +12,10 @@ option(GLOOM_ENABLE_WEB_ASSETS "Preload game assets when targeting Emscripten" O
 option(GLOOM_ENABLE_MENU_MUSIC "Enable original Amiga title music on web/desktop builds" ON)
 set(GLOOM_BINARY_VERSION "${PROJECT_VERSION}" CACHE STRING "Version string embedded in native/DOS binary builds")
 
+if(EMSCRIPTEN AND NOT CMAKE_CONFIGURATION_TYPES)
+  set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 if(NOT EMSCRIPTEN AND GLOOM_FETCH_SDL)
   set(SDL_SHARED OFF CACHE BOOL "" FORCE)
   set(SDL_STATIC ON CACHE BOOL "" FORCE)

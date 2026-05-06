@@ -1,6 +1,7 @@
 # Build trees
 /build/
 /build-web/
+/dist/
 /out/
 /cmake-build-*/
 
