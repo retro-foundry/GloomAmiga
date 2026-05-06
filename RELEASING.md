@@ -1,6 +1,6 @@
 # Releasing Gloom PC
 
-This repository releases native desktop builds through GitHub Actions. Pushing a version tag matching `v*.*.*`, for example `v0.1.0`, builds clean Linux, Windows, and macOS archives from the tagged source, runs the native self-tests, creates SHA256 checksums, records artifact attestations, and publishes the files to a GitHub Release using `GITHUB_TOKEN`.
+This repository releases native desktop and DOS builds through GitHub Actions. Pushing a version tag matching `v*.*.*`, for example `v0.1.0`, builds clean Linux, Windows, macOS, and DOS archives from the tagged source, runs the available self-tests, creates SHA256 checksums, records artifact attestations, and publishes the files to a GitHub Release using `GITHUB_TOKEN`.
 
 ## Create a Release
 
@@ -20,12 +20,15 @@ The release workflow creates or updates the GitHub Release for that tag. The rel
 Each release contains:
 
 - `gloom-pc-<tag>-windows-x64.zip`
+- `gloom-pc-<tag>-dos-386.zip`
 - `gloom-pc-<tag>-linux-x64.tar.gz`
 - `gloom-pc-<tag>-macos-x64.zip`
 - `SHA256SUMS.txt`
 - `VERIFY_RELEASE.md`
 
-The platform archives contain the executable, `README.TXT`, `GLOOM.INI`, this verification guide, and the required Amiga runtime assets copied by the CMake build. Source trees, CMake caches, intermediate objects, debug symbols, and temporary files are not packaged.
+The platform archives contain the executable, `README.TXT`, `GLOOM.INI`, this verification guide, and the required Amiga runtime assets copied by the build. The DOS archive also contains `GLOOM.BAT` and `CWSDPMI.EXE`, which DJGPP protected-mode DOS programs need on real DOS systems and some emulators. Source trees, CMake caches, intermediate objects, debug symbols, and temporary files are not packaged.
+
+The DOS job bootstraps the DJGPP GCC 12.2.0 cross-compiler, CWSDPMI, and the pinned SDL3 DOS source used by this port before running `tools/build_dos.ps1`.
 
 ## Verification
 

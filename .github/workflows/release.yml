@@ -30,6 +30,9 @@ jobs:
           - platform: windows
             os: windows-latest
             config: Release
+          - platform: dos
+            os: windows-latest
+            config: Release
           - platform: macos
             os: macos-latest
             config: Release
@@ -74,21 +77,33 @@ jobs:
             libxss-dev
 
       - name: Configure CMake
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && matrix.platform != 'dos'
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.config }}
 
       - name: Configure CMake
-        if: runner.os == 'Windows'
+        if: matrix.platform == 'windows'
         run: cmake -S . -B build -A x64
 
       - name: Build release binary
+        if: matrix.platform != 'dos'
         run: cmake --build build --config ${{ matrix.config }} --parallel
 
       - name: Run self-tests
+        if: matrix.platform != 'dos'
         run: python scripts/run_selftests.py --build-dir build --config ${{ matrix.config }}
 
+      - name: Set up DOS build dependencies
+        if: matrix.platform == 'dos'
+        shell: pwsh
+        run: scripts/setup_dos_build.ps1
+
+      - name: Build DOS release binary
+        if: matrix.platform == 'dos'
+        shell: pwsh
+        run: tools/build_dos.ps1
+
       - name: Sign Windows executable
-        if: runner.os == 'Windows' && env.WINDOWS_SIGNING_CERT_BASE64 != '' && env.WINDOWS_SIGNING_CERT_PASSWORD != ''
+        if: matrix.platform == 'windows' && env.WINDOWS_SIGNING_CERT_BASE64 != '' && env.WINDOWS_SIGNING_CERT_PASSWORD != ''
         shell: pwsh
         run: |
           $certPath = Join-Path $env:RUNNER_TEMP "gloom-signing.pfx"

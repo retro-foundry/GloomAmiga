@@ -25,6 +25,9 @@ jobs:
           - platform: windows
             os: windows-latest
             config: Release
+          - platform: dos
+            os: windows-latest
+            config: Release
           - platform: macos
             os: macos-latest
             config: Release
@@ -66,15 +69,35 @@ jobs:
             libxss-dev
 
       - name: Configure CMake
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && matrix.platform != 'dos'
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.config }}
 
       - name: Configure CMake
-        if: runner.os == 'Windows'
+        if: matrix.platform == 'windows'
         run: cmake -S . -B build -A x64
 
       - name: Build
+        if: matrix.platform != 'dos'
         run: cmake --build build --config ${{ matrix.config }} --parallel
 
       - name: Run self-tests
+        if: matrix.platform != 'dos'
         run: python scripts/run_selftests.py --build-dir build --config ${{ matrix.config }}
+
+      - name: Set up DOS build dependencies
+        if: matrix.platform == 'dos'
+        shell: pwsh
+        run: scripts/setup_dos_build.ps1
+
+      - name: Build DOS binary
+        if: matrix.platform == 'dos'
+        shell: pwsh
+        run: tools/build_dos.ps1
+
+      - name: Verify DOS output
+        if: matrix.platform == 'dos'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path build\dos\GLOOMPC.EXE)) { throw "Missing DOS executable" }
+          if (-not (Test-Path build\dos\CWSDPMI.EXE)) { throw "Missing CWSDPMI.EXE" }
+          if (-not (Test-Path build\dos\GLOOM.INI)) { throw "Missing DOS INI" }

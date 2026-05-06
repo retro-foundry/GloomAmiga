@@ -1,6 +1,6 @@
 # Verifying Gloom PC Releases
 
-Release binaries are built by GitHub Actions from the tagged source revision. A release tag such as `v0.1.0` creates the Windows, Linux, and macOS archives, a `SHA256SUMS.txt` checksum file, and GitHub artifact attestations where GitHub supports them.
+Release binaries are built by GitHub Actions from the tagged source revision. A release tag such as `v0.1.0` creates the Windows, DOS, Linux, and macOS archives, a `SHA256SUMS.txt` checksum file, and GitHub artifact attestations where GitHub supports them.
 
 ## Verify Checksums
 

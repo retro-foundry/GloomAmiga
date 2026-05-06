@@ -14,6 +14,14 @@ $xmpInclude = Join-Path $xmpSource 'include'
 $xmpLib = Join-Path $xmpBuild 'libxmp_dos.a'
 $outDir = Join-Path $repoRoot 'build\dos'
 $outExe = Join-Path $outDir 'GLOOMPC.EXE'
+$cmakeLists = Get-Content -LiteralPath (Join-Path $repoRoot 'CMakeLists.txt') -Raw
+$versionMatch = [regex]::Match($cmakeLists, 'project\s*\(\s*GloomPC\s+VERSION\s+(\d+)\.(\d+)\.(\d+)')
+if (-not $versionMatch.Success) {
+  throw "Unable to read GloomPC version from CMakeLists.txt"
+}
+$versionMajor = $versionMatch.Groups[1].Value
+$versionMinor = $versionMatch.Groups[2].Value
+$versionPatch = $versionMatch.Groups[3].Value
 
 if (-not (Test-Path -LiteralPath (Join-Path $djgppBin 'i586-pc-msdosdjgpp-gcc.exe'))) {
   throw "Missing DJGPP compiler under $djgppBin"
@@ -21,16 +29,16 @@ if (-not (Test-Path -LiteralPath (Join-Path $djgppBin 'i586-pc-msdosdjgpp-gcc.ex
 
 $sdlDosEvents = Join-Path $sdlSource 'src\video\dos\SDL_dosevents.c'
 if (Test-Path -LiteralPath $sdlDosEvents) {
-  $eventsSource = Get-Content -LiteralPath $sdlDosEvents -Raw
+  $eventsSource = (Get-Content -LiteralPath $sdlDosEvents -Raw) -replace "`r`n", "`n"
   $patchedSource = $eventsSource
 
   if ($patchedSource -notlike '*SDL_DOS_SKIP_EVENT_YIELD*') {
-    $yieldPatchSource = "    /* Give cooperative threads a chance to run.  Audio mixing now runs`n       in its own cooperative thread (via SDL's normal audio thread),`n       so it will execute during this yield along with loading threads`n       and anything else that is runnable. */`n    DOS_Yield();"
-    if (-not $patchedSource.Contains($yieldPatchSource)) {
+    $yieldPatchPattern = '(?s)\s*/\* Give cooperative threads a chance to run\..*?\*/\r?\n\s*DOS_Yield\(\);'
+    if (-not [regex]::IsMatch($patchedSource, $yieldPatchPattern)) {
       throw "Unable to patch SDL DOS event yield in $sdlDosEvents"
     }
-    $patchedSource = $patchedSource.Replace($yieldPatchSource,
-      "    /* Gloom DOS pumps events once per rendered frame; yielding here turns`n       input polling into a visible frame-time spike on 386-class profiles. */`n    if (!SDL_GetHintBoolean(`"SDL_DOS_SKIP_EVENT_YIELD`", false)) {`n        DOS_Yield();`n    }")
+    $patchedSource = [regex]::Replace($patchedSource, $yieldPatchPattern,
+      "`n    /* Gloom DOS pumps events once per rendered frame; yielding here turns`n       input polling into a visible frame-time spike on 386-class profiles. */`n    if (!SDL_GetHintBoolean(`"SDL_DOS_SKIP_EVENT_YIELD`", false)) {`n        DOS_Yield();`n    }", 1)
   }
   if ($patchedSource -notlike '*SDL_DOS_SKIP_MOUSE_PUMP*') {
     $mousePatchSource = '    if (mouse->internal) { // if non-NULL, there''s a mouse detected on the system.'
@@ -47,7 +55,7 @@ if (Test-Path -LiteralPath $sdlDosEvents) {
 
 $sdlDosAudio = Join-Path $sdlSource 'src\audio\dos\SDL_dosaudio_sb.c'
 if (Test-Path -LiteralPath $sdlDosAudio) {
-  $audioSource = Get-Content -LiteralPath $sdlDosAudio -Raw
+  $audioSource = (Get-Content -LiteralPath $sdlDosAudio -Raw) -replace "`r`n", "`n"
   $patchedAudio = $audioSource
 
   if ($patchedAudio -notlike '*#define RING_BUFFER_CHUNKS 8*') {
@@ -276,6 +284,14 @@ if ($LASTEXITCODE -ne 0) {
 New-Item -ItemType Directory -Force -Path $outDir | Out-Null
 Copy-Item -LiteralPath (Join-Path $repoRoot 'package\README.TXT') -Destination (Join-Path $outDir 'README.TXT') -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot 'package\GLOOM.INI') -Destination (Join-Path $outDir 'GLOOM.INI') -Force
+$csdpmi = Join-Path $repoRoot 'build\dos-toolchain\csdpmi7b\bin\CWSDPMI.EXE'
+if (Test-Path -LiteralPath $csdpmi) {
+  Copy-Item -LiteralPath $csdpmi -Destination (Join-Path $outDir 'CWSDPMI.EXE') -Force
+}
+Set-Content -LiteralPath (Join-Path $outDir 'GLOOM.BAT') -Value @(
+  '@ECHO OFF',
+  'GLOOMPC.EXE %1 %2 %3 %4 %5 %6 %7 %8 %9'
+) -Encoding ASCII
 $env:Path = "$djgppBin;$env:Path"
 
 $runtimeDirs = @(
@@ -328,7 +344,8 @@ try {
   & (Join-Path $djgppBin 'i586-pc-msdosdjgpp-gcc.exe') `
     -O3 -fomit-frame-pointer -march=i386 -mtune=i486 `
     -std=c17 -Wall -Wextra -Wpedantic -DGLOOM_DOS_SDL3 -DGLOOM_DOS_MENU_MUSIC `
-    -DGLOOM_BINARY_VERSION_MAJOR=1 -DGLOOM_BINARY_VERSION_MINOR=0 -DGLOOM_BINARY_VERSION_PATCH=0 `
+    "-DGLOOM_BINARY_VERSION_MAJOR=$versionMajor" "-DGLOOM_BINARY_VERSION_MINOR=$versionMinor" `
+    "-DGLOOM_BINARY_VERSION_PATCH=$versionPatch" `
     -Isrc "-I$sdlInclude" "-I$xmpInclude" `
     src\main.c src\map.c src\iff.c $sdlLib $xmpLib -lm `
     -o $outExe

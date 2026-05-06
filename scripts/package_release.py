@@ -13,14 +13,25 @@ from pathlib import Path
 
 
 PLATFORM_ARCHIVES = {
+    "dos": "zip",
     "linux": "tar.gz",
     "macos": "zip",
     "windows": "zip",
 }
 
+PLATFORM_SUFFIXES = {
+    "dos": "dos-386",
+    "linux": "linux-x64",
+    "macos": "macos-x64",
+    "windows": "windows-x64",
+}
+
 
 def find_executable(build_dir: Path, platform_name: str, config: str | None) -> Path:
-    exe_name = "gloom_pc.exe" if platform_name == "windows" else "gloom_pc"
+    if platform_name == "dos":
+        exe_name = "GLOOMPC.EXE"
+    else:
+        exe_name = "gloom_pc.exe" if platform_name == "windows" else "gloom_pc"
     candidates: list[Path] = []
 
     if config:
@@ -54,6 +65,13 @@ def copy_payload(repo_root: Path, runtime_dir: Path, stage_dir: Path, exe: Path,
 
     copy_file_if_exists(runtime_dir / "README.TXT", stage_dir / "README.TXT")
     copy_file_if_exists(runtime_dir / "GLOOM.INI", stage_dir / "GLOOM.INI")
+    if platform_name == "dos":
+        copy_file_if_exists(runtime_dir / "CWSDPMI.EXE", stage_dir / "CWSDPMI.EXE")
+        copy_file_if_exists(runtime_dir / "GLOOM.BAT", stage_dir / "GLOOM.BAT")
+        if not (stage_dir / "CWSDPMI.EXE").is_file():
+            raise FileNotFoundError("DOS package is missing CWSDPMI.EXE")
+        if not (stage_dir / "GLOOM.BAT").is_file():
+            raise FileNotFoundError("DOS package is missing GLOOM.BAT")
 
     if not (stage_dir / "README.TXT").is_file():
         copy_file_if_exists(repo_root / "package" / "README.TXT", stage_dir / "README.TXT")
@@ -91,7 +109,7 @@ def main() -> int:
     build_dir = args.build_dir.resolve()
     output_dir = args.output_dir.resolve()
     archive_kind = PLATFORM_ARCHIVES[args.platform]
-    package_name = f"gloom-pc-{args.version}-{args.platform}-x64"
+    package_name = f"gloom-pc-{args.version}-{PLATFORM_SUFFIXES[args.platform]}"
     stage_root = output_dir / "_staging"
     stage_dir = stage_root / package_name
     archive_path = output_dir / f"{package_name}.{archive_kind}"
