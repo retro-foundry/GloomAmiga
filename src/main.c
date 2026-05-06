@@ -17455,6 +17455,15 @@ static int run_player_death_selftest(void) {
   state.player_respawn_rotation = 64;
   state.player_weapon = 3u;
   state.player_reload = 2u;
+  state.player_bouncy_bullets = 3u;
+  state.player_reload_counter = 4.0f;
+  state.player_weapon_flash = 2.0f;
+  state.player_mega_timer = 250.0f;
+  state.player_invisible_timer = 500.0f;
+  state.player_thermo_timer = 600.0f;
+  state.player_hyper_timer = -512.0f;
+  state.player_pixsize = 8;
+  state.player_pixsizeadd = 1;
   state.player_rot_fixed = amiga_rotation_to_fixed(0);
   state.camera_angle = player_rotation_fixed_to_radians(state.player_rot_fixed);
   test_object.damage = 2;
@@ -17502,9 +17511,15 @@ static int run_player_death_selftest(void) {
   if (!combat_selftest_expect(!state.player_dead && state.player_death_phase == GLOOM_PLAYER_DEATH_INVINCIBLE &&
                                   state.player_hitpoints == GLOOM_PLAYER_INITIAL_HEALTH &&
                                   state.player_lives == GLOOM_PLAYER_INITIAL_LIVES - 1 &&
-                                  state.player_weapon == 3u && state.camera_x == 100.0f && state.camera_z == 200.0f &&
+                                  state.player_weapon == 3u &&
+                                  state.player_reload == (uint8_t)GLOOM_PLAYER_INITIAL_RELOAD &&
+                                  state.player_bouncy_bullets == 0u && state.player_reload_counter == 0.0f &&
+                                  state.player_weapon_flash == 0.0f && state.player_mega_timer == 0.0f &&
+                                  state.player_invisible_timer == 0.0f && state.player_thermo_timer == 0.0f &&
+                                  state.player_hyper_timer == 0.0f && state.player_pixsize == 0 &&
+                                  state.player_pixsizeadd == 0 && state.camera_x == 100.0f && state.camera_z == 200.0f &&
                                   state.player_rot_fixed == amiga_rotation_to_fixed(64),
-                              "waitrestart should respawn at p1x/p1z/prot, preserve weapon, and enter playerlogic0")) {
+                              "waitrestart should respawn at p1x/p1z/prot, preserve weapon, clear powerups, and enter playerlogic0")) {
     return 1;
   }
 
