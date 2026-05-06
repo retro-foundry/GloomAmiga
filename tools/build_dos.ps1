@@ -95,26 +95,21 @@ $2
 '@, 1)
   }
   if ($patchedAudio -notlike '*manual_soundblaster_device = device*') {
-    $audioPatchSource = "    SDL_Log(`"SoundBlaster opened!`");`n    return true;"
-    if (-not $patchedAudio.Contains($audioPatchSource)) {
+    $audioPatchPattern = '(?m)^(?<indent>\s*)SDL_Log\("SoundBlaster opened!"\);\n(?<indent2>\s*)return true;'
+    if (-not [regex]::IsMatch($patchedAudio, $audioPatchPattern)) {
       throw "Unable to patch SDL DOS Sound Blaster open hook in $sdlDosAudio"
     }
-    $patchedAudio = $patchedAudio.Replace($audioPatchSource,
-      "    SDL_Log(`"SoundBlaster opened!`");`n    manual_soundblaster_device = device;`n    return true;")
+    $patchedAudio = [regex]::Replace($patchedAudio, $audioPatchPattern,
+      '${indent}SDL_Log("SoundBlaster opened!");' + "`n" +
+      '${indent}manual_soundblaster_device = device;' + "`n" +
+      '${indent2}return true;', 1)
   }
   if ($patchedAudio -notlike '*SDL_DOSSoundBlasterGetQueuedAudioSize*') {
-    $audioPatchSource = @'
-    return true;
-}
-
-static void DOSSOUNDBLASTER_CloseDevice(SDL_AudioDevice *device)
-'@
-    if (-not $patchedAudio.Contains($audioPatchSource)) {
+    $audioPatchPattern = '(?s)(\nstatic void DOSSOUNDBLASTER_CloseDevice\(SDL_AudioDevice \*device\))'
+    if (-not [regex]::IsMatch($patchedAudio, $audioPatchPattern)) {
       throw "Unable to patch SDL DOS Sound Blaster manual queue hooks in $sdlDosAudio"
     }
-    $patchedAudio = $patchedAudio.Replace($audioPatchSource, @'
-    return true;
-}
+    $patchedAudio = [regex]::Replace($patchedAudio, $audioPatchPattern, @'
 
 int SDL_DOSSoundBlasterGetQueuedAudioSize(SDL_AudioDeviceID devid)
 {
@@ -179,44 +174,32 @@ void SDL_DOSSoundBlasterClearQueuedAudio(SDL_AudioDeviceID devid)
     DOS_EnableInterrupts();
 }
 
-static void DOSSOUNDBLASTER_CloseDevice(SDL_AudioDevice *device)
-'@)
+$1
+'@, 1)
   }
   if ($patchedAudio -notlike '*manual_soundblaster_device == device*') {
-    $audioPatchSource = @'
-static void DOSSOUNDBLASTER_CloseDevice(SDL_AudioDevice *device)
-{
-    struct SDL_PrivateAudioData *hidden = device->hidden;
-'@
-    if (-not $patchedAudio.Contains($audioPatchSource)) {
+    $audioPatchPattern = '(?s)(static void DOSSOUNDBLASTER_CloseDevice\(SDL_AudioDevice \*device\)\s*\{\n\s*struct SDL_PrivateAudioData \*hidden = device->hidden;\n)'
+    if (-not [regex]::IsMatch($patchedAudio, $audioPatchPattern)) {
       throw "Unable to patch SDL DOS Sound Blaster close hook in $sdlDosAudio"
     }
-    $patchedAudio = $patchedAudio.Replace($audioPatchSource, @'
-static void DOSSOUNDBLASTER_CloseDevice(SDL_AudioDevice *device)
-{
-    struct SDL_PrivateAudioData *hidden = device->hidden;
+    $patchedAudio = [regex]::Replace($patchedAudio, $audioPatchPattern, @'
+$1
     if (manual_soundblaster_device == device) {
         manual_soundblaster_device = NULL;
     }
-'@)
+'@, 1)
   }
   if ($patchedAudio -notlike '*ProvidesOwnCallbackThread = SDL_GetHintBoolean("SDL_DOS_MANUAL_AUDIO_PUMP"*') {
-    $audioPatchSource = @'
-    impl->PlayDevice = DOSSOUNDBLASTER_PlayDevice;
-    impl->CloseDevice = DOSSOUNDBLASTER_CloseDevice;
-
-    impl->OnlyHasDefaultPlaybackDevice = true;
-'@
-    if (-not $patchedAudio.Contains($audioPatchSource)) {
+    $audioPatchPattern = '(?s)(\s*impl->PlayDevice = DOSSOUNDBLASTER_PlayDevice;\n\s*impl->CloseDevice = DOSSOUNDBLASTER_CloseDevice;\n)(\s*impl->OnlyHasDefaultPlaybackDevice = true;)'
+    if (-not [regex]::IsMatch($patchedAudio, $audioPatchPattern)) {
       throw "Unable to patch SDL DOS Sound Blaster manual callback-thread hint in $sdlDosAudio"
     }
-    $patchedAudio = $patchedAudio.Replace($audioPatchSource, @'
-    impl->PlayDevice = DOSSOUNDBLASTER_PlayDevice;
-    impl->CloseDevice = DOSSOUNDBLASTER_CloseDevice;
+    $patchedAudio = [regex]::Replace($patchedAudio, $audioPatchPattern, @'
+$1
     impl->ProvidesOwnCallbackThread = SDL_GetHintBoolean("SDL_DOS_MANUAL_AUDIO_PUMP", false);
 
-    impl->OnlyHasDefaultPlaybackDevice = true;
-'@)
+$2
+'@, 1)
   }
   if ($patchedAudio -ne $audioSource) {
     Set-Content -LiteralPath $sdlDosAudio -Value $patchedAudio -NoNewline
