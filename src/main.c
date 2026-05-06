@@ -21054,16 +21054,14 @@ int main(int argc, char **argv) {
       {
         ScriptLevelIntro intro;
 
-        if (mouse_captured && set_runtime_mouse_capture(window, false)) {
-          mouse_captured = false;
-          mouse_dx_accum = 0.0;
-          suppress_mouse_fire_until_button_up = false;
-          SDL_FlushEvent(SDL_MOUSEMOTION);
-        }
         if (!resolve_script_level_intro_for_map(next_map_path, &intro) ||
             !run_script_intro_screen(renderer, &framebuffer, &intro, render_width, render_height)) {
           running = false;
           continue;
+        }
+        if (mouse_captured) {
+          mouse_dx_accum = 0.0;
+          SDL_FlushEvent(SDL_MOUSEMOTION);
         }
       }
 #ifdef GLOOM_DOS_SDL3
