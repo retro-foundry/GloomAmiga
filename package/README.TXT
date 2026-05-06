@@ -64,6 +64,18 @@
        viewport_size enables an Amiga-style centered gameplay window.
        viewport_pixel_size accepts 1x1 or 2x2.
 
+       Keyboard controls can be changed in the same file:
+
+         p1_forward=W,Up
+         p1_back=S,Down
+         p1_strafe_left=A
+         p1_strafe_right=D
+         p1_turn_left=Left,Q
+         p1_turn_right=Right,E
+         p1_fire=Space,Left Ctrl,Right Ctrl
+
+       Player two uses the same names with p2_ instead of p1_.
+
        DEFAULT DOS LOW MODE:
 
          GLOOMPC.EXE --classic

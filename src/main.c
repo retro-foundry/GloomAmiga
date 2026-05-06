@@ -665,6 +665,25 @@ typedef struct {
 
 static RuntimeGameplayViewport runtime_gameplay_viewport_for_render_target(int render_width, int render_height);
 
+enum {
+  GLOOM_MAX_KEYS_PER_ACTION = 4
+};
+
+typedef struct {
+  SDL_Scancode forward[GLOOM_MAX_KEYS_PER_ACTION];
+  SDL_Scancode back[GLOOM_MAX_KEYS_PER_ACTION];
+  SDL_Scancode strafe_left[GLOOM_MAX_KEYS_PER_ACTION];
+  SDL_Scancode strafe_right[GLOOM_MAX_KEYS_PER_ACTION];
+  SDL_Scancode turn_left[GLOOM_MAX_KEYS_PER_ACTION];
+  SDL_Scancode turn_right[GLOOM_MAX_KEYS_PER_ACTION];
+  SDL_Scancode fire[GLOOM_MAX_KEYS_PER_ACTION];
+} RuntimePlayerKeyBindings;
+
+typedef struct {
+  RuntimePlayerKeyBindings player1;
+  RuntimePlayerKeyBindings player2;
+} RuntimeKeyboardConfig;
+
 typedef struct {
   uint32_t *argb_pixels;
 #ifdef GLOOM_DOS_SDL3
@@ -1063,6 +1082,8 @@ static const char *control_source_menu_name(GloomControlSource source);
 static void normalize_control_config(RuntimeControlConfig *config);
 static void cycle_control_config(RuntimeControlConfig *config, unsigned player_index);
 static bool player1_receives_keyboard_input(void);
+static void initialize_default_keyboard_config(RuntimeKeyboardConfig *config);
+static bool parse_ini_key_binding_value(const char *value, SDL_Scancode *binding);
 static bool set_runtime_mouse_capture(SDL_Window *window, bool captured);
 static void runtime_force_cursor_visible(void);
 void runtime_emscripten_install_pointer_lock_listener(void);
@@ -1093,6 +1114,7 @@ static int g_menu_music_volume_percent = 100;
 #endif
 static RuntimeGamepad g_gamepads[GLOOM_GAMEPAD_COUNT];
 static RuntimeControlConfig g_control_config = {GLOOM_CONTROL_KEYBOARD, GLOOM_CONTROL_GAMEPAD_1};
+static RuntimeKeyboardConfig g_keyboard_config;
 static bool g_webrtc_guest_connected = false;
 static uint32_t g_webrtc_guest_player2_input = 0u;
 static bool g_runtime_mouse_capture_active = false;
@@ -7148,6 +7170,69 @@ static bool player1_receives_keyboard_input(void) {
           g_control_config.player2 != GLOOM_CONTROL_KEYBOARD);
 }
 
+static void copy_key_binding(SDL_Scancode *dst, SDL_Scancode a, SDL_Scancode b, SDL_Scancode c,
+                             SDL_Scancode d) {
+  if (dst == NULL) {
+    return;
+  }
+  dst[0] = a;
+  dst[1] = b;
+  dst[2] = c;
+  dst[3] = d;
+}
+
+static void initialize_default_keyboard_config(RuntimeKeyboardConfig *config) {
+  if (config == NULL) {
+    return;
+  }
+  memset(config, 0, sizeof(*config));
+  copy_key_binding(config->player1.forward, SDL_SCANCODE_W, SDL_SCANCODE_UP, SDL_SCANCODE_UNKNOWN,
+                   SDL_SCANCODE_UNKNOWN);
+  copy_key_binding(config->player1.back, SDL_SCANCODE_S, SDL_SCANCODE_DOWN, SDL_SCANCODE_UNKNOWN,
+                   SDL_SCANCODE_UNKNOWN);
+  copy_key_binding(config->player1.strafe_left, SDL_SCANCODE_A, SDL_SCANCODE_UNKNOWN, SDL_SCANCODE_UNKNOWN,
+                   SDL_SCANCODE_UNKNOWN);
+  copy_key_binding(config->player1.strafe_right, SDL_SCANCODE_D, SDL_SCANCODE_UNKNOWN, SDL_SCANCODE_UNKNOWN,
+                   SDL_SCANCODE_UNKNOWN);
+  copy_key_binding(config->player1.turn_left, SDL_SCANCODE_LEFT, SDL_SCANCODE_Q, SDL_SCANCODE_UNKNOWN,
+                   SDL_SCANCODE_UNKNOWN);
+  copy_key_binding(config->player1.turn_right, SDL_SCANCODE_RIGHT, SDL_SCANCODE_E, SDL_SCANCODE_UNKNOWN,
+                   SDL_SCANCODE_UNKNOWN);
+  copy_key_binding(config->player1.fire, SDL_SCANCODE_SPACE, SDL_SCANCODE_LCTRL, SDL_SCANCODE_RCTRL,
+                   SDL_SCANCODE_UNKNOWN);
+
+  copy_key_binding(config->player2.forward, SDL_SCANCODE_I, SDL_SCANCODE_UNKNOWN, SDL_SCANCODE_UNKNOWN,
+                   SDL_SCANCODE_UNKNOWN);
+  copy_key_binding(config->player2.back, SDL_SCANCODE_K, SDL_SCANCODE_UNKNOWN, SDL_SCANCODE_UNKNOWN,
+                   SDL_SCANCODE_UNKNOWN);
+  copy_key_binding(config->player2.strafe_left, SDL_SCANCODE_U, SDL_SCANCODE_UNKNOWN, SDL_SCANCODE_UNKNOWN,
+                   SDL_SCANCODE_UNKNOWN);
+  copy_key_binding(config->player2.strafe_right, SDL_SCANCODE_O, SDL_SCANCODE_UNKNOWN, SDL_SCANCODE_UNKNOWN,
+                   SDL_SCANCODE_UNKNOWN);
+  copy_key_binding(config->player2.turn_left, SDL_SCANCODE_J, SDL_SCANCODE_UNKNOWN, SDL_SCANCODE_UNKNOWN,
+                   SDL_SCANCODE_UNKNOWN);
+  copy_key_binding(config->player2.turn_right, SDL_SCANCODE_L, SDL_SCANCODE_UNKNOWN, SDL_SCANCODE_UNKNOWN,
+                   SDL_SCANCODE_UNKNOWN);
+  copy_key_binding(config->player2.fire, SDL_SCANCODE_RETURN, SDL_SCANCODE_RCTRL, SDL_SCANCODE_UNKNOWN,
+                   SDL_SCANCODE_UNKNOWN);
+}
+
+static bool keyboard_binding_down(const uint8_t *keyboard, const SDL_Scancode *binding) {
+  size_t i = 0u;
+
+  if (keyboard == NULL || binding == NULL) {
+    return false;
+  }
+  for (i = 0u; i < (size_t)GLOOM_MAX_KEYS_PER_ACTION; ++i) {
+    SDL_Scancode scancode = binding[i];
+
+    if (scancode != SDL_SCANCODE_UNKNOWN && keyboard[scancode]) {
+      return true;
+    }
+  }
+  return false;
+}
+
 #ifdef __EMSCRIPTEN__
 EMSCRIPTEN_KEEPALIVE void SetWebRTCGuestConnected(int connected) {
   g_webrtc_guest_connected = connected != 0;
@@ -7185,13 +7270,13 @@ static PlayerControls read_modern_player_controls(const uint8_t *keyboard, bool 
     return controls;
   }
 
-  controls.joyy = player_control_axis(keyboard[SDL_SCANCODE_W] || keyboard[SDL_SCANCODE_UP],
-                                      keyboard[SDL_SCANCODE_S] || keyboard[SDL_SCANCODE_DOWN]);
-  strafe = player_control_axis(keyboard[SDL_SCANCODE_A], keyboard[SDL_SCANCODE_D]);
-  turn = player_control_axis(keyboard[SDL_SCANCODE_LEFT] || keyboard[SDL_SCANCODE_Q],
-                             keyboard[SDL_SCANCODE_RIGHT] || keyboard[SDL_SCANCODE_E]);
-  controls.keyboard_fire_repeat =
-      keyboard[SDL_SCANCODE_SPACE] || keyboard[SDL_SCANCODE_LCTRL] || keyboard[SDL_SCANCODE_RCTRL];
+  controls.joyy = player_control_axis(keyboard_binding_down(keyboard, g_keyboard_config.player1.forward),
+                                      keyboard_binding_down(keyboard, g_keyboard_config.player1.back));
+  strafe = player_control_axis(keyboard_binding_down(keyboard, g_keyboard_config.player1.strafe_left),
+                               keyboard_binding_down(keyboard, g_keyboard_config.player1.strafe_right));
+  turn = player_control_axis(keyboard_binding_down(keyboard, g_keyboard_config.player1.turn_left),
+                             keyboard_binding_down(keyboard, g_keyboard_config.player1.turn_right));
+  controls.keyboard_fire_repeat = keyboard_binding_down(keyboard, g_keyboard_config.player1.fire);
   controls.fire = controls.keyboard_fire_repeat || mouse_fire;
 
   controls.turn = turn;
@@ -7213,10 +7298,13 @@ static PlayerControls read_second_player_controls(const uint8_t *keyboard) {
     return controls;
   }
 
-  controls.joyy = player_control_axis(keyboard[SDL_SCANCODE_I], keyboard[SDL_SCANCODE_K]);
-  strafe = player_control_axis(keyboard[SDL_SCANCODE_U], keyboard[SDL_SCANCODE_O]);
-  turn = player_control_axis(keyboard[SDL_SCANCODE_J], keyboard[SDL_SCANCODE_L]);
-  controls.keyboard_fire_repeat = keyboard[SDL_SCANCODE_RETURN] || keyboard[SDL_SCANCODE_RCTRL];
+  controls.joyy = player_control_axis(keyboard_binding_down(keyboard, g_keyboard_config.player2.forward),
+                                      keyboard_binding_down(keyboard, g_keyboard_config.player2.back));
+  strafe = player_control_axis(keyboard_binding_down(keyboard, g_keyboard_config.player2.strafe_left),
+                               keyboard_binding_down(keyboard, g_keyboard_config.player2.strafe_right));
+  turn = player_control_axis(keyboard_binding_down(keyboard, g_keyboard_config.player2.turn_left),
+                             keyboard_binding_down(keyboard, g_keyboard_config.player2.turn_right));
+  controls.keyboard_fire_repeat = keyboard_binding_down(keyboard, g_keyboard_config.player2.fire);
   controls.fire = controls.keyboard_fire_repeat;
 
   controls.turn = turn;
@@ -16842,6 +16930,7 @@ static int run_input_selftest(void) {
   RuntimeControlConfig config;
   uint8_t keyboard_state[SDL_SCANCODE_RCTRL + 1];
 
+  initialize_default_keyboard_config(&g_keyboard_config);
   if (!input_selftest_expect(gamepad_axis_with_deadzone(0, GLOOM_GAMEPAD_MOVE_DEADZONE) == 0,
                              "zero axis stays neutral")) {
     return 1;
@@ -16881,6 +16970,17 @@ static int run_input_selftest(void) {
                              "keyboard controls allow strafe and turn together")) {
     return 1;
   }
+  if (!input_selftest_expect(parse_ini_key_binding_value("F,Up", g_keyboard_config.player1.forward),
+                             "INI keyboard parser accepts comma-separated keys")) {
+    return 1;
+  }
+  memset(keyboard_state, 0, sizeof(keyboard_state));
+  keyboard_state[SDL_SCANCODE_F] = 1u;
+  keyboard_controls = read_modern_player_controls(keyboard_state, false);
+  if (!input_selftest_expect(keyboard_controls.joyy == -1, "INI keyboard parser can redefine forward")) {
+    return 1;
+  }
+  initialize_default_keyboard_config(&g_keyboard_config);
 
   memset(&keyboard_controls, 0, sizeof(keyboard_controls));
   memset(&gamepad_controls, 0, sizeof(gamepad_controls));
@@ -20061,6 +20161,170 @@ static bool parse_ini_pixel_size_value(const char *value, int *out_width, int *o
   return true;
 }
 
+static bool normalized_key_name_equals(const char *name, const char *expected) {
+  char normalized[48];
+  size_t write_index = 0u;
+  size_t read_index = 0u;
+
+  if (name == NULL || expected == NULL) {
+    return false;
+  }
+  for (read_index = 0u; name[read_index] != '\0' && write_index + 1u < sizeof(normalized); ++read_index) {
+    unsigned char ch = (unsigned char)name[read_index];
+
+    if (isalnum(ch)) {
+      normalized[write_index++] = (char)tolower(ch);
+    }
+  }
+  normalized[write_index] = '\0';
+  return strcmp(normalized, expected) == 0;
+}
+
+static bool parse_ini_key_name(const char *value, SDL_Scancode *out_scancode) {
+  char key_char = '\0';
+
+  if (value == NULL || out_scancode == NULL || value[0] == '\0') {
+    return false;
+  }
+
+  if (value[1] == '\0') {
+    key_char = (char)tolower((unsigned char)value[0]);
+    if (key_char >= 'a' && key_char <= 'z') {
+      *out_scancode = (SDL_Scancode)(SDL_SCANCODE_A + (key_char - 'a'));
+      return true;
+    }
+    if (key_char >= '1' && key_char <= '9') {
+      *out_scancode = (SDL_Scancode)(SDL_SCANCODE_1 + (key_char - '1'));
+      return true;
+    }
+    if (key_char == '0') {
+      *out_scancode = SDL_SCANCODE_0;
+      return true;
+    }
+  }
+
+  if (normalized_key_name_equals(value, "up")) {
+    *out_scancode = SDL_SCANCODE_UP;
+  } else if (normalized_key_name_equals(value, "down")) {
+    *out_scancode = SDL_SCANCODE_DOWN;
+  } else if (normalized_key_name_equals(value, "left")) {
+    *out_scancode = SDL_SCANCODE_LEFT;
+  } else if (normalized_key_name_equals(value, "right")) {
+    *out_scancode = SDL_SCANCODE_RIGHT;
+  } else if (normalized_key_name_equals(value, "space") || normalized_key_name_equals(value, "spacebar")) {
+    *out_scancode = SDL_SCANCODE_SPACE;
+  } else if (normalized_key_name_equals(value, "enter") || normalized_key_name_equals(value, "return")) {
+    *out_scancode = SDL_SCANCODE_RETURN;
+  } else if (normalized_key_name_equals(value, "kpenter") || normalized_key_name_equals(value, "keypadenter")) {
+    *out_scancode = SDL_SCANCODE_KP_ENTER;
+  } else if (normalized_key_name_equals(value, "escape") || normalized_key_name_equals(value, "esc")) {
+    *out_scancode = SDL_SCANCODE_ESCAPE;
+  } else if (normalized_key_name_equals(value, "tab")) {
+    *out_scancode = SDL_SCANCODE_TAB;
+  } else if (normalized_key_name_equals(value, "backspace")) {
+    *out_scancode = SDL_SCANCODE_BACKSPACE;
+  } else if (normalized_key_name_equals(value, "lctrl") || normalized_key_name_equals(value, "leftctrl") ||
+             normalized_key_name_equals(value, "leftcontrol")) {
+    *out_scancode = SDL_SCANCODE_LCTRL;
+  } else if (normalized_key_name_equals(value, "rctrl") || normalized_key_name_equals(value, "rightctrl") ||
+             normalized_key_name_equals(value, "rightcontrol")) {
+    *out_scancode = SDL_SCANCODE_RCTRL;
+  } else if (normalized_key_name_equals(value, "ctrl") || normalized_key_name_equals(value, "control")) {
+    *out_scancode = SDL_SCANCODE_LCTRL;
+  } else if (normalized_key_name_equals(value, "lshift") || normalized_key_name_equals(value, "leftshift")) {
+    *out_scancode = SDL_SCANCODE_LSHIFT;
+  } else if (normalized_key_name_equals(value, "rshift") || normalized_key_name_equals(value, "rightshift")) {
+    *out_scancode = SDL_SCANCODE_RSHIFT;
+  } else if (normalized_key_name_equals(value, "lalt") || normalized_key_name_equals(value, "leftalt")) {
+    *out_scancode = SDL_SCANCODE_LALT;
+  } else if (normalized_key_name_equals(value, "ralt") || normalized_key_name_equals(value, "rightalt")) {
+    *out_scancode = SDL_SCANCODE_RALT;
+  } else {
+    return false;
+  }
+
+  return true;
+}
+
+static bool parse_ini_key_binding_value(const char *value, SDL_Scancode *binding) {
+  char scratch[128];
+  char *cursor = scratch;
+  size_t count = 0u;
+
+  if (value == NULL || binding == NULL || strlen(value) >= sizeof(scratch)) {
+    return false;
+  }
+  memset(binding, 0, (size_t)GLOOM_MAX_KEYS_PER_ACTION * sizeof(*binding));
+  strcpy(scratch, value);
+
+  while (cursor != NULL && *cursor != '\0') {
+    char *next = strpbrk(cursor, ",|");
+    char *token = NULL;
+    SDL_Scancode scancode = SDL_SCANCODE_UNKNOWN;
+
+    if (next != NULL) {
+      *next++ = '\0';
+    }
+    token = trim_ini_token(cursor);
+    if (token != NULL && token[0] != '\0') {
+      if (count >= (size_t)GLOOM_MAX_KEYS_PER_ACTION || !parse_ini_key_name(token, &scancode)) {
+        return false;
+      }
+      binding[count++] = scancode;
+    }
+    cursor = next;
+  }
+
+  return count > 0u;
+}
+
+static bool apply_ini_keyboard_binding(const char *key, const char *value, RuntimeKeyboardConfig *config) {
+  RuntimePlayerKeyBindings *player = NULL;
+  const char *action = NULL;
+  SDL_Scancode parsed[GLOOM_MAX_KEYS_PER_ACTION];
+
+  if (key == NULL || value == NULL || config == NULL) {
+    return false;
+  }
+  memset(parsed, 0, sizeof(parsed));
+
+  if (strncmp(key, "p1_", 3) == 0 || strncmp(key, "player1_", 8) == 0) {
+    player = &config->player1;
+    action = key[1] == '1' ? key + 3 : key + 8;
+  } else if (strncmp(key, "p2_", 3) == 0 || strncmp(key, "player2_", 8) == 0) {
+    player = &config->player2;
+    action = key[1] == '2' ? key + 3 : key + 8;
+  } else {
+    return false;
+  }
+
+  if (!parse_ini_key_binding_value(value, parsed)) {
+    fprintf(stderr, "Ignoring GLOOM.INI %s=%s; expected comma-separated key names\n", key, value);
+    return true;
+  }
+
+  if (strcmp(action, "forward") == 0 || strcmp(action, "move_forward") == 0) {
+    memcpy(player->forward, parsed, sizeof(player->forward));
+  } else if (strcmp(action, "back") == 0 || strcmp(action, "backward") == 0 ||
+             strcmp(action, "move_back") == 0) {
+    memcpy(player->back, parsed, sizeof(player->back));
+  } else if (strcmp(action, "strafe_left") == 0) {
+    memcpy(player->strafe_left, parsed, sizeof(player->strafe_left));
+  } else if (strcmp(action, "strafe_right") == 0) {
+    memcpy(player->strafe_right, parsed, sizeof(player->strafe_right));
+  } else if (strcmp(action, "turn_left") == 0) {
+    memcpy(player->turn_left, parsed, sizeof(player->turn_left));
+  } else if (strcmp(action, "turn_right") == 0) {
+    memcpy(player->turn_right, parsed, sizeof(player->turn_right));
+  } else if (strcmp(action, "fire") == 0) {
+    memcpy(player->fire, parsed, sizeof(player->fire));
+  } else {
+    return false;
+  }
+
+  return true;
+}
+
 static void load_runtime_display_ini(RuntimeDisplayIniConfig *config) {
   static const char *candidates[] = {"GLOOM.INI", "gloom.ini"};
   FILE *file = NULL;
@@ -20118,6 +20382,14 @@ static void load_runtime_display_ini(RuntimeDisplayIniConfig *config) {
     if (key == NULL || value == NULL || key[0] == '\0' || value[0] == '\0') {
       continue;
     }
+    {
+      char *key_cursor = key;
+
+      while (*key_cursor != '\0') {
+        *key_cursor = (char)tolower((unsigned char)*key_cursor);
+        ++key_cursor;
+      }
+    }
 
     if (strcmp(key, "resolution") == 0 || strcmp(key, "screen_resolution") == 0 ||
         strcmp(key, "window_size") == 0 || strcmp(key, "boot_resolution") == 0) {
@@ -20146,6 +20418,7 @@ static void load_runtime_display_ini(RuntimeDisplayIniConfig *config) {
       } else {
         fprintf(stderr, "Ignoring GLOOM.INI %s=%s; expected 1, 2, 1x1, or 2x2\n", key, value);
       }
+    } else if (apply_ini_keyboard_binding(key, value, &g_keyboard_config)) {
     }
   }
 
@@ -20258,6 +20531,7 @@ int main(int argc, char **argv) {
   memset(&hud_font, 0, sizeof(hud_font));
   memset(&menu_assets, 0, sizeof(menu_assets));
   memset(&framebuffer, 0, sizeof(framebuffer));
+  initialize_default_keyboard_config(&g_keyboard_config);
   load_runtime_display_ini(&g_runtime_display_ini);
   if (g_runtime_display_ini.has_resolution) {
     window_width = g_runtime_display_ini.resolution_width;
