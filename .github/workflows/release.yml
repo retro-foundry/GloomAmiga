@@ -24,17 +24,11 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - platform: linux
-            os: ubuntu-latest
-            config: Release
           - platform: windows
             os: windows-latest
             config: Release
           - platform: dos
             os: windows-latest
-            config: Release
-          - platform: macos
-            os: macos-latest
             config: Release
 
     steps:
@@ -48,37 +42,6 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.x"
-
-      - name: Install Linux build dependencies
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            cmake \
-            ninja-build \
-            pkg-config \
-            libasound2-dev \
-            libdbus-1-dev \
-            libegl1-mesa-dev \
-            libgl1-mesa-dev \
-            libibus-1.0-dev \
-            libpulse-dev \
-            libudev-dev \
-            libwayland-dev \
-            libx11-dev \
-            libxcursor-dev \
-            libxext-dev \
-            libxfixes-dev \
-            libxi-dev \
-            libxinerama-dev \
-            libxkbcommon-dev \
-            libxrandr-dev \
-            libxrender-dev \
-            libxss-dev
-
-      - name: Configure CMake
-        if: runner.os != 'Windows' && matrix.platform != 'dos'
-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.config }}
 
       - name: Configure CMake
         if: matrix.platform == 'windows'
@@ -118,8 +81,6 @@ jobs:
           & signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f $certPath /p $env:WINDOWS_SIGNING_CERT_PASSWORD $exe.FullName
           Remove-Item -LiteralPath $certPath -Force
 
-      # TODO(macOS signing): add Developer ID signing and notarization once the
-      # Apple certificate, app-specific password, and notarization flow exist.
       - name: Package release archive
         run: python scripts/package_release.py --platform ${{ matrix.platform }} --build-dir build --config ${{ matrix.config }} --version ${{ github.ref_name }} --output-dir dist
 

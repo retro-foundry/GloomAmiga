@@ -1,6 +1,6 @@
 # Verifying Gloom PC Releases
 
-Release binaries are built by GitHub Actions from the tagged source revision. A release tag such as `v0.1.0` creates the Windows, DOS, Linux, and macOS archives, a `SHA256SUMS.txt` checksum file, and GitHub artifact attestations where GitHub supports them.
+Release binaries are built by GitHub Actions from the tagged source revision. A release tag such as `v0.1.0` creates the Windows and DOS archives, a `SHA256SUMS.txt` checksum file, and GitHub artifact attestations where GitHub supports them.
 
 ## Verify Checksums
 
@@ -31,7 +31,7 @@ Compare the printed hash with the matching line in `SHA256SUMS.txt`.
 Install the GitHub CLI, authenticate with `gh auth login`, then verify an archive against this repository:
 
 ```bash
-gh attestation verify gloom-pc-v0.1.0-linux-x64.tar.gz --repo OWNER/REPO --signer-workflow .github/workflows/release.yml
+gh attestation verify gloom-pc-v0.1.0-dos-386.zip --repo OWNER/REPO --signer-workflow .github/workflows/release.yml
 ```
 
 Replace `OWNER/REPO` with the GitHub repository name and replace the archive name with the file you downloaded. A successful verification means GitHub has a provenance record tying that file digest to this repository's release workflow.
