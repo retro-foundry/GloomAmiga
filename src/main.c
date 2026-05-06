@@ -1083,6 +1083,7 @@ static void normalize_control_config(RuntimeControlConfig *config);
 static void cycle_control_config(RuntimeControlConfig *config, unsigned player_index);
 static bool player1_receives_keyboard_input(void);
 static void initialize_default_keyboard_config(RuntimeKeyboardConfig *config);
+static bool normalized_key_name_equals(const char *name, const char *expected);
 static bool parse_ini_key_binding_value(const char *value, SDL_Scancode *binding);
 static bool set_runtime_mouse_capture(SDL_Window *window, bool captured);
 static void runtime_force_cursor_visible(void);
@@ -7104,6 +7105,24 @@ static const char *control_source_menu_name(GloomControlSource source) {
     return "JOYSTICK 2";
   }
   return "KEYBOARD";
+}
+
+static bool parse_control_source_name(const char *value, GloomControlSource *out_source) {
+  if (value == NULL || out_source == NULL) {
+    return false;
+  }
+  if (normalized_key_name_equals(value, "keyboard")) {
+    *out_source = GLOOM_CONTROL_KEYBOARD;
+  } else if (normalized_key_name_equals(value, "joystick1") || normalized_key_name_equals(value, "joy1") ||
+             normalized_key_name_equals(value, "gamepad1") || normalized_key_name_equals(value, "controller1")) {
+    *out_source = GLOOM_CONTROL_GAMEPAD_1;
+  } else if (normalized_key_name_equals(value, "joystick2") || normalized_key_name_equals(value, "joy2") ||
+             normalized_key_name_equals(value, "gamepad2") || normalized_key_name_equals(value, "controller2")) {
+    *out_source = GLOOM_CONTROL_GAMEPAD_2;
+  } else {
+    return false;
+  }
+  return true;
 }
 
 static GloomControlSource next_control_source(GloomControlSource source) {
@@ -15119,17 +15138,23 @@ static bool cache_start_menu_background_dos_indices(RenderFramebuffer *framebuff
 #endif
 
 static int start_menu_item_count(void) {
+  int count = 0;
+
 #if GLOOM_RUNTIME_HAS_AUTOSAVE
 #ifdef __EMSCRIPTEN__
-  return 6;
+  count = 6;
 #else
-  return 7;
+  count = 7;
 #endif
 #elif defined(__EMSCRIPTEN__)
-  return 4;
+  count = 4;
 #else
-  return 5;
+  count = 5;
 #endif
+#ifdef GLOOM_DOS_SDL3
+  count -= 2;
+#endif
+  return count;
 }
 
 static bool start_menu_item_enabled(int item_index) {
@@ -15241,15 +15266,27 @@ static int activate_start_menu_selection(int selected_index, GloomGameMode *out_
     *io_flash_ticks = GLOOM_MENU_FLASH_TICKS;
     return 0;
   }
+#ifdef GLOOM_DOS_SDL3
+  if (selected_index == 4) {
+    return -1;
+  }
+#else
   if (selected_index > 3) {
     selected_index -= 2;
   }
+#endif
 #else
   if (selected_index == 1) {
     *out_game_mode = GLOOM_GAME_MODE_TWO_PLAYER;
     return 1;
   }
+#ifdef GLOOM_DOS_SDL3
+  if (selected_index == 2) {
+    return -1;
+  }
 #endif
+#endif
+#ifndef GLOOM_DOS_SDL3
   if (selected_index == 2) {
     cycle_control_config(io_control_config, 0u);
     *io_selected_visible = false;
@@ -15265,6 +15302,7 @@ static int activate_start_menu_selection(int selected_index, GloomGameMode *out_
   if (selected_index == 4) {
     return -1;
   }
+#endif
   return 0;
 }
 
@@ -15302,16 +15340,24 @@ static void render_start_menu_frame(RenderFramebuffer *framebuffer, const MenuAs
   items[1] = "LOAD ONE PLAYER AUTOSAVE";
   items[2] = "TWO PLAYER GAME";
   items[3] = "LOAD TWO PLAYER AUTOSAVE";
+#ifdef GLOOM_DOS_SDL3
+  items[4] = "EXIT GLOOM";
+#else
   items[4] = player1_item;
   items[5] = player2_item;
 #ifndef __EMSCRIPTEN__
   items[6] = "EXIT GLOOM";
 #endif
+#endif
 #else
   items[1] = "TWO PLAYER GAME";
+#ifdef GLOOM_DOS_SDL3
+  items[2] = "EXIT GLOOM";
+#else
   items[2] = player1_item;
   items[3] = player2_item;
   items[4] = "EXIT GLOOM";
+#endif
 #endif
 
 #ifdef GLOOM_DOS_SDL3
@@ -20340,6 +20386,29 @@ static bool apply_ini_keyboard_binding(const char *key, const char *value, Runti
   return true;
 }
 
+static bool apply_ini_control_source(const char *key, const char *value, RuntimeControlConfig *config) {
+  GloomControlSource source = GLOOM_CONTROL_KEYBOARD;
+
+  if (key == NULL || value == NULL || config == NULL) {
+    return false;
+  }
+  if (strcmp(key, "p1_control") != 0 && strcmp(key, "player1_control") != 0 &&
+      strcmp(key, "p2_control") != 0 && strcmp(key, "player2_control") != 0) {
+    return false;
+  }
+  if (!parse_control_source_name(value, &source)) {
+    fprintf(stderr, "Ignoring GLOOM.INI %s=%s; expected keyboard, joystick1, or joystick2\n", key, value);
+    return true;
+  }
+  if (key[1] == '1' || strncmp(key, "player1_", 8) == 0) {
+    config->player1 = source;
+  } else {
+    config->player2 = source;
+  }
+  normalize_control_config(config);
+  return true;
+}
+
 static void load_runtime_display_ini(RuntimeDisplayIniConfig *config) {
   static const char *candidates[] = {"GLOOM.INI", "gloom.ini"};
   FILE *file = NULL;
@@ -20433,6 +20502,7 @@ static void load_runtime_display_ini(RuntimeDisplayIniConfig *config) {
       } else {
         fprintf(stderr, "Ignoring GLOOM.INI %s=%s; expected 1, 2, 1x1, or 2x2\n", key, value);
       }
+    } else if (apply_ini_control_source(key, value, &g_control_config)) {
     } else if (apply_ini_keyboard_binding(key, value, &g_keyboard_config)) {
     }
   }

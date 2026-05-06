@@ -66,6 +66,8 @@
 
        Keyboard controls can be changed in the same file:
 
+         player1_control=Keyboard
+         player2_control=Joystick1
          p1_forward=W,Up
          p1_back=S,Down
          p1_strafe_left=A
@@ -75,6 +77,8 @@
          p1_fire=Space,Left Ctrl,Right Ctrl
 
        Player two uses the same names with p2_ instead of p1_.
+       On DOS, player1_control and player2_control replace the old
+       menu control selector rows.
 
        DEFAULT DOS LOW MODE:
 
