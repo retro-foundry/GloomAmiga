@@ -16,6 +16,10 @@ cmake --build build --config Debug
 cmake --build build --config Release
 ```
 
+## Releases
+
+GitHub Actions builds tagged desktop releases and publishes downloadable archives with checksums and provenance. See [RELEASING.md](RELEASING.md) for maintainer steps and [VERIFY_RELEASE.md](VERIFY_RELEASE.md) for player verification commands.
+
 ## Web Build (Emscripten)
 
 Web builds use Emscripten's SDL2 port and preload the `amiga/` runtime assets into the virtual filesystem.

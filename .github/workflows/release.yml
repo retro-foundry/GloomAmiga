@@ -1,0 +1,169 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build release (${{ matrix.platform }})
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    env:
+      WINDOWS_SIGNING_CERT_BASE64: ${{ secrets.WINDOWS_SIGNING_CERT_BASE64 }}
+      WINDOWS_SIGNING_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux
+            os: ubuntu-latest
+            config: Release
+          - platform: windows
+            os: windows-latest
+            config: Release
+          - platform: macos
+            os: macos-latest
+            config: Release
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            cmake \
+            ninja-build \
+            pkg-config \
+            libasound2-dev \
+            libdbus-1-dev \
+            libegl1-mesa-dev \
+            libgl1-mesa-dev \
+            libibus-1.0-dev \
+            libpulse-dev \
+            libudev-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxcursor-dev \
+            libxext-dev \
+            libxfixes-dev \
+            libxi-dev \
+            libxinerama-dev \
+            libxkbcommon-dev \
+            libxrandr-dev \
+            libxrender-dev \
+            libxss-dev
+
+      - name: Configure CMake
+        if: runner.os != 'Windows'
+        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.config }}
+
+      - name: Configure CMake
+        if: runner.os == 'Windows'
+        run: cmake -S . -B build -A x64
+
+      - name: Build release binary
+        run: cmake --build build --config ${{ matrix.config }} --parallel
+
+      - name: Run self-tests
+        run: python scripts/run_selftests.py --build-dir build --config ${{ matrix.config }}
+
+      - name: Sign Windows executable
+        if: runner.os == 'Windows' && env.WINDOWS_SIGNING_CERT_BASE64 != '' && env.WINDOWS_SIGNING_CERT_PASSWORD != ''
+        shell: pwsh
+        run: |
+          $certPath = Join-Path $env:RUNNER_TEMP "gloom-signing.pfx"
+          [IO.File]::WriteAllBytes($certPath, [Convert]::FromBase64String($env:WINDOWS_SIGNING_CERT_BASE64))
+          $exe = Get-ChildItem -Path build -Recurse -Filter gloom_pc.exe |
+            Where-Object { $_.FullName -match '\\Release\\' } |
+            Sort-Object FullName |
+            Select-Object -First 1
+          if (-not $exe) {
+            throw "Could not find Release gloom_pc.exe to sign"
+          }
+          & signtool sign /fd SHA256 /tr http://timestamp.digicert.com /td SHA256 /f $certPath /p $env:WINDOWS_SIGNING_CERT_PASSWORD $exe.FullName
+          Remove-Item -LiteralPath $certPath -Force
+
+      # TODO(macOS signing): add Developer ID signing and notarization once the
+      # Apple certificate, app-specific password, and notarization flow exist.
+      - name: Package release archive
+        run: python scripts/package_release.py --platform ${{ matrix.platform }} --build-dir build --config ${{ matrix.config }} --version ${{ github.ref_name }} --output-dir dist
+
+      - name: Attest release archive provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "dist/*"
+
+      - name: Upload packaged archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: gloom-pc-${{ github.ref_name }}-${{ matrix.platform }}-x64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish GitHub Release
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Download packaged archives
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate SHA256 checksums
+        run: python scripts/generate_checksums.py release-assets --output release-assets/SHA256SUMS.txt
+
+      - name: Attest checksum manifest provenance
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: "release-assets/SHA256SUMS.txt"
+
+      - name: Create or update GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Gloom PC ${{ github.ref_name }}
+          body_path: VERIFY_RELEASE.md
+          files: |
+            release-assets/*
+            VERIFY_RELEASE.md
+          fail_on_unmatched_files: true
