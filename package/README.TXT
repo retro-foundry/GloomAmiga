@@ -7,7 +7,7 @@
          \________/
 
                  GLOOM  -  PC / DOS PORT
-                 VERSION   : 1.0.5
+                 VERSION   : 1.0.6
                  RELEASE   : FIRST BINARY RELEASE
                  TARGET    : PC / DOS 386+ / VGA / SOUNDBLASTER
                  DISPLAY   : 320X200 INDEXED VGA ON DOS

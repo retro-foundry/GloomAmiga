@@ -105,11 +105,12 @@ $2
       '${indent2}return true;', 1)
   }
   if ($patchedAudio -notlike '*SDL_DOSSoundBlasterGetQueuedAudioSize*') {
-    $audioPatchPattern = '(?s)(\nstatic void DOSSOUNDBLASTER_CloseDevice\(SDL_AudioDevice \*device\))'
-    if (-not [regex]::IsMatch($patchedAudio, $audioPatchPattern)) {
+    $audioPatchPattern = '(?m)^.*DOSSOUNDBLASTER_CloseDevice\s*\(\s*SDL_AudioDevice\s*\*\s*device\s*\)'
+    $audioPatchMatch = [regex]::Match($patchedAudio, $audioPatchPattern)
+    if (-not $audioPatchMatch.Success) {
       throw "Unable to patch SDL DOS Sound Blaster manual queue hooks in $sdlDosAudio"
     }
-    $patchedAudio = [regex]::Replace($patchedAudio, $audioPatchPattern, @'
+    $audioPatchInsert = @'
 
 int SDL_DOSSoundBlasterGetQueuedAudioSize(SDL_AudioDeviceID devid)
 {
@@ -174,8 +175,8 @@ void SDL_DOSSoundBlasterClearQueuedAudio(SDL_AudioDeviceID devid)
     DOS_EnableInterrupts();
 }
 
-$1
-'@, 1)
+'@
+    $patchedAudio = $patchedAudio.Insert($audioPatchMatch.Index, $audioPatchInsert)
   }
   if ($patchedAudio -notlike '*manual_soundblaster_device == device*') {
     $audioPatchPattern = '(?s)(static void DOSSOUNDBLASTER_CloseDevice\(SDL_AudioDevice \*device\)\s*\{\n\s*struct SDL_PrivateAudioData \*hidden = device->hidden;\n)'
