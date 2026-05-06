@@ -25,6 +25,7 @@
 #include <stdarg.h>
 #include <string.h>
 #include <errno.h>
+#include <ctype.h>
 
 #include "iff.h"
 #include "map.h"
@@ -638,6 +639,31 @@ typedef struct {
   GloomControlSource player1;
   GloomControlSource player2;
 } RuntimeControlConfig;
+
+typedef struct {
+  bool has_resolution;
+  int resolution_width;
+  int resolution_height;
+  bool has_gameplay_viewport;
+  int gameplay_viewport_width;
+  int gameplay_viewport_height;
+  int gameplay_pixel_width;
+  int gameplay_pixel_height;
+} RuntimeDisplayIniConfig;
+
+typedef struct {
+  bool active;
+  int source_width;
+  int source_height;
+  int pixel_width;
+  int pixel_height;
+  int dst_x;
+  int dst_y;
+  int dst_width;
+  int dst_height;
+} RuntimeGameplayViewport;
+
+static RuntimeGameplayViewport runtime_gameplay_viewport_for_render_target(int render_width, int render_height);
 
 typedef struct {
   uint32_t *argb_pixels;
@@ -16440,12 +16466,93 @@ static bool render_pixelate_texture(SDL_Renderer *renderer, SDL_Texture *texture
 }
 #endif
 
+static void framebuffer_clear_outside_rect(RenderFramebuffer *framebuffer, int x, int y, int w, int h,
+                                           uint32_t argb) {
+  int row = 0;
+
+  if (framebuffer == NULL || framebuffer->width <= 0 || framebuffer->height <= 0) {
+    return;
+  }
+  for (row = 0; row < y; ++row) {
+    framebuffer_clear_row_span(framebuffer, row, 0, framebuffer->width, argb);
+  }
+  for (row = y + h; row < framebuffer->height; ++row) {
+    framebuffer_clear_row_span(framebuffer, row, 0, framebuffer->width, argb);
+  }
+  for (row = y; row < y + h; ++row) {
+    framebuffer_clear_row_span(framebuffer, row, 0, x, argb);
+    framebuffer_clear_row_span(framebuffer, row, x + w, framebuffer->width - (x + w), argb);
+  }
+}
+
+static void framebuffer_scale_rect_in_place(RenderFramebuffer *framebuffer, int src_w, int src_h, int dst_x, int dst_y,
+                                            int pixel_w, int pixel_h) {
+  int src_y = 0;
+
+  if (framebuffer == NULL || src_w <= 0 || src_h <= 0 || pixel_w <= 0 || pixel_h <= 0) {
+    return;
+  }
+  if (dst_x < 0 || dst_y < 0 || dst_x + (src_w * pixel_w) > framebuffer->width ||
+      dst_y + (src_h * pixel_h) > framebuffer->height) {
+    return;
+  }
+  if (dst_x == 0 && dst_y == 0 && pixel_w == 1 && pixel_h == 1) {
+    return;
+  }
+
+  for (src_y = src_h - 1; src_y >= 0; --src_y) {
+    int dy = 0;
+
+    for (dy = pixel_h - 1; dy >= 0; --dy) {
+      int dst_row = dst_y + (src_y * pixel_h) + dy;
+      int src_x = 0;
+
+#ifdef GLOOM_DOS_SDL3
+      uint8_t *dst = NULL;
+      const uint8_t *src = NULL;
+
+      if (framebuffer->index_pixels == NULL || framebuffer->index_pitch_pixels < framebuffer->width) {
+        return;
+      }
+      dst = framebuffer->index_pixels + ((size_t)dst_row * (size_t)framebuffer->index_pitch_pixels) + (size_t)dst_x;
+      src = framebuffer->index_pixels + ((size_t)src_y * (size_t)framebuffer->index_pitch_pixels);
+      for (src_x = src_w - 1; src_x >= 0; --src_x) {
+        int dx = 0;
+        uint8_t value = src[src_x];
+
+        for (dx = 0; dx < pixel_w; ++dx) {
+          dst[(src_x * pixel_w) + dx] = value;
+        }
+      }
+#else
+      uint32_t *dst = NULL;
+      const uint32_t *src = NULL;
+
+      if (framebuffer->pixels == NULL || framebuffer->pitch_pixels < framebuffer->width) {
+        return;
+      }
+      dst = framebuffer->pixels + ((size_t)dst_row * (size_t)framebuffer->pitch_pixels) + (size_t)dst_x;
+      src = framebuffer->pixels + ((size_t)src_y * (size_t)framebuffer->pitch_pixels);
+      for (src_x = src_w - 1; src_x >= 0; --src_x) {
+        int dx = 0;
+        uint32_t value = src[src_x];
+
+        for (dx = 0; dx < pixel_w; ++dx) {
+          dst[(src_x * pixel_w) + dx] = value;
+        }
+      }
+#endif
+    }
+  }
+}
+
 static void render(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const AppState *state,
                    const GridOffsetSet *grid_offsets,
                    const WallTextureSet *wall_textures, const FlatTextureSet *flat_textures,
                    const ObjectVisualSet *object_visuals, const WeaponVisualSet *weapon_visuals,
                    const HudFont *hud_font, int render_width, int render_height, const char *notice_text) {
   int pixsize = state != NULL ? state->player_pixsize : 0;
+  RuntimeGameplayViewport gameplay_viewport = runtime_gameplay_viewport_for_render_target(render_width, render_height);
   double profile_render_start_ms = profile_now_ms();
   double profile_start_ms = 0.0;
 
@@ -16459,37 +16566,45 @@ static void render(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const
   if (!begin_render_framebuffer(framebuffer)) {
     return;
   }
-  if (state == NULL || flat_textures == NULL || !flat_textures->floor.loaded || !flat_textures->roof.loaded ||
-      wall_textures == NULL || wall_textures->loaded_count == 0u) {
+  if (gameplay_viewport.active || state == NULL || flat_textures == NULL || !flat_textures->floor.loaded ||
+      !flat_textures->roof.loaded || wall_textures == NULL || wall_textures->loaded_count == 0u) {
     framebuffer_clear(framebuffer, 0xFF000000u);
   }
   profile_add_elapsed(&g_profiler.render_lock_clear_ms, profile_start_ms);
   if (state != NULL && state->two_player_mode) {
     AppState player2_state = *state;
     RuntimePlayerState player1_state;
-    int left_w = render_width / 2;
-    int right_w = render_width - left_w;
+    int left_w = gameplay_viewport.source_width / 2;
+    int right_w = gameplay_viewport.source_width - left_w;
 
     capture_primary_player_state(state, &player1_state);
     render_scene_contents(framebuffer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals,
-                          hud_font, 0, 0, left_w, render_height);
+                          hud_font, 0, 0, left_w, gameplay_viewport.source_height);
     profile_start_ms = profile_now_ms();
-    apply_player_red_palette_rect(framebuffer, state, 0, 0, left_w, render_height);
+    apply_player_red_palette_rect(framebuffer, state, 0, 0, left_w, gameplay_viewport.source_height);
     profile_add_elapsed(&g_profiler.render_red_ms, profile_start_ms);
     apply_primary_player_state(&player2_state, &state->player2);
     player2_state.player2 = player1_state;
     player2_state.active_player_index = 1u;
     render_scene_contents(framebuffer, &player2_state, grid_offsets, wall_textures, flat_textures, object_visuals,
-                          weapon_visuals, hud_font, left_w, 0, right_w, render_height);
+                          weapon_visuals, hud_font, left_w, 0, right_w, gameplay_viewport.source_height);
     profile_start_ms = profile_now_ms();
-    apply_player_red_palette_rect(framebuffer, &player2_state, left_w, 0, right_w, render_height);
+    apply_player_red_palette_rect(framebuffer, &player2_state, left_w, 0, right_w, gameplay_viewport.source_height);
     profile_add_elapsed(&g_profiler.render_red_ms, profile_start_ms);
   } else {
     render_scene_contents(framebuffer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals,
-                          hud_font, 0, 0, render_width, render_height);
+                          hud_font, 0, 0, gameplay_viewport.source_width, gameplay_viewport.source_height);
     profile_start_ms = profile_now_ms();
-    apply_player_red_palette(framebuffer, state);
+    apply_player_red_palette_rect(framebuffer, state, 0, 0, gameplay_viewport.source_width,
+                                  gameplay_viewport.source_height);
     profile_add_elapsed(&g_profiler.render_red_ms, profile_start_ms);
+  }
+  if (gameplay_viewport.active) {
+    framebuffer_scale_rect_in_place(framebuffer, gameplay_viewport.source_width, gameplay_viewport.source_height,
+                                    gameplay_viewport.dst_x, gameplay_viewport.dst_y, gameplay_viewport.pixel_width,
+                                    gameplay_viewport.pixel_height);
+    framebuffer_clear_outside_rect(framebuffer, gameplay_viewport.dst_x, gameplay_viewport.dst_y,
+                                   gameplay_viewport.dst_width, gameplay_viewport.dst_height, 0xFF000000u);
   }
 #if GLOOM_RUNTIME_HAS_AUTOSAVE
   if (notice_text != NULL && notice_text[0] != '\0') {
@@ -19878,6 +19993,208 @@ static bool set_gameplay_start_mouse_capture(SDL_Window *window) {
   return captured;
 }
 
+static RuntimeDisplayIniConfig g_runtime_display_ini;
+
+static char *trim_ini_token(char *text) {
+  char *end = NULL;
+
+  if (text == NULL) {
+    return NULL;
+  }
+  while (*text != '\0' && isspace((unsigned char)*text)) {
+    ++text;
+  }
+  end = text + strlen(text);
+  while (end > text && isspace((unsigned char)end[-1])) {
+    --end;
+  }
+  *end = '\0';
+  return text;
+}
+
+static bool parse_ini_resolution_value(const char *value, int min_width, int max_width, int min_height, int max_height,
+                                       int *out_width, int *out_height) {
+  char *end = NULL;
+  long parsed_width = 0;
+  long parsed_height = 0;
+
+  if (value == NULL || out_width == NULL || out_height == NULL) {
+    return false;
+  }
+  parsed_width = strtol(value, &end, 10);
+  if ((*end != 'x' && *end != 'X') || parsed_width < min_width || parsed_width > max_width) {
+    return false;
+  }
+  parsed_height = strtol(end + 1, &end, 10);
+  if (*end != '\0' || parsed_height < min_height || parsed_height > max_height) {
+    return false;
+  }
+  *out_width = (int)parsed_width;
+  *out_height = (int)parsed_height;
+  return true;
+}
+
+static bool parse_ini_pixel_size_value(const char *value, int *out_width, int *out_height) {
+  char *end = NULL;
+  long parsed_width = 0;
+  long parsed_height = 0;
+
+  if (value == NULL || out_width == NULL || out_height == NULL) {
+    return false;
+  }
+  parsed_width = strtol(value, &end, 10);
+  if (*end == '\0') {
+    parsed_height = parsed_width;
+  } else if (*end == 'x' || *end == 'X') {
+    parsed_height = strtol(end + 1, &end, 10);
+    if (*end != '\0') {
+      return false;
+    }
+  } else {
+    return false;
+  }
+  if (parsed_width < 1 || parsed_width > 2 || parsed_height < 1 || parsed_height > 2) {
+    return false;
+  }
+  *out_width = (int)parsed_width;
+  *out_height = (int)parsed_height;
+  return true;
+}
+
+static void load_runtime_display_ini(RuntimeDisplayIniConfig *config) {
+  static const char *candidates[] = {"GLOOM.INI", "gloom.ini"};
+  FILE *file = NULL;
+  size_t candidate_index = 0u;
+  char line[256];
+
+  if (config == NULL) {
+    return;
+  }
+  memset(config, 0, sizeof(*config));
+  config->gameplay_pixel_width = 1;
+  config->gameplay_pixel_height = 1;
+
+#ifdef GLOOM_DOS_SDL3
+  for (candidate_index = 0u; candidate_index < sizeof(candidates) / sizeof(candidates[0]); ++candidate_index) {
+    file = fopen(candidates[candidate_index], "r");
+    if (file != NULL) {
+      break;
+    }
+  }
+#else
+  (void)candidates;
+  (void)candidate_index;
+#endif
+
+  if (file == NULL) {
+    return;
+  }
+
+  while (fgets(line, sizeof(line), file) != NULL) {
+    char *key = trim_ini_token(line);
+    char *value = NULL;
+    char *comment = NULL;
+    int parsed_width = 0;
+    int parsed_height = 0;
+
+    if (key == NULL || key[0] == '\0' || key[0] == '#' || key[0] == ';' || key[0] == '[') {
+      continue;
+    }
+    comment = strchr(key, ';');
+    if (comment != NULL) {
+      *comment = '\0';
+    }
+    comment = strchr(key, '#');
+    if (comment != NULL) {
+      *comment = '\0';
+    }
+    value = strchr(key, '=');
+    if (value == NULL) {
+      continue;
+    }
+    *value++ = '\0';
+    key = trim_ini_token(key);
+    value = trim_ini_token(value);
+    if (key == NULL || value == NULL || key[0] == '\0' || value[0] == '\0') {
+      continue;
+    }
+
+    if (strcmp(key, "resolution") == 0 || strcmp(key, "screen_resolution") == 0 ||
+        strcmp(key, "window_size") == 0 || strcmp(key, "boot_resolution") == 0) {
+      if (parse_ini_resolution_value(value, 320, 7680, 200, 4320, &parsed_width, &parsed_height)) {
+        config->has_resolution = true;
+        config->resolution_width = parsed_width;
+        config->resolution_height = parsed_height;
+      } else {
+        fprintf(stderr, "Ignoring GLOOM.INI %s=%s; expected WIDTHxHEIGHT within CLI resolution limits\n", key, value);
+      }
+    } else if (strcmp(key, "gameplay_viewport") == 0 || strcmp(key, "viewport_size") == 0 ||
+               strcmp(key, "reduced_window_size") == 0 || strcmp(key, "amiga_window_size") == 0) {
+      if (parse_ini_resolution_value(value, 64, BASE_WIDTH, 64, BASE_HEIGHT, &parsed_width, &parsed_height)) {
+        config->has_gameplay_viewport = true;
+        config->gameplay_viewport_width = parsed_width;
+        config->gameplay_viewport_height = parsed_height;
+      } else {
+        fprintf(stderr, "Ignoring GLOOM.INI %s=%s; expected WIDTHxHEIGHT from 64x64 through 320x224\n", key,
+                value);
+      }
+    } else if (strcmp(key, "gameplay_pixel_size") == 0 || strcmp(key, "viewport_pixel_size") == 0 ||
+               strcmp(key, "chixel_size") == 0 || strcmp(key, "pixel_size") == 0) {
+      if (parse_ini_pixel_size_value(value, &parsed_width, &parsed_height)) {
+        config->gameplay_pixel_width = parsed_width;
+        config->gameplay_pixel_height = parsed_height;
+      } else {
+        fprintf(stderr, "Ignoring GLOOM.INI %s=%s; expected 1, 2, 1x1, or 2x2\n", key, value);
+      }
+    }
+  }
+
+  fclose(file);
+}
+
+static void configure_runtime_gameplay_viewport(int render_width, int render_height) {
+  if (!g_runtime_display_ini.has_gameplay_viewport) {
+    return;
+  }
+  if (g_runtime_display_ini.gameplay_viewport_width * g_runtime_display_ini.gameplay_pixel_width > render_width ||
+      g_runtime_display_ini.gameplay_viewport_height * g_runtime_display_ini.gameplay_pixel_height > render_height) {
+    fprintf(stderr,
+            "Ignoring GLOOM.INI gameplay viewport %dx%d at %dx%d; it does not fit the %dx%d render target\n",
+            g_runtime_display_ini.gameplay_viewport_width, g_runtime_display_ini.gameplay_viewport_height,
+            g_runtime_display_ini.gameplay_pixel_width, g_runtime_display_ini.gameplay_pixel_height, render_width,
+            render_height);
+    g_runtime_display_ini.has_gameplay_viewport = false;
+  }
+}
+
+static RuntimeGameplayViewport runtime_gameplay_viewport_for_render_target(int render_width, int render_height) {
+  RuntimeGameplayViewport viewport;
+
+  memset(&viewport, 0, sizeof(viewport));
+  viewport.source_width = render_width;
+  viewport.source_height = render_height;
+  viewport.pixel_width = 1;
+  viewport.pixel_height = 1;
+  viewport.dst_width = render_width;
+  viewport.dst_height = render_height;
+
+  if (g_runtime_display_ini.has_gameplay_viewport) {
+    viewport.active = true;
+    viewport.source_width = g_runtime_display_ini.gameplay_viewport_width;
+    viewport.source_height = g_runtime_display_ini.gameplay_viewport_height;
+    viewport.pixel_width =
+        g_runtime_display_ini.gameplay_pixel_width > 0 ? g_runtime_display_ini.gameplay_pixel_width : 1;
+    viewport.pixel_height =
+        g_runtime_display_ini.gameplay_pixel_height > 0 ? g_runtime_display_ini.gameplay_pixel_height : 1;
+    viewport.dst_width = viewport.source_width * viewport.pixel_width;
+    viewport.dst_height = viewport.source_height * viewport.pixel_height;
+    viewport.dst_x = (render_width - viewport.dst_width) / 2;
+    viewport.dst_y = (render_height - viewport.dst_height) / 2;
+  }
+
+  return viewport;
+}
+
 int main(int argc, char **argv) {
   const char *map_path = "amiga/maps/map1_1";
   const char *resolved_map_path = map_path;
@@ -19941,6 +20258,14 @@ int main(int argc, char **argv) {
   memset(&hud_font, 0, sizeof(hud_font));
   memset(&menu_assets, 0, sizeof(menu_assets));
   memset(&framebuffer, 0, sizeof(framebuffer));
+  load_runtime_display_ini(&g_runtime_display_ini);
+  if (g_runtime_display_ini.has_resolution) {
+    window_width = g_runtime_display_ini.resolution_width;
+    window_height = g_runtime_display_ini.resolution_height;
+    render_width = window_width;
+    render_height = window_height;
+    explicit_resolution = true;
+  }
 
   if (argc > 1 && strcmp(argv[1], "--version") == 0) {
     printf("%s\n", runtime_title());
@@ -20333,6 +20658,7 @@ int main(int argc, char **argv) {
     window_width = render_width;
     window_height = render_height;
   }
+  configure_runtime_gameplay_viewport(render_width, render_height);
   gamepad_init();
 
 #ifdef GLOOM_DOS_SDL3

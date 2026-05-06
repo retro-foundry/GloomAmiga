@@ -53,6 +53,17 @@
 
      RESOLUTION OPTIONS
 
+       DOS builds also read GLOOM.INI from the game directory before
+       command-line options are applied:
+
+         resolution=320x200
+         viewport_size=160x100
+         viewport_pixel_size=2x2
+
+       resolution accepts the same WIDTHxHEIGHT values as --resolution.
+       viewport_size enables an Amiga-style centered gameplay window.
+       viewport_pixel_size accepts 1x1 or 2x2.
+
        DEFAULT DOS LOW MODE:
 
          GLOOMPC.EXE --classic
