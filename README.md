@@ -45,6 +45,6 @@ python -m http.server 8000
 
 ## WebRTC Multiplayer
 
-The web shell supports a 2-player WebRTC mode based on the Stunt Car Remake setup. The host tab runs the game and streams the canvas; the guest opens the join link, watches the stream, and sends keyboard/gamepad controls as player two. Remote input always feeds player two and does not follow the host's local control assignment menu.
+The web shell supports a 2-player WebRTC mode for Gloom. The host tab runs the game and streams the canvas; the guest opens the join link, watches the stream, and sends keyboard/gamepad controls as player two. Remote input always feeds player two and does not follow the host's local control assignment menu.
 
-A signaling server is required. This repo carries the Cloudflare Workers/Durable Objects signaling service in `webrtc/muttistuntcarsignal/`. See [webrtc/muttistuntcarsignal/README.md](webrtc/muttistuntcarsignal/README.md) for deploy steps and how to set `SIGNAL_BASE` in [package/template.html](package/template.html).
+A signaling server is required. This repo carries the Cloudflare Workers/Durable Objects signaling service in `webrtc/gloom-signaling/`. See [webrtc/gloom-signaling/README.md](webrtc/gloom-signaling/README.md) for deploy steps and how to set `SIGNAL_BASE` in [package/template.html](package/template.html).
