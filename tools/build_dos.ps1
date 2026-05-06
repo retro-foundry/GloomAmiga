@@ -77,24 +77,12 @@ if (Test-Path -LiteralPath $sdlDosAudio) {
       "static Uint8 soundblaster_silence_value = 0;`nstatic SDL_AudioDevice *manual_soundblaster_device = NULL;")
   }
   if ($patchedAudio -notlike '*SDL_DOS_MANUAL_AUDIO_FREQ*') {
-    $audioPatchSource = @'
-    } else {
-        // SB 2.0 (DSP 2.x) and SB 1.x: 8-bit mono unsigned.
-        device->spec.format = SDL_AUDIO_U8;
-        device->spec.channels = 1;
-    }
-
-    // Accept whatever frequency SDL3's audio layer passes in. For SB16 (DSP >= 4)
-'@
-    if (-not $patchedAudio.Contains($audioPatchSource)) {
+    $audioPatchPattern = '(?s)(    \} else \{\n\s*// SB 2\.0 \(DSP 2\.x\) and SB 1\.x: 8-bit mono unsigned\.\n\s*device->spec\.format = SDL_AUDIO_U8;\n\s*device->spec\.channels = 1;\n\s*\}\n)(\s*// Accept whatever frequency SDL3''s audio layer passes in\.)'
+    if (-not [regex]::IsMatch($patchedAudio, $audioPatchPattern)) {
       throw "Unable to patch SDL DOS Sound Blaster manual frequency in $sdlDosAudio"
     }
-    $patchedAudio = $patchedAudio.Replace($audioPatchSource, @'
-    } else {
-        // SB 2.0 (DSP 2.x) and SB 1.x: 8-bit mono unsigned.
-        device->spec.format = SDL_AUDIO_U8;
-        device->spec.channels = 1;
-    }
+    $patchedAudio = [regex]::Replace($patchedAudio, $audioPatchPattern, @'
+$1
     if (SDL_GetHintBoolean("SDL_DOS_MANUAL_AUDIO_PUMP", false)) {
         const char *freq_hint = SDL_GetHint("SDL_DOS_MANUAL_AUDIO_FREQ");
         const int freq = freq_hint ? SDL_atoi(freq_hint) : 22050;
@@ -103,8 +91,8 @@ if (Test-Path -LiteralPath $sdlDosAudio) {
         }
     }
 
-    // Accept whatever frequency SDL3's audio layer passes in. For SB16 (DSP >= 4)
-'@)
+$2
+'@, 1)
   }
   if ($patchedAudio -notlike '*manual_soundblaster_device = device*') {
     $audioPatchSource = "    SDL_Log(`"SoundBlaster opened!`");`n    return true;"
