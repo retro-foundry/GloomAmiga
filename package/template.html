@@ -496,9 +496,8 @@
             var VOLUME_STORAGE_KEY = 'gloom-webrtc-volume';
 
             // setupWebRTCAudioRouting: called once the host's SDL2 audio node is ready.
-            // Inserts a ChannelSplitter so the stereo output (L=P1, R=P2) is split:
-            //   left  → GainNode → audioContext.destination  (host hears P1 only)
-            //   right → MediaStreamDestinationNode           (guest receives P2 only)
+            // Keeps the complete SDL stereo mix for both host speakers and the guest stream.
+            // Paula-style SFX panning is by hardware channel, not by player.
             function setupWebRTCAudioRouting() {
                 if (state.role !== 'host') return false;
                 var SDL2 = (typeof Module !== 'undefined') ? Module.SDL2 : null;
@@ -507,16 +506,14 @@
                 var ctx = SDL2.audioContext;
                 var sp = SDL2.audio.scriptProcessorNode;
                 try { sp.disconnect(); } catch (e) {}
-                var splitter = ctx.createChannelSplitter(2);
-                sp.connect(splitter);
                 var hostGain = ctx.createGain();
-                splitter.connect(hostGain, 0, 0);
+                sp.connect(hostGain);
                 hostGain.connect(ctx.destination);
                 if (webrtcVolumeSlider) hostGain.gain.value = parseInt(webrtcVolumeSlider.value, 10) / 100;
                 SDL2.audio.gainNode = hostGain;
-                var p2Dest = ctx.createMediaStreamDestination();
-                splitter.connect(p2Dest, 1, 0);
-                state.p2AudioStream = p2Dest.stream;
+                var guestDest = ctx.createMediaStreamDestination();
+                sp.connect(guestDest);
+                state.p2AudioStream = guestDest.stream;
                 SDL2.audio._webrtcRoutingDone = true;
                 return true;
             }
@@ -890,7 +887,7 @@
 
             async function startHostOffer() {
                 if (!state.pc || !state.ws || state.ws.readyState !== WebSocket.OPEN || !state.targetPeerId) return;
-                // Video only from canvas (captureStream has no audio); guest audio is a separate P2-only track below.
+                // Video only from canvas (captureStream has no audio); guest audio is a separate full-mix track below.
                 if (!state.streamAdded && canvas) {
                     try {
                         const stream = canvas.captureStream(30);
@@ -900,7 +897,7 @@
                         state.streamAdded = true;
                     } catch (err) { console.error('captureStream failed', err); }
                 }
-                // P2-only audio from channel splitter (right channel); not from video. One track, same stream ID as video for sync.
+                // Full SDL audio mix; not from video. One track, same stream ID as video for sync.
                 if (!state.p2AudioTrackAdded && state.captureStream && state.p2AudioStream) {
                     var audioTracks = state.p2AudioStream.getAudioTracks();
                     for (var t = 0; t < audioTracks.length; t++) {
