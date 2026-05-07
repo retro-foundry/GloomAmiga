@@ -651,7 +651,7 @@ def try_decode_blit_table(path: Path, data: bytes, out_root: Path) -> list[Path]
 
 def try_decode_wall_textures(path: Path, data: bytes, out_root: Path) -> list[Path]:
     rel_lower = str(path.relative_to(AMIGA)).replace("\\", "/").lower()
-    if "/txts/" not in f"/{rel_lower}" and "/ggfx/" not in f"/{rel_lower}":
+    if "/txts/" not in f"/{rel_lower}":
         return []
     if "floor" in path.name.lower() or "roof" in path.name.lower():
         return []
@@ -693,7 +693,7 @@ def try_decode_wall_textures(path: Path, data: bytes, out_root: Path) -> list[Pa
 def try_decode_flat(path: Path, data: bytes, out_root: Path) -> list[Path]:
     name = path.name.lower()
     rel_lower = str(path.relative_to(AMIGA)).replace("\\", "/").lower()
-    if ("floor" not in name and "roof" not in name) or ("/txts/" not in f"/{rel_lower}" and "/ggfx/" not in f"/{rel_lower}"):
+    if ("floor" not in name and "roof" not in name) or "/txts/" not in f"/{rel_lower}":
         return []
     texel_bytes = FLAT_SIZE * FLAT_SIZE
     if len(data) < texel_bytes + 2:
