@@ -291,7 +291,19 @@ foreach ($runtimeDir in $runtimeDirs) {
 }
 
 $runtimeRootFiles = @(
+  @{ Source = 'combat.iff'; Dest = 'combat.iff' },
   @{ Source = 'blackmagic.iff'; Dest = 'BLACKMAG.IFF' },
+  @{ Source = 'bullet1.bin'; Dest = 'bullet1.bin' },
+  @{ Source = 'bullet2.bin'; Dest = 'bullet2.bin' },
+  @{ Source = 'bullet3.bin'; Dest = 'bullet3.bin' },
+  @{ Source = 'bullet4.bin'; Dest = 'bullet4.bin' },
+  @{ Source = 'bullet5.bin'; Dest = 'bullet5.bin' },
+  @{ Source = 'sparks1.bin'; Dest = 'sparks1.bin' },
+  @{ Source = 'sparks2.bin'; Dest = 'sparks2.bin' },
+  @{ Source = 'sparks3.bin'; Dest = 'sparks3.bin' },
+  @{ Source = 'sparks4.bin'; Dest = 'sparks4.bin' },
+  @{ Source = 'sparks5.bin'; Dest = 'sparks5.bin' },
+  @{ Source = 'gridoffs4.bin'; Dest = 'gridoff4.bin' },
   @{ Source = 'spacehulk.iff'; Dest = 'SPACEHUL.IFF' },
   @{ Source = 'gothic.iff'; Dest = 'GOTHIC.IFF' },
   @{ Source = 'hell.iff'; Dest = 'HELL.IFF' },
@@ -301,9 +313,10 @@ $runtimeRootFiles = @(
 foreach ($runtimeRootFile in $runtimeRootFiles) {
   $sourceFile = Join-Path $repoRoot "amiga\$($runtimeRootFile.Source)"
   $destFile = Join-Path $outDir "amiga\$($runtimeRootFile.Dest)"
-  if (Test-Path -LiteralPath $sourceFile) {
-    Copy-Item -LiteralPath $sourceFile -Destination $destFile -Force
+  if (-not (Test-Path -LiteralPath $sourceFile)) {
+    throw "Missing required DOS runtime asset $sourceFile"
   }
+  Copy-Item -LiteralPath $sourceFile -Destination $destFile -Force
 }
 
 $dosMiscDir = Join-Path $outDir 'amiga\misc'

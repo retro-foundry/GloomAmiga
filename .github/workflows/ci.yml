@@ -47,6 +47,11 @@ jobs:
         if: matrix.platform != 'dos'
         run: python scripts/run_selftests.py --build-dir build --config ${{ matrix.config }}
 
+      - name: Verify Windows runtime assets
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: scripts/verify_runtime_assets.ps1 -RuntimeDir build\${{ matrix.config }} -Platform windows
+
       - name: Set up DOS build dependencies
         if: matrix.platform == 'dos'
         shell: pwsh
@@ -64,3 +69,4 @@ jobs:
           if (-not (Test-Path build\dos\GLOOMPC.EXE)) { throw "Missing DOS executable" }
           if (-not (Test-Path build\dos\CWSDPMI.EXE)) { throw "Missing CWSDPMI.EXE" }
           if (-not (Test-Path build\dos\GLOOM.INI)) { throw "Missing DOS INI" }
+          scripts/verify_runtime_assets.ps1 -RuntimeDir build\dos -Platform dos

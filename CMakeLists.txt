@@ -146,6 +146,9 @@ add_custom_command(TARGET gloom_pc POST_BUILD
     "${CMAKE_SOURCE_DIR}/package/README.TXT"
     "$<TARGET_FILE_DIR:gloom_pc>/README.TXT"
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
+    "${CMAKE_SOURCE_DIR}/package/GLOOM.INI"
+    "$<TARGET_FILE_DIR:gloom_pc>/GLOOM.INI"
+  COMMAND ${CMAKE_COMMAND} -E copy_if_different
     "${CMAKE_SOURCE_DIR}/amiga/combat.iff"
     "${CMAKE_SOURCE_DIR}/amiga/blackmagic.iff"
     "${CMAKE_SOURCE_DIR}/amiga/bullet1.bin"
