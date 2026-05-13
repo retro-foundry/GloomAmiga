@@ -12,6 +12,7 @@ import tempfile
 from pathlib import Path
 
 from PIL import Image
+from PIL.PngImagePlugin import PngInfo
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -422,20 +423,286 @@ def image_from_indices(
     return image
 
 
-def save_sheet(frames: list[Image.Image], out_path: Path, columns: int = 8, pad: int = 2) -> None:
+def rect_dict(x: int, y: int, width: int, height: int) -> dict[str, int]:
+    return {"x": x, "y": y, "width": width, "height": height}
+
+
+def save_sheet(
+    frames: list[Image.Image],
+    out_path: Path,
+    columns: int = 8,
+    pad: int = 2,
+    *,
+    kind: str = "frames",
+    source: str | None = None,
+    item_ids: list[str] | None = None,
+    item_files: list[str] | None = None,
+    item_metadata: list[dict] | None = None,
+    extra_metadata: dict | None = None,
+) -> Path | None:
     if not frames:
-        return
+        return None
+    if item_ids is not None and len(item_ids) != len(frames):
+        raise ValueError(f"Sheet {out_path} has {len(frames)} frames but {len(item_ids)} item IDs")
+    if item_files is not None and len(item_files) != len(frames):
+        raise ValueError(f"Sheet {out_path} has {len(frames)} frames but {len(item_files)} item files")
+    if item_metadata is not None and len(item_metadata) != len(frames):
+        raise ValueError(f"Sheet {out_path} has {len(frames)} frames but {len(item_metadata)} item metadata entries")
     columns = max(1, min(columns, len(frames)))
     cell_w = max(frame.width for frame in frames)
     cell_h = max(frame.height for frame in frames)
     rows = (len(frames) + columns - 1) // columns
-    sheet = Image.new("RGBA", (columns * cell_w + (columns - 1) * pad, rows * cell_h + (rows - 1) * pad), (0, 0, 0, 0))
+    sheet = Image.new(
+        "RGBA",
+        (columns * cell_w + (columns - 1) * pad, rows * cell_h + (rows - 1) * pad),
+        (0, 0, 0, 0),
+    )
+    items = []
     for i, frame in enumerate(frames):
         x = (i % columns) * (cell_w + pad)
         y = (i // columns) * (cell_h + pad)
         sheet.alpha_composite(frame, (x, y))
+        name = item_ids[i] if item_ids is not None else f"frame_{i:04d}"
+        item = {
+            "index": i,
+            "name": name,
+            "id": f"{source}#{name}" if source else name,
+            "file": item_files[i] if item_files is not None else f"{name}.png",
+            "rect": rect_dict(x, y, frame.width, frame.height),
+            "cell": rect_dict(x, y, cell_w, cell_h),
+        }
+        if item_metadata is not None:
+            item.update(item_metadata[i])
+        items.append(item)
     ensure_dir(out_path.parent)
-    sheet.save(out_path)
+    metadata = {
+        "schema": "gloom.sheet.v1",
+        "kind": kind,
+        "source": source,
+        "sheet": out_path.name,
+        "manifest": out_path.with_suffix(".json").name,
+        "columns": columns,
+        "rows": rows,
+        "padding": pad,
+        "canvas": rect_dict(0, 0, sheet.width, sheet.height),
+        "cell": {"width": cell_w, "height": cell_h},
+        "items": items,
+    }
+    if extra_metadata:
+        metadata.update(extra_metadata)
+    manifest_path = out_path.with_suffix(".json")
+    metadata_text = json.dumps(metadata, indent=2)
+    png_info = PngInfo()
+    png_info.add_text("GloomSheetManifest", json.dumps(metadata, separators=(",", ":")))
+    sheet.save(out_path, pnginfo=png_info)
+    manifest_path.write_text(metadata_text, encoding="utf-8")
+    return manifest_path
+
+
+def load_sheet_metadata(manifest_path: Path) -> dict:
+    try:
+        return json.loads(manifest_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{manifest_path} is not valid sheet metadata: {exc}") from exc
+
+
+def sheet_path_from_metadata(manifest_path: Path, metadata: dict) -> Path:
+    sheet_name = metadata.get("sheet")
+    if not isinstance(sheet_name, str) or not sheet_name:
+        raise ValueError(f"{manifest_path} does not name a source sheet")
+    return manifest_path.parent / sheet_name
+
+
+def sheet_items_from_metadata(manifest_path: Path, metadata: dict) -> list[dict]:
+    items = metadata.get("items")
+    if not isinstance(items, list):
+        raise ValueError(f"{manifest_path} does not contain an items list")
+    return items
+
+
+def rect_from_item(manifest_path: Path, item: dict) -> tuple[int, int, int, int]:
+    rect = item.get("rect")
+    if not isinstance(rect, dict):
+        raise ValueError(f"{manifest_path} item {item.get('id', item.get('name'))} has no rect")
+    try:
+        x = int(rect["x"])
+        y = int(rect["y"])
+        width = int(rect["width"])
+        height = int(rect["height"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"{manifest_path} item {item.get('id', item.get('name'))} has an invalid rect") from exc
+    if width <= 0 or height <= 0:
+        raise ValueError(f"{manifest_path} item {item.get('id', item.get('name'))} has an empty rect")
+    return x, y, width, height
+
+
+def output_file_from_item(manifest_path: Path, item: dict, index: int) -> Path:
+    default_name = item.get("name")
+    if not isinstance(default_name, str) or not default_name:
+        default_name = f"item_{index:04d}"
+    file_name = item.get("file") or f"{default_name}.png"
+    if not isinstance(file_name, str) or not file_name:
+        raise ValueError(f"{manifest_path} item {item.get('id', item.get('name'))} has no output file")
+    return manifest_path.parent / file_name
+
+
+def sheet_logical_canvas(metadata: dict, items: list[dict], manifest_path: Path) -> tuple[int, int]:
+    canvas = metadata.get("canvas")
+    if isinstance(canvas, dict):
+        try:
+            width = int(canvas["width"])
+            height = int(canvas["height"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"{manifest_path} has an invalid sheet canvas") from exc
+        if width > 0 and height > 0:
+            return width, height
+
+    width = 0
+    height = 0
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError(f"{manifest_path} contains a non-object item entry")
+        x, y, item_w, item_h = rect_from_item(manifest_path, item)
+        width = max(width, x + item_w)
+        height = max(height, y + item_h)
+    if width <= 0 or height <= 0:
+        raise ValueError(f"{manifest_path} has no usable sheet canvas")
+    return width, height
+
+
+def scaled_bounds(
+    rect: tuple[int, int, int, int],
+    scale_x: float,
+    scale_y: float,
+) -> tuple[int, int, int, int]:
+    x, y, width, height = rect
+    left = round(x * scale_x)
+    top = round(y * scale_y)
+    right = round((x + width) * scale_x)
+    bottom = round((y + height) * scale_y)
+    return left, top, right, bottom
+
+
+def write_sheet_image_with_metadata(sheet: Image.Image, out_path: Path, metadata: dict) -> None:
+    manifest_path = out_path.with_suffix(".json")
+    metadata_text = json.dumps(metadata, indent=2)
+    png_info = PngInfo()
+    png_info.add_text("GloomSheetManifest", json.dumps(metadata, separators=(",", ":")))
+    sheet.save(out_path, pnginfo=png_info)
+    manifest_path.write_text(metadata_text, encoding="utf-8")
+
+
+def split_sheet_manifest(manifest_path: Path) -> int:
+    metadata = load_sheet_metadata(manifest_path)
+    items = sheet_items_from_metadata(manifest_path, metadata)
+
+    sheet_path = sheet_path_from_metadata(manifest_path, metadata)
+    if not sheet_path.exists():
+        raise FileNotFoundError(f"Missing sheet image {sheet_path}")
+
+    count = 0
+    with Image.open(sheet_path) as source_image:
+        logical_w, logical_h = sheet_logical_canvas(metadata, items, manifest_path)
+        scale_x = source_image.width / logical_w
+        scale_y = source_image.height / logical_h
+        if scale_x <= 0.0 or scale_y <= 0.0:
+            raise ValueError(f"{sheet_path} has an invalid image size")
+        sheet = source_image.convert("RGBA")
+        try:
+            for item in items:
+                if not isinstance(item, dict):
+                    raise ValueError(f"{manifest_path} contains a non-object item entry")
+                left, top, right, bottom = scaled_bounds(rect_from_item(manifest_path, item), scale_x, scale_y)
+                if right <= left or bottom <= top:
+                    raise ValueError(f"{manifest_path} item {item.get('id', item.get('name'))} has an empty scaled rect")
+                if left < 0 or top < 0 or right > sheet.width or bottom > sheet.height:
+                    raise ValueError(f"{manifest_path} item {item.get('id', item.get('name'))} is outside {sheet_path}")
+                frame_path = output_file_from_item(manifest_path, item, count)
+                ensure_dir(frame_path.parent)
+                sheet.crop((left, top, right, bottom)).save(frame_path)
+                count += 1
+        finally:
+            sheet.close()
+    return count
+
+
+def rebuild_sheet_manifest(manifest_path: Path) -> int:
+    metadata = load_sheet_metadata(manifest_path)
+    items = sheet_items_from_metadata(manifest_path, metadata)
+    sheet_path = sheet_path_from_metadata(manifest_path, metadata)
+    logical_w, logical_h = sheet_logical_canvas(metadata, items, manifest_path)
+    loaded_items = []
+    scale_x = None
+    scale_y = None
+
+    try:
+        for index, item in enumerate(items):
+            if not isinstance(item, dict):
+                raise ValueError(f"{manifest_path} contains a non-object item entry")
+            x, y, width, height = rect_from_item(manifest_path, item)
+            frame_path = output_file_from_item(manifest_path, item, index)
+            if not frame_path.exists():
+                raise FileNotFoundError(f"Missing item image {frame_path}")
+            image = Image.open(frame_path).convert("RGBA")
+            item_scale_x = image.width / width
+            item_scale_y = image.height / height
+            if item_scale_x <= 0.0 or item_scale_y <= 0.0:
+                raise ValueError(f"{frame_path} has an invalid image size")
+            if scale_x is None or scale_y is None:
+                scale_x = item_scale_x
+                scale_y = item_scale_y
+            elif abs(item_scale_x - scale_x) > 0.001 or abs(item_scale_y - scale_y) > 0.001:
+                raise ValueError(
+                    f"{frame_path} is scaled {item_scale_x:.3f}x{item_scale_y:.3f}, "
+                    f"but this sheet is already using {scale_x:.3f}x{scale_y:.3f}"
+                )
+            loaded_items.append((item, image, frame_path, (x, y, width, height)))
+
+        if scale_x is None or scale_y is None:
+            raise ValueError(f"{manifest_path} does not contain any item images")
+        sheet = Image.new("RGBA", (round(logical_w * scale_x), round(logical_h * scale_y)), (0, 0, 0, 0))
+        try:
+            for item, image, frame_path, rect in loaded_items:
+                left, top, right, bottom = scaled_bounds(rect, scale_x, scale_y)
+                if image.width != right - left or image.height != bottom - top:
+                    raise ValueError(f"{frame_path} does not match its scaled rect")
+                sheet.alpha_composite(image, (left, top))
+            ensure_dir(sheet_path.parent)
+            write_sheet_image_with_metadata(sheet, sheet_path, metadata)
+        finally:
+            sheet.close()
+    finally:
+        for _, image, _, _ in loaded_items:
+            image.close()
+    return len(loaded_items)
+
+
+def normalize_sheet_manifest_path(path: Path) -> Path:
+    return path.with_suffix(".json") if path.suffix.lower() == ".png" else path
+
+
+def collect_sheet_manifest_entries(out_root: Path) -> list[dict]:
+    entries = []
+    for manifest_path in sorted(out_root.rglob("_sheet.json")):
+        rel_manifest = str(manifest_path.relative_to(out_root)).replace("\\", "/")
+        try:
+            metadata = load_sheet_metadata(manifest_path)
+            sheet_name = metadata.get("sheet")
+            sheet_rel = None
+            if isinstance(sheet_name, str):
+                sheet_rel = str((manifest_path.parent / sheet_name).relative_to(out_root)).replace("\\", "/")
+            entries.append(
+                {
+                    "path": rel_manifest,
+                    "sheet": sheet_rel,
+                    "kind": metadata.get("kind"),
+                    "source": metadata.get("source"),
+                    "item_count": len(metadata.get("items", [])) if isinstance(metadata.get("items"), list) else 0,
+                }
+            )
+        except Exception as exc:
+            entries.append({"path": rel_manifest, "error": str(exc)})
+    return entries
 
 
 def try_decode_object_visual(path: Path, data: bytes, out_root: Path) -> list[Path]:
@@ -490,12 +757,34 @@ def try_decode_object_visual(path: Path, data: bytes, out_root: Path) -> list[Pa
     out_dir = out_root / "objects" / sanitize_rel(path)
     ensure_dir(out_dir)
     written = []
+    source_rel = str(path.relative_to(AMIGA)).replace("\\", "/")
+    frame_ids = []
+    frame_files = []
     for i, frame in enumerate(frames):
         frame_path = out_dir / f"frame_{i:04d}.png"
         frame.save(frame_path)
         written.append(frame_path)
+        frame_ids.append(frame_path.stem)
+        frame_files.append(frame_path.name)
     sheet_path = out_dir / "_sheet.png"
-    save_sheet(frames, sheet_path, columns=8)
+    save_sheet(
+        frames,
+        sheet_path,
+        columns=8,
+        kind="object_visual",
+        source=source_rel,
+        item_ids=frame_ids,
+        item_files=frame_files,
+        extra_metadata={
+            "object_format": {
+                "rotation_shift": rotation_shift,
+                "frames_per_rotation": frames_per_rotation,
+                "max_width": max_w,
+                "max_height": max_h,
+                "palette_offset": palette_offset,
+            }
+        },
+    )
     written.append(sheet_path)
     return written
 
@@ -504,12 +793,25 @@ def write_blit_frames(path: Path, frames: list[Image.Image], out_root: Path, var
     out_dir = out_root / variant / sanitize_rel(path)
     ensure_dir(out_dir)
     written = []
+    source_rel = str(path.relative_to(AMIGA)).replace("\\", "/")
+    frame_ids = []
+    frame_files = []
     for i, frame in enumerate(frames):
         frame_path = out_dir / f"shape_{i:04d}.png"
         frame.save(frame_path)
         written.append(frame_path)
+        frame_ids.append(frame_path.stem)
+        frame_files.append(frame_path.name)
     sheet_path = out_dir / "_sheet.png"
-    save_sheet(frames, sheet_path, columns=16)
+    save_sheet(
+        frames,
+        sheet_path,
+        columns=16,
+        kind=variant,
+        source=source_rel,
+        item_ids=frame_ids,
+        item_files=frame_files,
+    )
     written.append(sheet_path)
     return written
 
@@ -680,12 +982,47 @@ def try_decode_wall_textures(path: Path, data: bytes, out_root: Path) -> list[Pa
     out_dir = out_root / "wall_textures" / sanitize_rel(path)
     ensure_dir(out_dir)
     written = []
+    source_rel = str(path.relative_to(AMIGA)).replace("\\", "/")
+    texture_ids = []
+    texture_files = []
+    texture_metadata = []
     for i, frame in enumerate(frames):
         texture_path = out_dir / f"texture_{i:02d}.png"
         frame.save(texture_path)
         written.append(texture_path)
+        texture_ids.append(texture_path.stem)
+        texture_files.append(texture_path.name)
+        texture_metadata.append(
+            {
+                "texture_index": i,
+                "source_offset": 4 + i * TEXTURE_W * TEXTURE_COLUMN_BYTES,
+                "source_stride": TEXTURE_W * TEXTURE_COLUMN_BYTES,
+            }
+        )
     sheet_path = out_dir / "_sheet.png"
-    save_sheet(frames, sheet_path, columns=5)
+    save_sheet(
+        frames,
+        sheet_path,
+        columns=5,
+        kind="wall_texture",
+        source=source_rel,
+        item_ids=texture_ids,
+        item_files=texture_files,
+        item_metadata=texture_metadata,
+        extra_metadata={
+            "amiga_format": {
+                "authority": "amiga/gloom2.s:loadtxts",
+                "texture_width": TEXTURE_W,
+                "texture_height": TEXTURE_H,
+                "texture_column_bytes": TEXTURE_COLUMN_BYTES,
+                "texture_data_offset": 4,
+                "texture_data_end": texture_data_end,
+                "palette_offset": palette_offset,
+                "texture_count": available,
+                "textures_per_screen": 20,
+            }
+        },
+    )
     written.append(sheet_path)
     return written
 
@@ -825,7 +1162,15 @@ def run_ffmpeg_form(path: Path, source_data: bytes | None, out_root: Path, ffmpe
         return []
     images = [Image.open(frame).convert("RGBA") for frame in frames]
     sheet_path = out_dir / "_sheet.png"
-    save_sheet(images, sheet_path, columns=5)
+    save_sheet(
+        images,
+        sheet_path,
+        columns=5,
+        kind="FORM/IFF/ANIM",
+        source=str(path.relative_to(AMIGA)).replace("\\", "/"),
+        item_ids=[frame.stem for frame in frames],
+        item_files=[frame.name for frame in frames],
+    )
     for image in images:
         image.close()
     return frames + [sheet_path]
@@ -896,6 +1241,10 @@ def extract_all(out_root: Path) -> dict:
         if not decoded_any and path.suffix.lower() not in {".pal"}:
             manifest["skipped_sources"].append(rel)
 
+    sheet_manifests = collect_sheet_manifest_entries(out_root)
+    manifest["sheet_manifest_count"] = len(sheet_manifests)
+    manifest["sheet_manifests"] = sheet_manifests
+
     manifest_path = out_root / "manifest.json"
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     return manifest
@@ -904,6 +1253,23 @@ def extract_all(out_root: Path) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", type=Path, default=DEFAULT_OUT, help="Output directory, default amiga/art")
+    parser.add_argument(
+        "--split-sheets",
+        action="store_true",
+        help="Recreate individual frame/texture PNGs from exported _sheet.png/_sheet.json metadata",
+    )
+    parser.add_argument(
+        "--rebuild-sheets",
+        action="store_true",
+        help="Recreate _sheet.png files from the identified individual frame/texture PNGs",
+    )
+    parser.add_argument(
+        "--sheet",
+        action="append",
+        type=Path,
+        default=[],
+        help="Specific _sheet.json or _sheet.png to split/rebuild; repeat for more than one",
+    )
     args = parser.parse_args()
 
     out_root = args.out
@@ -911,10 +1277,41 @@ def main() -> int:
         out_root = (ROOT / out_root).resolve()
     out_root.relative_to(ROOT)
 
+    if args.split_sheets and args.rebuild_sheets:
+        parser.error("--split-sheets and --rebuild-sheets cannot be used together")
+    if args.sheet and not (args.split_sheets or args.rebuild_sheets):
+        parser.error("--sheet requires --split-sheets or --rebuild-sheets")
+
+    if args.split_sheets or args.rebuild_sheets:
+        targets = []
+        if args.sheet:
+            for sheet_path in args.sheet:
+                if not sheet_path.is_absolute():
+                    sheet_path = (ROOT / sheet_path).resolve()
+                targets.append(normalize_sheet_manifest_path(sheet_path))
+        else:
+            targets = sorted(out_root.rglob("_sheet.json"))
+        if not targets:
+            print(f"No sheet manifests found under {out_root}")
+            return 1
+        item_count = 0
+        for manifest_path in targets:
+            if args.split_sheets:
+                item_count += split_sheet_manifest(manifest_path)
+            else:
+                item_count += rebuild_sheet_manifest(manifest_path)
+        if args.split_sheets:
+            print(f"Split {item_count} item PNGs from {len(targets)} sheet manifest(s)")
+        else:
+            print(f"Rebuilt {len(targets)} sheet PNG(s) from {item_count} item PNGs")
+        return 0
+
     manifest = extract_all(out_root)
     png_count = sum(item["png_count"] for item in manifest["decoded_sources"])
     print(f"Decoded {len(manifest['decoded_sources'])} source assets into {png_count} PNG files")
     print(f"Wrote {out_root / 'manifest.json'}")
+    if "sheet_manifest_count" in manifest:
+        print(f"Wrote {manifest['sheet_manifest_count']} sheet sidecar manifest(s)")
     if manifest["errors"]:
         print(f"Decoder warnings/errors: {len(manifest['errors'])}")
     return 0
