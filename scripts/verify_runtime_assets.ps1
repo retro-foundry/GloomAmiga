@@ -27,9 +27,9 @@ Require-Path 'amiga\data\maps\map1_2'
 Require-Path 'amiga\data\txts\floor1'
 Require-Path 'amiga\objs\player'
 Require-Path 'amiga\misc\script'
-Require-Path 'amiga\misc\smallfont2.bin'
 Require-Path 'amiga\sfxs\med1'
 Require-Path 'amiga\combat.iff'
+Require-Path 'amiga\title.iff'
 Require-Path 'amiga\bullet1.bin'
 Require-Path 'amiga\bullet2.bin'
 Require-Path 'amiga\bullet3.bin'
@@ -48,11 +48,13 @@ if ($Platform -eq 'dos') {
   Require-Path 'amiga\gridoff4.bin'
   Require-Path 'amiga\BLACKMAG.IFF'
   Require-Path 'amiga\SPACEHUL.IFF'
+  Require-Path 'amiga\misc\SMALLF2.BIN'
 } else {
   Require-Path 'gloom_pc.exe'
   Require-Path 'amiga\gridoffs4.bin'
   Require-Path 'amiga\blackmagic.iff'
   Require-Path 'amiga\spacehulk.iff'
+  Require-Path 'amiga\misc\smallfont2.bin'
 }
 
 Write-Host "Runtime assets verified for $Platform at $runtimePath"

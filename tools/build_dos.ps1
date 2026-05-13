@@ -292,6 +292,7 @@ foreach ($runtimeDir in $runtimeDirs) {
 
 $runtimeRootFiles = @(
   @{ Source = 'combat.iff'; Dest = 'combat.iff' },
+  @{ Source = 'title.iff'; Dest = 'title.iff' },
   @{ Source = 'blackmagic.iff'; Dest = 'BLACKMAG.IFF' },
   @{ Source = 'bullet1.bin'; Dest = 'bullet1.bin' },
   @{ Source = 'bullet2.bin'; Dest = 'bullet2.bin' },
@@ -323,6 +324,7 @@ $dosMiscDir = Join-Path $outDir 'amiga\misc'
 New-Item -ItemType Directory -Force -Path $dosMiscDir | Out-Null
 Copy-Item -LiteralPath (Join-Path $repoRoot 'amiga\misc\palette_8') -Destination (Join-Path $dosMiscDir 'PAL8.BIN') -Force
 Copy-Item -LiteralPath (Join-Path $repoRoot 'amiga\misc\remap_8') -Destination (Join-Path $dosMiscDir 'RMAP8.BIN') -Force
+Copy-Item -LiteralPath (Join-Path $repoRoot 'amiga\misc\smallfont2.bin') -Destination (Join-Path $dosMiscDir 'SMALLF2.BIN') -Force
 
 Push-Location $repoRoot
 try {
