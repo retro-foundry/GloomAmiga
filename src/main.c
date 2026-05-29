@@ -26,6 +26,7 @@
 #include <string.h>
 #include <errno.h>
 #include <ctype.h>
+#include <limits.h>
 
 #include "iff.h"
 #include "map.h"
@@ -86,6 +87,8 @@ static const char *runtime_title(void) {
 
 #ifdef _WIN32
 #include <windows.h>
+#include <objbase.h>
+#include <wincodec.h>
 #endif
 
 enum {
@@ -685,6 +688,12 @@ typedef struct {
 } RuntimeKeyboardConfig;
 
 typedef struct {
+  uint32_t *pixels;
+  int width;
+  int height;
+} HdBitmap;
+
+typedef struct {
   uint32_t *argb_pixels;
 #ifdef GLOOM_DOS_SDL3
   uint8_t *indexed_pixels;
@@ -774,6 +783,9 @@ typedef struct {
 #endif
   uint8_t *texels;
   uint8_t *column_flags;
+  uint32_t *hd_argb_texels;
+  int hd_width;
+  int hd_height;
   size_t texture_count;
 } WallTextureScreen;
 
@@ -793,6 +805,9 @@ typedef struct {
   uint8_t *shaded_texels;
 #endif
   uint8_t *texels;
+  uint32_t *hd_argb_texels;
+  int hd_width;
+  int hd_height;
 } FlatTexture;
 
 typedef struct {
@@ -806,6 +821,8 @@ typedef struct {
   int16_t handle_y;
   int16_t width;
   int16_t height;
+  int bitmap_width;
+  int bitmap_height;
   uint32_t *argb_pixels;
 #ifdef GLOOM_DOS_SDL3
   uint8_t *indexed_pixels;
@@ -1650,6 +1667,356 @@ static bool file_exists_readable(const char *path) {
   }
   fclose(f);
   return true;
+}
+
+static void trim_trailing_slashes(char *path);
+
+static bool g_hd_art_enabled = false;
+static char g_hd_art_root[1024];
+
+static void free_hd_bitmap(HdBitmap *bitmap) {
+  if (bitmap == NULL) {
+    return;
+  }
+
+  free(bitmap->pixels);
+  memset(bitmap, 0, sizeof(*bitmap));
+}
+
+#ifdef _WIN32
+static bool path_to_wide(const char *path, wchar_t *out_path, size_t out_path_count) {
+  int written = 0;
+
+  if (path == NULL || out_path == NULL || out_path_count == 0u || out_path_count > (size_t)INT_MAX) {
+    return false;
+  }
+
+  written = MultiByteToWideChar(CP_UTF8, 0, path, -1, out_path, (int)out_path_count);
+  if (written <= 0) {
+    written = MultiByteToWideChar(CP_ACP, 0, path, -1, out_path, (int)out_path_count);
+  }
+
+  return written > 0 && (size_t)written <= out_path_count;
+}
+
+static bool load_png_file_argb(const char *path, HdBitmap *out_bitmap) {
+  HRESULT co_result = S_OK;
+  bool co_initialized = false;
+  IWICImagingFactory *factory = NULL;
+  IWICBitmapDecoder *decoder = NULL;
+  IWICBitmapFrameDecode *frame = NULL;
+  IWICFormatConverter *converter = NULL;
+  wchar_t wide_path[4096];
+  UINT width = 0u;
+  UINT height = 0u;
+  UINT stride = 0u;
+  UINT buffer_size = 0u;
+  uint8_t *rgba = NULL;
+  uint32_t *pixels = NULL;
+  size_t pixel_index = 0u;
+  HRESULT hr = S_OK;
+
+  if (path == NULL || out_bitmap == NULL) {
+    return false;
+  }
+
+  memset(out_bitmap, 0, sizeof(*out_bitmap));
+  if (!path_to_wide(path, wide_path, sizeof(wide_path) / sizeof(wide_path[0]))) {
+    fprintf(stderr, "Cannot load HD PNG %s: path is not representable as a Windows filename\n", path);
+    return false;
+  }
+
+  co_result = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+  if (SUCCEEDED(co_result)) {
+    co_initialized = true;
+  } else if (co_result != RPC_E_CHANGED_MODE) {
+    fprintf(stderr, "Cannot load HD PNG %s: COM initialization failed (0x%08lx)\n", path, (unsigned long)co_result);
+    return false;
+  }
+
+  hr = CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, &IID_IWICImagingFactory,
+                        (LPVOID *)&factory);
+  if (FAILED(hr)) {
+    fprintf(stderr, "Cannot load HD PNG %s: WIC factory creation failed (0x%08lx)\n", path, (unsigned long)hr);
+    goto fail;
+  }
+
+  hr = factory->lpVtbl->CreateDecoderFromFilename(factory, wide_path, NULL, GENERIC_READ,
+                                                  WICDecodeMetadataCacheOnLoad, &decoder);
+  if (FAILED(hr)) {
+    fprintf(stderr, "Cannot load HD PNG %s: WIC decoder failed (0x%08lx)\n", path, (unsigned long)hr);
+    goto fail;
+  }
+
+  hr = decoder->lpVtbl->GetFrame(decoder, 0u, &frame);
+  if (FAILED(hr)) {
+    fprintf(stderr, "Cannot load HD PNG %s: first image frame is unavailable (0x%08lx)\n", path,
+            (unsigned long)hr);
+    goto fail;
+  }
+
+  hr = frame->lpVtbl->GetSize(frame, &width, &height);
+  if (FAILED(hr) || width == 0u || height == 0u || width > 8192u || height > 8192u) {
+    fprintf(stderr, "Cannot load HD PNG %s: invalid image size %ux%u\n", path, (unsigned)width,
+            (unsigned)height);
+    goto fail;
+  }
+
+  hr = factory->lpVtbl->CreateFormatConverter(factory, &converter);
+  if (FAILED(hr)) {
+    fprintf(stderr, "Cannot load HD PNG %s: WIC format converter creation failed (0x%08lx)\n", path,
+            (unsigned long)hr);
+    goto fail;
+  }
+
+  hr = converter->lpVtbl->Initialize(converter, (IWICBitmapSource *)frame, &GUID_WICPixelFormat32bppRGBA,
+                                     WICBitmapDitherTypeNone, NULL, 0.0, WICBitmapPaletteTypeCustom);
+  if (FAILED(hr)) {
+    fprintf(stderr, "Cannot load HD PNG %s: WIC RGBA conversion failed (0x%08lx)\n", path, (unsigned long)hr);
+    goto fail;
+  }
+
+  if (width > UINT32_MAX / 4u || height > UINT32_MAX / (width * 4u)) {
+    fprintf(stderr, "Cannot load HD PNG %s: image buffer size overflows\n", path);
+    goto fail;
+  }
+  stride = width * 4u;
+  buffer_size = stride * height;
+  rgba = (uint8_t *)malloc((size_t)buffer_size);
+  pixels = (uint32_t *)malloc((size_t)width * (size_t)height * sizeof(*pixels));
+  if (rgba == NULL || pixels == NULL) {
+    fprintf(stderr, "Cannot load HD PNG %s: out of memory for %ux%u image\n", path, (unsigned)width,
+            (unsigned)height);
+    goto fail;
+  }
+
+  hr = converter->lpVtbl->CopyPixels(converter, NULL, stride, buffer_size, rgba);
+  if (FAILED(hr)) {
+    fprintf(stderr, "Cannot load HD PNG %s: WIC pixel copy failed (0x%08lx)\n", path, (unsigned long)hr);
+    goto fail;
+  }
+
+  for (pixel_index = 0u; pixel_index < (size_t)width * (size_t)height; ++pixel_index) {
+    const uint8_t *src = rgba + pixel_index * 4u;
+    pixels[pixel_index] =
+        ((uint32_t)src[3] << 24u) | ((uint32_t)src[0] << 16u) | ((uint32_t)src[1] << 8u) | (uint32_t)src[2];
+  }
+
+  out_bitmap->pixels = pixels;
+  out_bitmap->width = (int)width;
+  out_bitmap->height = (int)height;
+  pixels = NULL;
+  free(rgba);
+  converter->lpVtbl->Release(converter);
+  frame->lpVtbl->Release(frame);
+  decoder->lpVtbl->Release(decoder);
+  factory->lpVtbl->Release(factory);
+  if (co_initialized) {
+    CoUninitialize();
+  }
+  return true;
+
+fail:
+  free(pixels);
+  free(rgba);
+  if (converter != NULL) converter->lpVtbl->Release(converter);
+  if (frame != NULL) frame->lpVtbl->Release(frame);
+  if (decoder != NULL) decoder->lpVtbl->Release(decoder);
+  if (factory != NULL) factory->lpVtbl->Release(factory);
+  if (co_initialized) {
+    CoUninitialize();
+  }
+  return false;
+}
+#else
+static bool load_png_file_argb(const char *path, HdBitmap *out_bitmap) {
+  if (out_bitmap != NULL) {
+    memset(out_bitmap, 0, sizeof(*out_bitmap));
+  }
+  fprintf(stderr, "Cannot load HD PNG %s: --hd-art currently requires a native Windows build\n",
+          path != NULL ? path : "(null)");
+  return false;
+}
+#endif
+
+static bool set_hd_art_root(const char *path) {
+  if (path == NULL || path[0] == '\0' || strlen(path) >= sizeof(g_hd_art_root)) {
+    fprintf(stderr, "--hd-art requires a non-empty path shorter than %zu characters\n", sizeof(g_hd_art_root));
+    return false;
+  }
+
+  (void)snprintf(g_hd_art_root, sizeof(g_hd_art_root), "%s", path);
+  trim_trailing_slashes(g_hd_art_root);
+  if (g_hd_art_root[0] == '\0') {
+    fprintf(stderr, "--hd-art resolved to an empty path\n");
+    return false;
+  }
+
+  g_hd_art_enabled = true;
+  return true;
+}
+
+static bool append_hd_path(char *out_path, size_t out_path_size, const char *root, const char *category,
+                           const char *key, const char *file) {
+  int written = 0;
+
+  if (out_path == NULL || out_path_size == 0u || root == NULL || category == NULL || file == NULL) {
+    return false;
+  }
+
+  if (key != NULL && key[0] != '\0') {
+    written = snprintf(out_path, out_path_size, "%s/%s/%s/%s", root, category, key, file);
+  } else {
+    written = snprintf(out_path, out_path_size, "%s/%s/%s", root, category, file);
+  }
+
+  return written > 0 && (size_t)written < out_path_size;
+}
+
+static bool resolve_hd_art_file(const char *category, const char *key, const char *file, char *out_path,
+                                size_t out_path_size) {
+  char candidate[1280] = {0};
+  char art_root[1280] = {0};
+  int written = 0;
+
+  if (!g_hd_art_enabled || category == NULL || file == NULL || out_path == NULL || out_path_size == 0u) {
+    return false;
+  }
+
+  if (append_hd_path(candidate, sizeof(candidate), g_hd_art_root, category, key, file) &&
+      file_exists_readable(candidate)) {
+    (void)snprintf(out_path, out_path_size, "%s", candidate);
+    return true;
+  }
+
+  written = snprintf(art_root, sizeof(art_root), "%s/art", g_hd_art_root);
+  if (written > 0 && (size_t)written < sizeof(art_root) &&
+      append_hd_path(candidate, sizeof(candidate), art_root, category, key, file) &&
+      file_exists_readable(candidate)) {
+    (void)snprintf(out_path, out_path_size, "%s", candidate);
+    return true;
+  }
+
+  return false;
+}
+
+static bool path_component_equals(const char *start, size_t length, const char *expected) {
+  size_t i = 0u;
+
+  if (start == NULL || expected == NULL || strlen(expected) != length) {
+    return false;
+  }
+
+  for (i = 0u; i < length; ++i) {
+    if (tolower((unsigned char)start[i]) != tolower((unsigned char)expected[i])) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+static const char *path_after_component(const char *path, const char *component) {
+  const char *segment = path;
+  const char *cursor = path;
+
+  if (path == NULL || component == NULL) {
+    return NULL;
+  }
+
+  while (*cursor != '\0') {
+    if (*cursor == '/' || *cursor == '\\') {
+      if (path_component_equals(segment, (size_t)(cursor - segment), component)) {
+        return cursor + 1;
+      }
+      segment = cursor + 1;
+    }
+    ++cursor;
+  }
+
+  if (path_component_equals(segment, (size_t)(cursor - segment), component)) {
+    return cursor;
+  }
+  return NULL;
+}
+
+static const char *path_leaf(const char *path) {
+  const char *leaf = path;
+  const char *p = path;
+
+  if (path == NULL) {
+    return "";
+  }
+  while (*p != '\0') {
+    if (*p == '/' || *p == '\\') {
+      leaf = p + 1;
+    }
+    ++p;
+  }
+  return leaf;
+}
+
+static bool sanitize_hd_asset_key(const char *input, char *out_key, size_t out_key_size) {
+  size_t write_index = 0u;
+  size_t read_index = 0u;
+
+  if (input == NULL || input[0] == '\0' || out_key == NULL || out_key_size == 0u) {
+    return false;
+  }
+
+  while (input[0] == '/' || input[0] == '\\') {
+    ++input;
+  }
+
+  for (read_index = 0u; input[read_index] != '\0'; ++read_index) {
+    char ch = input[read_index];
+
+    if (ch == '/' || ch == '\\') {
+      if (write_index + 2u >= out_key_size) {
+        return false;
+      }
+      out_key[write_index++] = '_';
+      out_key[write_index++] = '_';
+    } else {
+      if (write_index + 1u >= out_key_size) {
+        return false;
+      }
+      out_key[write_index++] = ch == ':' ? '_' : ch;
+    }
+  }
+
+  out_key[write_index] = '\0';
+  return write_index > 0u;
+}
+
+static bool hd_asset_key_from_runtime_path(const char *resolved_path, const char *fallback, char *out_key,
+                                           size_t out_key_size) {
+  const char *relative = path_after_component(resolved_path, "amiga");
+
+  if (relative != NULL && relative[0] != '\0' && sanitize_hd_asset_key(relative, out_key, out_key_size)) {
+    return true;
+  }
+  if (fallback != NULL && fallback[0] != '\0' && sanitize_hd_asset_key(fallback, out_key, out_key_size)) {
+    return true;
+  }
+  return false;
+}
+
+static uint32_t sample_hd_bitmap_argb(const uint32_t *pixels, int width, int height, float u, float v) {
+  int sx = 0;
+  int sy = 0;
+
+  if (pixels == NULL || width <= 0 || height <= 0) {
+    return 0u;
+  }
+
+  if (u < 0.0f) u = 0.0f;
+  if (u > 1.0f) u = 1.0f;
+  if (v < 0.0f) v = 0.0f;
+  if (v > 1.0f) v = 1.0f;
+  sx = (int)(u * (float)(width - 1));
+  sy = (int)(v * (float)(height - 1));
+  return pixels[(size_t)sy * (size_t)width + (size_t)sx];
 }
 
 static const SfxDefinition *sfx_definitions(void) {
@@ -3124,6 +3491,7 @@ static void free_wall_texture_set(WallTextureSet *set) {
   for (i = 0; i < GLOOM_TEXTURE_SCREENS; ++i) {
     free(set->screens[i].texels);
     free(set->screens[i].column_flags);
+    free(set->screens[i].hd_argb_texels);
 #ifdef GLOOM_DOS_SDL3
     free(set->screens[i].column_texels);
     free(set->screens[i].column_shaded_texels);
@@ -3144,6 +3512,7 @@ static bool clone_wall_texture_screen(const WallTextureScreen *source, WallTextu
 
   free(destination->texels);
   free(destination->column_flags);
+  free(destination->hd_argb_texels);
 #ifdef GLOOM_DOS_SDL3
   free(destination->column_texels);
   free(destination->column_shaded_texels);
@@ -3151,6 +3520,7 @@ static bool clone_wall_texture_screen(const WallTextureScreen *source, WallTextu
   *destination = *source;
   destination->texels = NULL;
   destination->column_flags = NULL;
+  destination->hd_argb_texels = NULL;
 #ifdef GLOOM_DOS_SDL3
   destination->column_texels = NULL;
   destination->column_shaded_texels = NULL;
@@ -3196,6 +3566,7 @@ static bool clone_wall_texture_screen(const WallTextureScreen *source, WallTextu
     destination->column_flags = (uint8_t *)malloc(flag_count * sizeof(*destination->column_flags));
     if (destination->column_flags == NULL) {
       free(destination->texels);
+      free(destination->hd_argb_texels);
 #ifdef GLOOM_DOS_SDL3
       free(destination->column_texels);
       free(destination->column_shaded_texels);
@@ -3204,6 +3575,23 @@ static bool clone_wall_texture_screen(const WallTextureScreen *source, WallTextu
       return false;
     }
     memcpy(destination->column_flags, source->column_flags, flag_count * sizeof(*destination->column_flags));
+  }
+
+  if (source->hd_argb_texels != NULL && source->hd_width > 0 && source->hd_height > 0) {
+    size_t hd_count = source->texture_count * (size_t)source->hd_width * (size_t)source->hd_height;
+
+    destination->hd_argb_texels = (uint32_t *)malloc(hd_count * sizeof(*destination->hd_argb_texels));
+    if (destination->hd_argb_texels == NULL) {
+      free(destination->texels);
+      free(destination->column_flags);
+#ifdef GLOOM_DOS_SDL3
+      free(destination->column_texels);
+      free(destination->column_shaded_texels);
+#endif
+      memset(destination, 0, sizeof(*destination));
+      return false;
+    }
+    memcpy(destination->hd_argb_texels, source->hd_argb_texels, hd_count * sizeof(*destination->hd_argb_texels));
   }
 
   return true;
@@ -3908,6 +4296,277 @@ static void apply_dos_menu_display_palette(RenderFramebuffer *framebuffer, const
 }
 #endif
 
+static bool resolve_hd_art_file_for_keys(const char *category, const char *const *keys, size_t key_count,
+                                         const char *file, char *out_path, size_t out_path_size) {
+  size_t i = 0u;
+
+  if (category == NULL || keys == NULL || file == NULL || out_path == NULL || out_path_size == 0u) {
+    return false;
+  }
+
+  for (i = 0u; i < key_count; ++i) {
+    if (keys[i] == NULL || keys[i][0] == '\0') {
+      continue;
+    }
+    if (resolve_hd_art_file(category, keys[i], file, out_path, out_path_size)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+static bool load_hd_wall_texture_screen(const char *resolved_path, const char *source_name,
+                                        WallTextureScreen *screen) {
+  char key_from_path[256] = {0};
+  char key_from_source[256] = {0};
+  char key_txts[256] = {0};
+  char key_data_txts[256] = {0};
+  char key_ggfx[256] = {0};
+  char key_data_ggfx[256] = {0};
+  const char *keys[6] = {NULL, NULL, NULL, NULL, NULL, NULL};
+  size_t key_count = 0u;
+  uint32_t *hd_pixels = NULL;
+  int hd_width = 0;
+  int hd_height = 0;
+  size_t texture_index = 0u;
+
+  if (!g_hd_art_enabled) {
+    return true;
+  }
+  if (screen == NULL || !screen->loaded || screen->texture_count == 0u) {
+    return false;
+  }
+
+  if (hd_asset_key_from_runtime_path(resolved_path, source_name, key_from_path, sizeof(key_from_path))) {
+    keys[key_count++] = key_from_path;
+  }
+  if (source_name != NULL && source_name[0] != '\0' &&
+      sanitize_hd_asset_key(source_name, key_from_source, sizeof(key_from_source))) {
+    keys[key_count++] = key_from_source;
+    (void)snprintf(key_txts, sizeof(key_txts), "txts__%s", key_from_source);
+    (void)snprintf(key_data_txts, sizeof(key_data_txts), "data__txts__%s", key_from_source);
+    (void)snprintf(key_ggfx, sizeof(key_ggfx), "ggfx__%s", key_from_source);
+    (void)snprintf(key_data_ggfx, sizeof(key_data_ggfx), "data__ggfx__%s", key_from_source);
+    keys[key_count++] = key_txts;
+    keys[key_count++] = key_data_txts;
+    keys[key_count++] = key_ggfx;
+    keys[key_count++] = key_data_ggfx;
+  }
+
+  for (texture_index = 0u; texture_index < screen->texture_count; ++texture_index) {
+    char file_name[32] = {0};
+    char hd_path[1280] = {0};
+    HdBitmap bitmap;
+    size_t bitmap_pixels = 0u;
+
+    memset(&bitmap, 0, sizeof(bitmap));
+    (void)snprintf(file_name, sizeof(file_name), "texture_%02zu.png", texture_index);
+    if (!resolve_hd_art_file_for_keys("wall_textures", keys, key_count, file_name, hd_path, sizeof(hd_path))) {
+      fprintf(stderr, "Missing HD wall texture %s for original texture screen %s\n", file_name,
+              source_name != NULL ? source_name : resolved_path);
+      free(hd_pixels);
+      return false;
+    }
+    if (!load_png_file_argb(hd_path, &bitmap)) {
+      free(hd_pixels);
+      return false;
+    }
+    if (bitmap.width < GLOOM_TEXTURE_WIDTH || bitmap.height < GLOOM_TEXTURE_HEIGHT) {
+      fprintf(stderr, "HD wall texture %s is %dx%d, smaller than original %dx%d\n", hd_path, bitmap.width,
+              bitmap.height, GLOOM_TEXTURE_WIDTH, GLOOM_TEXTURE_HEIGHT);
+      free_hd_bitmap(&bitmap);
+      free(hd_pixels);
+      return false;
+    }
+    if (texture_index == 0u) {
+      size_t total_pixels = 0u;
+
+      hd_width = bitmap.width;
+      hd_height = bitmap.height;
+      if ((size_t)hd_width > SIZE_MAX / (size_t)hd_height ||
+          screen->texture_count > SIZE_MAX / ((size_t)hd_width * (size_t)hd_height)) {
+        fprintf(stderr, "HD wall texture screen %s is too large to allocate\n",
+                source_name != NULL ? source_name : resolved_path);
+        free_hd_bitmap(&bitmap);
+        return false;
+      }
+      total_pixels = screen->texture_count * (size_t)hd_width * (size_t)hd_height;
+      hd_pixels = (uint32_t *)malloc(total_pixels * sizeof(*hd_pixels));
+      if (hd_pixels == NULL) {
+        fprintf(stderr, "Out of memory while loading HD wall texture screen %s\n",
+                source_name != NULL ? source_name : resolved_path);
+        free_hd_bitmap(&bitmap);
+        return false;
+      }
+    } else if (bitmap.width != hd_width || bitmap.height != hd_height) {
+      fprintf(stderr, "HD wall texture %s is %dx%d, expected %dx%d for the same texture screen\n", hd_path,
+              bitmap.width, bitmap.height, hd_width, hd_height);
+      free_hd_bitmap(&bitmap);
+      free(hd_pixels);
+      return false;
+    }
+
+    bitmap_pixels = (size_t)hd_width * (size_t)hd_height;
+    memcpy(hd_pixels + texture_index * bitmap_pixels, bitmap.pixels, bitmap_pixels * sizeof(*hd_pixels));
+    free_hd_bitmap(&bitmap);
+  }
+
+  free(screen->hd_argb_texels);
+  screen->hd_argb_texels = hd_pixels;
+  screen->hd_width = hd_width;
+  screen->hd_height = hd_height;
+  printf("Loaded HD wall texture screen %s at %dx%d per texture\n",
+         source_name != NULL ? source_name : resolved_path, hd_width, hd_height);
+  return true;
+}
+
+static bool load_hd_flat_texture(const char *resolved_path, const char *kind, const char *tile_tag,
+                                 FlatTexture *texture) {
+  char key_from_path[256] = {0};
+  char key_leaf[256] = {0};
+  char key_txts[256] = {0};
+  char key_data_txts[256] = {0};
+  char file_name[320] = {0};
+  const char *keys[4] = {NULL, NULL, NULL, NULL};
+  size_t key_count = 0u;
+  char hd_path[1280] = {0};
+  HdBitmap bitmap;
+
+  memset(&bitmap, 0, sizeof(bitmap));
+  if (!g_hd_art_enabled) {
+    return true;
+  }
+  if (resolved_path == NULL || kind == NULL || tile_tag == NULL || texture == NULL || !texture->loaded) {
+    return false;
+  }
+
+  if (hd_asset_key_from_runtime_path(resolved_path, NULL, key_from_path, sizeof(key_from_path))) {
+    keys[key_count++] = key_from_path;
+  }
+  (void)snprintf(key_leaf, sizeof(key_leaf), "%s%s", kind, tile_tag);
+  (void)snprintf(key_txts, sizeof(key_txts), "txts__%s", key_leaf);
+  (void)snprintf(key_data_txts, sizeof(key_data_txts), "data__txts__%s", key_leaf);
+  keys[key_count++] = key_leaf;
+  keys[key_count++] = key_txts;
+  keys[key_count++] = key_data_txts;
+
+  {
+    size_t i = 0u;
+    bool found = false;
+
+    for (i = 0u; i < key_count; ++i) {
+      if (keys[i] == NULL || keys[i][0] == '\0') {
+        continue;
+      }
+      (void)snprintf(file_name, sizeof(file_name), "%s.png", keys[i]);
+      if (resolve_hd_art_file("flats", NULL, file_name, hd_path, sizeof(hd_path))) {
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      fprintf(stderr, "Missing HD %s tile for script tile_%s\n", kind, tile_tag);
+      return false;
+    }
+  }
+
+  if (!load_png_file_argb(hd_path, &bitmap)) {
+    return false;
+  }
+  if (bitmap.width < GLOOM_FLAT_TEXTURE_SIZE || bitmap.height < GLOOM_FLAT_TEXTURE_SIZE) {
+    fprintf(stderr, "HD %s tile %s is %dx%d, smaller than original %dx%d\n", kind, hd_path, bitmap.width,
+            bitmap.height, GLOOM_FLAT_TEXTURE_SIZE, GLOOM_FLAT_TEXTURE_SIZE);
+    free_hd_bitmap(&bitmap);
+    return false;
+  }
+
+  free(texture->hd_argb_texels);
+  texture->hd_argb_texels = bitmap.pixels;
+  texture->hd_width = bitmap.width;
+  texture->hd_height = bitmap.height;
+  bitmap.pixels = NULL;
+  printf("Loaded HD %s tile_%s from %s (%dx%d)\n", kind, tile_tag, hd_path, texture->hd_width,
+         texture->hd_height);
+  free_hd_bitmap(&bitmap);
+  return true;
+}
+
+static bool load_hd_object_visual_frames(const char *resolved_path, const char *asset_name, ObjectVisual *visual) {
+  char key_from_path[256] = {0};
+  char key_from_asset[256] = {0};
+  char key_objs[256] = {0};
+  char key_data_objs[256] = {0};
+  char key_prog_objs[256] = {0};
+  const char *keys[5] = {NULL, NULL, NULL, NULL, NULL};
+  size_t key_count = 0u;
+  size_t frame_index = 0u;
+
+  if (!g_hd_art_enabled) {
+    return true;
+  }
+  if (visual == NULL || !visual->loaded || visual->frames == NULL || visual->frame_count == 0u) {
+    return false;
+  }
+
+  if (hd_asset_key_from_runtime_path(resolved_path, asset_name, key_from_path, sizeof(key_from_path))) {
+    keys[key_count++] = key_from_path;
+  }
+  if (asset_name != NULL && asset_name[0] != '\0' &&
+      sanitize_hd_asset_key(asset_name, key_from_asset, sizeof(key_from_asset))) {
+    keys[key_count++] = key_from_asset;
+    if (strchr(asset_name, '/') == NULL && strchr(asset_name, '\\') == NULL) {
+      (void)snprintf(key_objs, sizeof(key_objs), "objs__%s", key_from_asset);
+      (void)snprintf(key_data_objs, sizeof(key_data_objs), "data__objs__%s", key_from_asset);
+      (void)snprintf(key_prog_objs, sizeof(key_prog_objs), "prog__objs__%s", key_from_asset);
+      keys[key_count++] = key_objs;
+      keys[key_count++] = key_data_objs;
+      keys[key_count++] = key_prog_objs;
+    }
+  }
+
+  for (frame_index = 0u; frame_index < visual->frame_count; ++frame_index) {
+    ObjectFrame *frame = &visual->frames[frame_index];
+    char file_name[32] = {0};
+    char hd_path[1280] = {0};
+    HdBitmap bitmap;
+
+    memset(&bitmap, 0, sizeof(bitmap));
+    (void)snprintf(file_name, sizeof(file_name), "frame_%04zu.png", frame_index);
+    if (!resolve_hd_art_file_for_keys("objects", keys, key_count, file_name, hd_path, sizeof(hd_path))) {
+      fprintf(stderr, "Missing HD object frame %s for original asset %s\n", file_name,
+              asset_name != NULL ? asset_name : resolved_path);
+      return false;
+    }
+    if (!load_png_file_argb(hd_path, &bitmap)) {
+      return false;
+    }
+    if (bitmap.width < frame->width || bitmap.height < frame->height) {
+      fprintf(stderr, "HD object frame %s is %dx%d, smaller than original logical frame %dx%d\n", hd_path,
+              bitmap.width, bitmap.height, frame->width, frame->height);
+      free_hd_bitmap(&bitmap);
+      return false;
+    }
+
+    free(frame->argb_pixels);
+    frame->argb_pixels = bitmap.pixels;
+    frame->bitmap_width = bitmap.width;
+    frame->bitmap_height = bitmap.height;
+    bitmap.pixels = NULL;
+    free_hd_bitmap(&bitmap);
+  }
+
+  {
+    size_t len = strlen(visual->source_name);
+
+    if (len + 9u < sizeof(visual->source_name)) {
+      (void)snprintf(visual->source_name + len, sizeof(visual->source_name) - len, " + HD art");
+    }
+  }
+  printf("Loaded %zu HD object frames for %s\n", visual->frame_count, asset_name != NULL ? asset_name : resolved_path);
+  return true;
+}
+
 static void free_hud_font(HudFont *font) {
   size_t i = 0u;
 
@@ -4516,6 +5175,19 @@ static bool load_wall_texture_screen(const char *path, const char *source_name, 
   }
 #endif
 
+  if (!load_hd_wall_texture_screen(path, source_name, out_screen)) {
+    free(data);
+    free(out_screen->texels);
+    free(out_screen->column_flags);
+    free(out_screen->hd_argb_texels);
+#ifdef GLOOM_DOS_SDL3
+    free(out_screen->column_texels);
+    free(out_screen->column_shaded_texels);
+#endif
+    memset(out_screen, 0, sizeof(*out_screen));
+    return false;
+  }
+
   free(data);
   return true;
 }
@@ -4707,6 +5379,7 @@ static void free_flat_texture(FlatTexture *texture) {
   }
 
   free(texture->texels);
+  free(texture->hd_argb_texels);
 #ifdef GLOOM_DOS_SDL3
   free(texture->shaded_texels);
 #endif
@@ -4733,6 +5406,7 @@ static bool clone_flat_texture(const FlatTexture *source, FlatTexture *destinati
   free_flat_texture(destination);
   *destination = *source;
   destination->texels = NULL;
+  destination->hd_argb_texels = NULL;
 #ifdef GLOOM_DOS_SDL3
   destination->shaded_texels = NULL;
 #endif
@@ -4743,6 +5417,17 @@ static bool clone_flat_texture(const FlatTexture *source, FlatTexture *destinati
     return false;
   }
   memcpy(destination->texels, source->texels, (size_t)FLAT_TEXEL_BYTES);
+
+  if (source->hd_argb_texels != NULL && source->hd_width > 0 && source->hd_height > 0) {
+    size_t hd_count = (size_t)source->hd_width * (size_t)source->hd_height;
+
+    destination->hd_argb_texels = (uint32_t *)malloc(hd_count * sizeof(*destination->hd_argb_texels));
+    if (destination->hd_argb_texels == NULL) {
+      free_flat_texture(destination);
+      return false;
+    }
+    memcpy(destination->hd_argb_texels, source->hd_argb_texels, hd_count * sizeof(*destination->hd_argb_texels));
+  }
 
 #ifdef GLOOM_DOS_SDL3
   if (source->shaded_texels != NULL) {
@@ -5746,6 +6431,12 @@ static bool load_flat_texture(const char *kind, const char *tile_tag, FlatTextur
 #endif
   (void)snprintf(out_texture->source_name, sizeof(out_texture->source_name), "%s", resolved_path);
 
+  if (!load_hd_flat_texture(resolved_path, kind, tile_tag, out_texture)) {
+    free(data);
+    free_flat_texture(out_texture);
+    return false;
+  }
+
   free(data);
   return true;
 }
@@ -5828,6 +6519,22 @@ static uint32_t sample_wall_texture_argb_ex(const WallTextureSet *set, uint8_t t
       set->screens[screen_index].column_flags != NULL && set->screens[screen_index].column_flags[flag_offset] != 0u;
   if (out_transparent_column != NULL) {
     *out_transparent_column = transparent_column;
+  }
+
+  if (set->screens[screen_index].hd_argb_texels != NULL && set->screens[screen_index].hd_width > 0 &&
+      set->screens[screen_index].hd_height > 0) {
+    const WallTextureScreen *screen = &set->screens[screen_index];
+    const uint32_t *hd_pixels = screen->hd_argb_texels +
+                                local_index * (size_t)screen->hd_width * (size_t)screen->hd_height;
+    uint32_t argb = sample_hd_bitmap_argb(hd_pixels, screen->hd_width, screen->hd_height, u, v);
+
+    if (transparent_column && ((argb >> 24u) == 0u || palette_index == 0u)) {
+      return 0x00000000u;
+    }
+    if ((argb >> 24u) == 0u) {
+      return 0x00000000u;
+    }
+    return argb;
   }
 
   if (transparent_column && palette_index == 0u) {
@@ -6172,6 +6879,8 @@ static bool clone_object_visual(const ObjectVisual *source, ObjectVisual *destin
     const ObjectFrame *src_frame = &source->frames[frame_index];
     ObjectFrame *dst_frame = &destination->frames[frame_index];
     size_t pixel_count = 0u;
+    int src_bitmap_width = src_frame->bitmap_width > 0 ? src_frame->bitmap_width : src_frame->width;
+    int src_bitmap_height = src_frame->bitmap_height > 0 ? src_frame->bitmap_height : src_frame->height;
 
     *dst_frame = *src_frame;
     dst_frame->argb_pixels = NULL;
@@ -6179,11 +6888,12 @@ static bool clone_object_visual(const ObjectVisual *source, ObjectVisual *destin
     dst_frame->indexed_pixels = NULL;
 #endif
 
-    if (src_frame->width <= 0 || src_frame->height <= 0 || src_frame->argb_pixels == NULL) {
+    if (src_frame->width <= 0 || src_frame->height <= 0 || src_bitmap_width <= 0 || src_bitmap_height <= 0 ||
+        src_frame->argb_pixels == NULL) {
       free_object_visual(destination);
       return false;
     }
-    pixel_count = (size_t)src_frame->width * (size_t)src_frame->height;
+    pixel_count = (size_t)src_bitmap_width * (size_t)src_bitmap_height;
 
     dst_frame->argb_pixels = (uint32_t *)malloc(pixel_count * sizeof(*dst_frame->argb_pixels));
     if (dst_frame->argb_pixels == NULL) {
@@ -6366,6 +7076,8 @@ static bool load_object_visual_from_asset(const char *asset_name, const ObjectVi
     frames[frame_index].handle_y = handle_y;
     frames[frame_index].width = width;
     frames[frame_index].height = height;
+    frames[frame_index].bitmap_width = width;
+    frames[frame_index].bitmap_height = height;
     frames[frame_index].argb_pixels = pixels;
 #ifdef GLOOM_DOS_SDL3
     frames[frame_index].indexed_pixels = indexed_pixels;
@@ -6383,6 +7095,12 @@ static bool load_object_visual_from_asset(const char *asset_name, const ObjectVi
   out_visual->frame_count = frame_count;
   out_visual->frames = frames;
   (void)snprintf(out_visual->source_name, sizeof(out_visual->source_name), "%s", resolved_path);
+
+  if (!load_hd_object_visual_frames(resolved_path, asset_name, out_visual)) {
+    free(data);
+    free_object_visual(out_visual);
+    return false;
+  }
 
   free(data);
   return true;
@@ -6512,19 +7230,30 @@ static bool load_weapon_visual_set(WeaponVisualSet *set) {
   return true;
 }
 
-static uint32_t sample_object_frame_argb(const ObjectFrame *frame, float u, float v) {
-  int sx = 0;
-  int sy = 0;
+static int object_frame_bitmap_width(const ObjectFrame *frame) {
+  return frame != NULL && frame->bitmap_width > 0 ? frame->bitmap_width : (frame != NULL ? frame->width : 0);
+}
 
-  if (frame == NULL || frame->argb_pixels == NULL || frame->width <= 0 || frame->height <= 0) {
+static int object_frame_bitmap_height(const ObjectFrame *frame) {
+  return frame != NULL && frame->bitmap_height > 0 ? frame->bitmap_height : (frame != NULL ? frame->height : 0);
+}
+
+static uint32_t sample_object_frame_argb(const ObjectFrame *frame, float u, float v) {
+  int bitmap_width = object_frame_bitmap_width(frame);
+  int bitmap_height = object_frame_bitmap_height(frame);
+
+  if (frame == NULL || frame->argb_pixels == NULL || bitmap_width <= 0 || bitmap_height <= 0) {
     return 0u;
   }
 
-  u = clampf(u, 0.0f, 1.0f);
-  v = clampf(v, 0.0f, 1.0f);
-  sx = (int)(u * (float)(frame->width - 1));
-  sy = (int)(v * (float)(frame->height - 1));
-  return frame->argb_pixels[(sy * frame->width) + sx];
+  return sample_hd_bitmap_argb(frame->argb_pixels, bitmap_width, bitmap_height, u, v);
+}
+
+static uint32_t sample_object_frame_logical_argb(const ObjectFrame *frame, float source_x, float source_y) {
+  if (frame == NULL || frame->width <= 0 || frame->height <= 0) {
+    return 0u;
+  }
+  return sample_object_frame_argb(frame, source_x / (float)frame->width, source_y / (float)frame->height);
 }
 
 static const ObjectFrame *select_object_visual_frame_number(const ObjectVisual *visual, const GloomObjectSpawn *spawn,
@@ -11372,6 +12101,20 @@ static void check_event_triggers(AppState *state) {
   }
 }
 
+static int repeated_hd_texture_coord(float world, int original_size, int hd_size) {
+  int coord = 0;
+
+  if (original_size <= 0 || hd_size <= 0) {
+    return 0;
+  }
+
+  coord = floor_to_int((world * (float)hd_size) / (float)original_size) % hd_size;
+  if (coord < 0) {
+    coord += hd_size;
+  }
+  return coord;
+}
+
 static uint32_t sample_flat_texture_argb(const FlatTexture *texture, float world_x, float world_z) {
   int tx = 0;
   int tz = 0;
@@ -11379,6 +12122,13 @@ static uint32_t sample_flat_texture_argb(const FlatTexture *texture, float world
 
   if (texture == NULL || !texture->loaded || texture->texels == NULL) {
     return 0xFF000000u;
+  }
+
+  if (texture->hd_argb_texels != NULL && texture->hd_width > 0 && texture->hd_height > 0) {
+    int hd_tx = repeated_hd_texture_coord(world_x, GLOOM_FLAT_TEXTURE_SIZE, texture->hd_width);
+    int hd_tz = repeated_hd_texture_coord(world_z, GLOOM_FLAT_TEXTURE_SIZE, texture->hd_height);
+
+    return texture->hd_argb_texels[(size_t)hd_tz * (size_t)texture->hd_width + (size_t)hd_tx];
   }
 
   tx = floor_to_int(world_x) & (GLOOM_FLAT_TEXTURE_SIZE - 1);
@@ -12067,6 +12817,7 @@ static void render_flat_textures(RenderFramebuffer *framebuffer, const AppState 
     float world_x_step = 0.0f;
     float world_z_step = 0.0f;
     int col = 0;
+    int hd_subtract = 0;
 
     if (centered_y > 0.5f) {
       texture = &flats->floor;
@@ -12094,13 +12845,25 @@ static void render_flat_textures(RenderFramebuffer *framebuffer, const AppState 
     world_x_step = view_x_step * view_cos;
     world_z_step = -view_x_step * view_sin;
     palette = texture->shaded_palette[amiga_depth_dark_index(depth)];
+    hd_subtract = depth_subtract_for_depth(depth);
 
     for (col = 0; col < w; ++col) {
       size_t dst = (size_t)(y + row) * (size_t)framebuffer->pitch_pixels + (size_t)(x + col);
-      int tx = floor_to_int(world_x) & (GLOOM_FLAT_TEXTURE_SIZE - 1);
-      int tz = floor_to_int(world_z) & (GLOOM_FLAT_TEXTURE_SIZE - 1);
-      uint8_t palette_index = texels[(tx * GLOOM_FLAT_TEXTURE_SIZE) + tz];
-      uint32_t argb = palette[palette_index];
+      uint32_t argb = 0u;
+
+      if (texture->hd_argb_texels != NULL && texture->hd_width > 0 && texture->hd_height > 0) {
+        int hd_tx = repeated_hd_texture_coord(world_x, GLOOM_FLAT_TEXTURE_SIZE, texture->hd_width);
+        int hd_tz = repeated_hd_texture_coord(world_z, GLOOM_FLAT_TEXTURE_SIZE, texture->hd_height);
+
+        argb = texture->hd_argb_texels[(size_t)hd_tz * (size_t)texture->hd_width + (size_t)hd_tx];
+        argb = shade_argb_subtract(argb, hd_subtract);
+      } else {
+        int tx = floor_to_int(world_x) & (GLOOM_FLAT_TEXTURE_SIZE - 1);
+        int tz = floor_to_int(world_z) & (GLOOM_FLAT_TEXTURE_SIZE - 1);
+        uint8_t palette_index = texels[(tx * GLOOM_FLAT_TEXTURE_SIZE) + tz];
+
+        argb = palette[palette_index];
+      }
 
       framebuffer->pixels[dst] = 0xFF000000u | (argb & 0x00FFFFFFu);
       world_x += world_x_step;
@@ -12914,8 +13677,12 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
       bool fast_wall_column = false;
       bool transparent_wall_column = false;
       const uint8_t *wall_texels = NULL;
+      const uint32_t *wall_hd_texels = NULL;
       const uint32_t *wall_palette = NULL;
       size_t wall_texel_base = 0u;
+      size_t wall_hd_texel_base = 0u;
+      int wall_hd_width = 0;
+      int wall_hd_height = 0;
 
       if (wall_height < 1.0f) {
         float center_y = (wall_top + wall_bottom) * 0.5f;
@@ -12956,6 +13723,18 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
             wall_texels = screen->texels;
             wall_palette = screen->shaded_palette[dark_index];
             wall_texel_base = local_index * ((size_t)GLOOM_TEXTURE_WIDTH * (size_t)GLOOM_TEXTURE_HEIGHT) + tx;
+            if (screen->hd_argb_texels != NULL && screen->hd_width > 0 && screen->hd_height > 0) {
+              size_t hd_tx = (size_t)(local_u * (float)(screen->hd_width - 1));
+
+              if (hd_tx >= (size_t)screen->hd_width) {
+                hd_tx = (size_t)screen->hd_width - 1u;
+              }
+              wall_hd_texels = screen->hd_argb_texels;
+              wall_hd_width = screen->hd_width;
+              wall_hd_height = screen->hd_height;
+              wall_hd_texel_base =
+                  local_index * (size_t)screen->hd_width * (size_t)screen->hd_height + hd_tx;
+            }
             transparent_wall_column =
                 screen->column_flags != NULL &&
                 screen->column_flags[(local_index * (size_t)GLOOM_TEXTURE_WIDTH) + tx] != 0u;
@@ -13030,7 +13809,20 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
           if (transparent_wall_column && palette_index == 0u) {
             continue;
           }
-          argb = wall_palette[palette_index];
+          if (wall_hd_texels != NULL && wall_hd_width > 0 && wall_hd_height > 0) {
+            size_t hd_ty = (size_t)(wall_v * (float)(wall_hd_height - 1));
+
+            if (hd_ty >= (size_t)wall_hd_height) {
+              hd_ty = (size_t)wall_hd_height - 1u;
+            }
+            argb = wall_hd_texels[wall_hd_texel_base + hd_ty * (size_t)wall_hd_width];
+            if ((argb >> 24u) == 0u) {
+              continue;
+            }
+            argb = shade_argb_subtract(argb, subtract);
+          } else {
+            argb = wall_palette[palette_index];
+          }
         } else {
           argb = sample_zone_wall_texture_argb(wall_textures, state, hit->wall->zone, hit->wall_u, wall_v);
           argb = shade_argb_subtract(argb, subtract);
@@ -13603,8 +14395,6 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
         float tv = ((float)draw_y + 0.5f - sp->screen_y) / sp->screen_h;
         uint32_t argb = 0;
         uint8_t alpha = 0;
-        int sx = 0;
-        int sy = 0;
 
         if (tv < 0.0f || tv > 1.0f || tu < 0.0f || tu > 1.0f) {
           continue;
@@ -13620,13 +14410,10 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
               source_y >= (float)frame->height) {
             continue;
           }
-          sx = (int)source_x;
-          sy = (int)source_y;
+          argb = sample_object_frame_logical_argb(frame, source_x, source_y);
         } else {
-          sx = (int)(tu * (float)(frame->width - 1));
-          sy = (int)(tv * (float)(frame->height - 1));
+          argb = sample_object_frame_argb(frame, tu, tv);
         }
-        argb = frame->argb_pixels[(size_t)sy * (size_t)frame->width + (size_t)sx];
 
         alpha = (uint8_t)(argb >> 24);
 
@@ -13750,11 +14537,53 @@ static void render_argb_pixels_scaled(RenderFramebuffer *framebuffer, const uint
 #ifndef GLOOM_DOS_SDL3
 static void render_object_frame_scaled(RenderFramebuffer *framebuffer, const ObjectFrame *frame, int screen_x,
                                        int screen_y, int scale) {
+  int dst_w = 0;
+  int dst_h = 0;
+  int x0 = 0;
+  int x1 = 0;
+  int y0 = 0;
+  int y1 = 0;
+  int draw_y = 0;
+
   if (frame == NULL) {
     return;
   }
 
-  render_argb_pixels_scaled(framebuffer, frame->argb_pixels, frame->width, frame->height, screen_x, screen_y, scale);
+  if (framebuffer == NULL || frame->argb_pixels == NULL || frame->width <= 0 || frame->height <= 0 || scale <= 0 ||
+      framebuffer->pixels == NULL || framebuffer->pitch_pixels < framebuffer->width) {
+    return;
+  }
+
+  dst_w = frame->width * scale;
+  dst_h = frame->height * scale;
+  if (screen_x + dst_w <= 0 || screen_y + dst_h <= 0 ||
+      screen_x >= framebuffer->width || screen_y >= framebuffer->height) {
+    return;
+  }
+
+  x0 = screen_x;
+  x1 = screen_x + dst_w;
+  y0 = screen_y;
+  y1 = screen_y + dst_h;
+  if (x0 < 0) x0 = 0;
+  if (y0 < 0) y0 = 0;
+  if (x1 > framebuffer->width) x1 = framebuffer->width;
+  if (y1 > framebuffer->height) y1 = framebuffer->height;
+
+  for (draw_y = y0; draw_y < y1; ++draw_y) {
+    float v = ((float)draw_y + 0.5f - (float)screen_y) / (float)dst_h;
+    uint32_t *row = framebuffer->pixels + ((size_t)draw_y * (size_t)framebuffer->pitch_pixels);
+    int draw_x = 0;
+
+    for (draw_x = x0; draw_x < x1; ++draw_x) {
+      float u = ((float)draw_x + 0.5f - (float)screen_x) / (float)dst_w;
+      uint32_t argb = sample_object_frame_argb(frame, u, v);
+
+      if ((argb >> 24u) != 0u) {
+        row[draw_x] = 0xFF000000u | (argb & 0x00FFFFFFu);
+      }
+    }
+  }
 }
 #endif
 
@@ -20413,6 +21242,9 @@ static void load_runtime_display_ini(RuntimeDisplayIniConfig *config) {
   static const char *candidates[] = {"GLOOM.INI", "gloom.ini"};
   FILE *file = NULL;
   size_t candidate_index = 0u;
+#ifndef GLOOM_DOS_SDL3
+  char resolved_ini_path[1280] = {0};
+#endif
   char line[256];
 
   if (config == NULL) {
@@ -20430,8 +21262,16 @@ static void load_runtime_display_ini(RuntimeDisplayIniConfig *config) {
     }
   }
 #else
-  (void)candidates;
-  (void)candidate_index;
+  for (candidate_index = 0u; candidate_index < sizeof(candidates) / sizeof(candidates[0]); ++candidate_index) {
+    if (!resolve_runtime_file_path(candidates[candidate_index], resolved_ini_path, sizeof(resolved_ini_path))) {
+      continue;
+    }
+
+    file = fopen(resolved_ini_path, "r");
+    if (file != NULL) {
+      break;
+    }
+  }
 #endif
 
   if (file == NULL) {
@@ -20501,6 +21341,10 @@ static void load_runtime_display_ini(RuntimeDisplayIniConfig *config) {
         config->gameplay_pixel_height = parsed_height;
       } else {
         fprintf(stderr, "Ignoring GLOOM.INI %s=%s; expected 1, 2, 1x1, or 2x2\n", key, value);
+      }
+    } else if (strcmp(key, "hd_art_path") == 0 || strcmp(key, "hd_art") == 0) {
+      if (!set_hd_art_root(value)) {
+        fprintf(stderr, "Ignoring GLOOM.INI %s=%s; expected an HD art root path\n", key, value);
       }
     } else if (apply_ini_control_source(key, value, &g_control_config)) {
     } else if (apply_ini_keyboard_binding(key, value, &g_keyboard_config)) {
@@ -20793,6 +21637,14 @@ int main(int argc, char **argv) {
         }
         profile_render_frames = (uint32_t)parsed;
         skip_menu = true;
+      } else if (strcmp(argv[argi], "--hd-art") == 0 || strcmp(argv[argi], "--hd-art-path") == 0) {
+        if (argi + 1 >= argc) {
+          fprintf(stderr, "%s requires a path, for example --hd-art D:\\art-HD-v1\n", argv[argi]);
+          return 1;
+        }
+        if (!set_hd_art_root(argv[++argi])) {
+          return 1;
+        }
       } else if (strcmp(argv[argi], "--player-projectiles") == 0 ||
                  strcmp(argv[argi], "--legacy-projectiles") == 0) {
         barrel_projectile_origin = false;
@@ -20815,6 +21667,9 @@ int main(int argc, char **argv) {
 #if GLOOM_RUNTIME_IS_BINARY
   printf("%s\n", runtime_title());
 #endif
+  if (g_hd_art_enabled) {
+    printf("HD art root: %s\n", g_hd_art_root);
+  }
 
   memset(&state, 0, sizeof(state));
   memset(&previous_state, 0, sizeof(previous_state));

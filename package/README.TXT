@@ -53,8 +53,8 @@
 
      RESOLUTION OPTIONS
 
-       DOS builds also read GLOOM.INI from the game directory before
-       command-line options are applied:
+       DOS and Windows native builds also read GLOOM.INI from the game
+       directory before command-line options are applied:
 
          resolution=320x200
          viewport_size=160x100
@@ -95,6 +95,19 @@
 
        The aliases --window-size and --boot-resolution are also accepted.
        Native builds can additionally use --render-scale 1 through 6.
+
+       Windows native builds can use optional HD presentation art exported
+       from the repo art layout:
+
+         gloom_pc.exe --hd-art D:\art-HD-v1
+
+       GLOOM.INI also accepts:
+
+         hd_art_path=D:\art-HD-v1
+
+       The original Amiga binary assets are still required; HD art only
+       replaces sampled presentation pixels for walls, flats, sprites,
+       projectiles, sparks, and the gun.
 
    ---------------------------------------------------------------------
 

@@ -227,6 +227,10 @@ if(NOT EMSCRIPTEN)
     target_compile_definitions(gloom_pc PRIVATE GLOOM_ENABLE_MENU_MUSIC=1)
     target_link_libraries(gloom_pc PRIVATE SDL2_mixer::SDL2_mixer-static)
   endif()
+
+  if(WIN32)
+    target_link_libraries(gloom_pc PRIVATE ole32 windowscodecs)
+  endif()
 endif()
 
 if(MSVC)

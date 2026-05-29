@@ -16,6 +16,16 @@ cmake --build build --config Debug
 cmake --build build --config Release
 ```
 
+Optional upscaled presentation art can be enabled on Windows native builds:
+
+```powershell
+.\build\Debug\gloom_pc.exe --hd-art D:\art-HD-v1
+```
+
+The same path can be set in `GLOOM.INI` with `hd_art_path=D:\art-HD-v1`; the command-line option overrides the INI value.
+
+The original Amiga assets remain required and authoritative; HD art only replaces sampled presentation pixels.
+
 ## Releases
 
 GitHub Actions builds tagged Windows and DOS releases and publishes downloadable archives with checksums and provenance. See [RELEASING.md](RELEASING.md) for maintainer steps and [VERIFY_RELEASE.md](VERIFY_RELEASE.md) for player verification commands.
