@@ -621,7 +621,8 @@ typedef enum {
   PAUSE_MENU_QUIT = -1,
   PAUSE_MENU_CONTINUE = 0,
   PAUSE_MENU_MAIN_MENU = 1,
-  PAUSE_MENU_LOAD_GAME = 2
+  PAUSE_MENU_LOAD_GAME = 2,
+  PAUSE_MENU_TOGGLE_HD_ART = 3
 } PauseMenuResult;
 
 typedef enum {
@@ -824,6 +825,9 @@ typedef struct {
   int bitmap_width;
   int bitmap_height;
   uint32_t *argb_pixels;
+  int hd_bitmap_width;
+  int hd_bitmap_height;
+  uint32_t *hd_argb_pixels;
 #ifdef GLOOM_DOS_SDL3
   uint8_t *indexed_pixels;
 #endif
@@ -1672,7 +1676,22 @@ static bool file_exists_readable(const char *path) {
 static void trim_trailing_slashes(char *path);
 
 static bool g_hd_art_enabled = false;
+static bool g_hd_art_render_enabled = false;
 static char g_hd_art_root[1024];
+
+static bool hd_art_render_enabled(void) {
+  return g_hd_art_enabled && g_hd_art_render_enabled;
+}
+
+static bool toggle_hd_art_render_enabled(void) {
+  if (!g_hd_art_enabled) {
+    return false;
+  }
+
+  g_hd_art_render_enabled = !g_hd_art_render_enabled;
+  printf("HD textures %s\n", g_hd_art_render_enabled ? "enabled" : "disabled");
+  return true;
+}
 
 static void free_hd_bitmap(HdBitmap *bitmap) {
   if (bitmap == NULL) {
@@ -1853,6 +1872,7 @@ static bool set_hd_art_root(const char *path) {
   }
 
   g_hd_art_enabled = true;
+  g_hd_art_render_enabled = true;
   return true;
 }
 
@@ -4548,10 +4568,10 @@ static bool load_hd_object_visual_frames(const char *resolved_path, const char *
       return false;
     }
 
-    free(frame->argb_pixels);
-    frame->argb_pixels = bitmap.pixels;
-    frame->bitmap_width = bitmap.width;
-    frame->bitmap_height = bitmap.height;
+    free(frame->hd_argb_pixels);
+    frame->hd_argb_pixels = bitmap.pixels;
+    frame->hd_bitmap_width = bitmap.width;
+    frame->hd_bitmap_height = bitmap.height;
     bitmap.pixels = NULL;
     free_hd_bitmap(&bitmap);
   }
@@ -6521,7 +6541,8 @@ static uint32_t sample_wall_texture_argb_ex(const WallTextureSet *set, uint8_t t
     *out_transparent_column = transparent_column;
   }
 
-  if (set->screens[screen_index].hd_argb_texels != NULL && set->screens[screen_index].hd_width > 0 &&
+  if (hd_art_render_enabled() && set->screens[screen_index].hd_argb_texels != NULL &&
+      set->screens[screen_index].hd_width > 0 &&
       set->screens[screen_index].hd_height > 0) {
     const WallTextureScreen *screen = &set->screens[screen_index];
     const uint32_t *hd_pixels = screen->hd_argb_texels +
@@ -6848,6 +6869,7 @@ static void free_object_visual(ObjectVisual *visual) {
 
   for (i = 0u; i < visual->frame_count; ++i) {
     free(visual->frames[i].argb_pixels);
+    free(visual->frames[i].hd_argb_pixels);
 #ifdef GLOOM_DOS_SDL3
     free(visual->frames[i].indexed_pixels);
 #endif
@@ -6884,6 +6906,7 @@ static bool clone_object_visual(const ObjectVisual *source, ObjectVisual *destin
 
     *dst_frame = *src_frame;
     dst_frame->argb_pixels = NULL;
+    dst_frame->hd_argb_pixels = NULL;
 #ifdef GLOOM_DOS_SDL3
     dst_frame->indexed_pixels = NULL;
 #endif
@@ -6901,6 +6924,18 @@ static bool clone_object_visual(const ObjectVisual *source, ObjectVisual *destin
       return false;
     }
     memcpy(dst_frame->argb_pixels, src_frame->argb_pixels, pixel_count * sizeof(*dst_frame->argb_pixels));
+
+    if (src_frame->hd_argb_pixels != NULL && src_frame->hd_bitmap_width > 0 && src_frame->hd_bitmap_height > 0) {
+      size_t hd_pixel_count = (size_t)src_frame->hd_bitmap_width * (size_t)src_frame->hd_bitmap_height;
+
+      dst_frame->hd_argb_pixels = (uint32_t *)malloc(hd_pixel_count * sizeof(*dst_frame->hd_argb_pixels));
+      if (dst_frame->hd_argb_pixels == NULL) {
+        free_object_visual(destination);
+        return false;
+      }
+      memcpy(dst_frame->hd_argb_pixels, src_frame->hd_argb_pixels,
+             hd_pixel_count * sizeof(*dst_frame->hd_argb_pixels));
+    }
 
 #ifdef GLOOM_DOS_SDL3
     if (src_frame->indexed_pixels != NULL) {
@@ -7108,6 +7143,7 @@ static bool load_object_visual_from_asset(const char *asset_name, const ObjectVi
 fail:
   for (frame_index = 0u; frame_index < frame_count; ++frame_index) {
     free(frames[frame_index].argb_pixels);
+    free(frames[frame_index].hd_argb_pixels);
 #ifdef GLOOM_DOS_SDL3
     free(frames[frame_index].indexed_pixels);
 #endif
@@ -7231,22 +7267,48 @@ static bool load_weapon_visual_set(WeaponVisualSet *set) {
 }
 
 static int object_frame_bitmap_width(const ObjectFrame *frame) {
-  return frame != NULL && frame->bitmap_width > 0 ? frame->bitmap_width : (frame != NULL ? frame->width : 0);
+  if (frame == NULL) {
+    return 0;
+  }
+  if (hd_art_render_enabled() && frame->hd_argb_pixels != NULL && frame->hd_bitmap_width > 0 &&
+      frame->hd_bitmap_height > 0) {
+    return frame->hd_bitmap_width;
+  }
+  return frame->bitmap_width > 0 ? frame->bitmap_width : frame->width;
 }
 
 static int object_frame_bitmap_height(const ObjectFrame *frame) {
-  return frame != NULL && frame->bitmap_height > 0 ? frame->bitmap_height : (frame != NULL ? frame->height : 0);
+  if (frame == NULL) {
+    return 0;
+  }
+  if (hd_art_render_enabled() && frame->hd_argb_pixels != NULL && frame->hd_bitmap_width > 0 &&
+      frame->hd_bitmap_height > 0) {
+    return frame->hd_bitmap_height;
+  }
+  return frame->bitmap_height > 0 ? frame->bitmap_height : frame->height;
+}
+
+static const uint32_t *object_frame_argb_pixels(const ObjectFrame *frame) {
+  if (frame == NULL) {
+    return NULL;
+  }
+  if (hd_art_render_enabled() && frame->hd_argb_pixels != NULL && frame->hd_bitmap_width > 0 &&
+      frame->hd_bitmap_height > 0) {
+    return frame->hd_argb_pixels;
+  }
+  return frame->argb_pixels;
 }
 
 static uint32_t sample_object_frame_argb(const ObjectFrame *frame, float u, float v) {
   int bitmap_width = object_frame_bitmap_width(frame);
   int bitmap_height = object_frame_bitmap_height(frame);
+  const uint32_t *pixels = object_frame_argb_pixels(frame);
 
-  if (frame == NULL || frame->argb_pixels == NULL || bitmap_width <= 0 || bitmap_height <= 0) {
+  if (pixels == NULL || bitmap_width <= 0 || bitmap_height <= 0) {
     return 0u;
   }
 
-  return sample_hd_bitmap_argb(frame->argb_pixels, bitmap_width, bitmap_height, u, v);
+  return sample_hd_bitmap_argb(pixels, bitmap_width, bitmap_height, u, v);
 }
 
 static uint32_t sample_object_frame_logical_argb(const ObjectFrame *frame, float source_x, float source_y) {
@@ -12124,7 +12186,8 @@ static uint32_t sample_flat_texture_argb(const FlatTexture *texture, float world
     return 0xFF000000u;
   }
 
-  if (texture->hd_argb_texels != NULL && texture->hd_width > 0 && texture->hd_height > 0) {
+  if (hd_art_render_enabled() && texture->hd_argb_texels != NULL && texture->hd_width > 0 &&
+      texture->hd_height > 0) {
     int hd_tx = repeated_hd_texture_coord(world_x, GLOOM_FLAT_TEXTURE_SIZE, texture->hd_width);
     int hd_tz = repeated_hd_texture_coord(world_z, GLOOM_FLAT_TEXTURE_SIZE, texture->hd_height);
 
@@ -12851,7 +12914,8 @@ static void render_flat_textures(RenderFramebuffer *framebuffer, const AppState 
       size_t dst = (size_t)(y + row) * (size_t)framebuffer->pitch_pixels + (size_t)(x + col);
       uint32_t argb = 0u;
 
-      if (texture->hd_argb_texels != NULL && texture->hd_width > 0 && texture->hd_height > 0) {
+      if (hd_art_render_enabled() && texture->hd_argb_texels != NULL && texture->hd_width > 0 &&
+          texture->hd_height > 0) {
         int hd_tx = repeated_hd_texture_coord(world_x, GLOOM_FLAT_TEXTURE_SIZE, texture->hd_width);
         int hd_tz = repeated_hd_texture_coord(world_z, GLOOM_FLAT_TEXTURE_SIZE, texture->hd_height);
 
@@ -13723,7 +13787,8 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
             wall_texels = screen->texels;
             wall_palette = screen->shaded_palette[dark_index];
             wall_texel_base = local_index * ((size_t)GLOOM_TEXTURE_WIDTH * (size_t)GLOOM_TEXTURE_HEIGHT) + tx;
-            if (screen->hd_argb_texels != NULL && screen->hd_width > 0 && screen->hd_height > 0) {
+            if (hd_art_render_enabled() && screen->hd_argb_texels != NULL && screen->hd_width > 0 &&
+                screen->hd_height > 0) {
               size_t hd_tx = (size_t)(local_u * (float)(screen->hd_width - 1));
 
               if (hd_tx >= (size_t)screen->hd_width) {
@@ -16704,26 +16769,47 @@ static bool run_combat_result_screen(SDL_Renderer *renderer, RenderFramebuffer *
 }
 
 static int pause_menu_item_count(bool two_player_mode) {
+  int count = 0;
+
 #if GLOOM_RUNTIME_HAS_AUTOSAVE
-  return gloom_autosave_available(two_player_mode) ? 3 : 2;
+  count = gloom_autosave_available(two_player_mode) ? 3 : 2;
 #else
   (void)two_player_mode;
-  return 2;
+  count = 2;
 #endif
+  if (g_hd_art_enabled) {
+    count += 1;
+  }
+  return count;
+}
+
+static bool pause_menu_index_is_hd_toggle(int selected_index) {
+  return g_hd_art_enabled && selected_index == 1;
 }
 
 static PauseMenuResult pause_menu_result_for_index(int selected_index, bool two_player_mode) {
+  int action_index = selected_index;
+
+  if (selected_index == 0) {
+    return PAUSE_MENU_CONTINUE;
+  }
+  if (pause_menu_index_is_hd_toggle(selected_index)) {
+    return PAUSE_MENU_TOGGLE_HD_ART;
+  }
+  if (g_hd_art_enabled && selected_index > 1) {
+    action_index -= 1;
+  }
+
 #if GLOOM_RUNTIME_HAS_AUTOSAVE
   if (gloom_autosave_available(two_player_mode)) {
-    if (selected_index == 0) return PAUSE_MENU_CONTINUE;
-    if (selected_index == 1) return PAUSE_MENU_LOAD_GAME;
-    if (selected_index == 2) return PAUSE_MENU_MAIN_MENU;
+    if (action_index == 1) return PAUSE_MENU_LOAD_GAME;
+    if (action_index == 2) return PAUSE_MENU_MAIN_MENU;
     return PAUSE_MENU_CONTINUE;
   }
 #else
   (void)two_player_mode;
 #endif
-  return selected_index == 0 ? PAUSE_MENU_CONTINUE : PAUSE_MENU_MAIN_MENU;
+  return action_index == 1 ? PAUSE_MENU_MAIN_MENU : PAUSE_MENU_CONTINUE;
 }
 
 static int pause_menu_y_for_viewport(int render_width, int render_height, int item_count) {
@@ -16757,8 +16843,9 @@ static void render_pause_menu_frame(RenderFramebuffer *framebuffer, const HudFon
                                     const uint8_t *dos_index_background, int background_pitch_pixels,
                                     int render_width, int render_height,
                                     int selected_index, bool selected_visible, bool two_player_mode) {
-  const char *items[3];
+  const char *items[4];
   int item_count = pause_menu_item_count(two_player_mode);
+  int item_index = 0;
   int scale = 1;
   int y = 0;
   int i = 0;
@@ -16783,15 +16870,21 @@ static void render_pause_menu_frame(RenderFramebuffer *framebuffer, const HudFon
     framebuffer_clear(framebuffer, 0xFF000000u);
   }
 #endif
-  items[0] = "CONTINUE";
+  items[item_index++] = "CONTINUE";
+  if (g_hd_art_enabled) {
+    items[item_index++] = hd_art_render_enabled() ? "HD TEXTURES: ON" : "HD TEXTURES: OFF";
+  }
 #if GLOOM_RUNTIME_HAS_AUTOSAVE
   if (gloom_autosave_available(two_player_mode)) {
-    items[1] = "LOAD GAME";
-    items[2] = "RETURN TO MAIN MENU";
+    items[item_index++] = "LOAD GAME";
+    items[item_index++] = "RETURN TO MAIN MENU";
   } else
 #endif
   {
-    items[1] = "RETURN TO MAIN MENU";
+    items[item_index++] = "RETURN TO MAIN MENU";
+  }
+  if (item_index < item_count) {
+    item_count = item_index;
   }
   scale = menu_pixel_scale_for_viewport(render_width, render_height);
   y = pause_menu_y_for_viewport(render_width, render_height, item_count);
@@ -16801,6 +16894,25 @@ static void render_pause_menu_frame(RenderFramebuffer *framebuffer, const HudFon
     render_menu_text_brightness(framebuffer, font, items[i], render_width / 2,
                                 y + (i * GLOOM_MENU_BIG_FONT_HEIGHT * scale), scale, brightness);
   }
+}
+
+static bool pause_menu_apply_hd_toggle(PauseMenuResult result, bool *io_redraw, bool *io_selected_visible,
+                                       int *io_flash_ticks) {
+  if (result != PAUSE_MENU_TOGGLE_HD_ART) {
+    return false;
+  }
+  if (toggle_hd_art_render_enabled()) {
+    if (io_redraw != NULL) {
+      *io_redraw = true;
+    }
+    if (io_selected_visible != NULL) {
+      *io_selected_visible = false;
+    }
+    if (io_flash_ticks != NULL) {
+      *io_flash_ticks = GLOOM_MENU_FLASH_TICKS;
+    }
+  }
+  return true;
 }
 
 static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer, RenderFramebuffer *framebuffer,
@@ -16924,10 +17036,18 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
         } else if (sym == SDLK_RETURN || sym == SDLK_SPACE || sym == SDLK_LCTRL || sym == SDLK_RCTRL) {
           PauseMenuResult result = pause_menu_result_for_index(selected_index, two_player_mode);
           audio_play_ui_activate();
+          if (pause_menu_apply_hd_toggle(result, &redraw, &selected_visible, &flash_ticks)) {
+            continue;
+          }
           menu_pause_after_selection();
           audio_pause_output(&g_audio, false, false);
           free_hud_font(&font);
           return result;
+        } else if (sym == SDLK_F10) {
+          if (g_hd_art_enabled) {
+            audio_play_ui_activate();
+            (void)pause_menu_apply_hd_toggle(PAUSE_MENU_TOGGLE_HD_ART, &redraw, &selected_visible, &flash_ticks);
+          }
         } else if (sym == SDLK_p) {
           audio_play_ui_activate();
           menu_pause_after_selection();
@@ -16956,6 +17076,9 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
 
             selected_index = click_index;
             audio_play_ui_activate();
+            if (pause_menu_apply_hd_toggle(result, &redraw, &selected_visible, &flash_ticks)) {
+              continue;
+            }
             menu_pause_after_selection();
             audio_pause_output(&g_audio, false, false);
             free_hud_font(&font);
@@ -16979,6 +17102,9 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
 
           selected_index = click_index;
           audio_play_ui_activate();
+          if (pause_menu_apply_hd_toggle(result, &redraw, &selected_visible, &flash_ticks)) {
+            continue;
+          }
           menu_pause_after_selection();
           audio_pause_output(&g_audio, false, false);
           free_hud_font(&font);
@@ -17018,6 +17144,9 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
         } else if (gamepad_menu_activate_event(&event)) {
           PauseMenuResult result = pause_menu_result_for_index(selected_index, two_player_mode);
           audio_play_ui_activate();
+          if (pause_menu_apply_hd_toggle(result, &redraw, &selected_visible, &flash_ticks)) {
+            continue;
+          }
           menu_pause_after_selection();
           audio_pause_output(&g_audio, false, false);
           free_hud_font(&font);
@@ -22260,6 +22389,14 @@ int main(int argc, char **argv) {
             }
           } else if (event.key.keysym.sym == SDLK_p) {
             pause_menu_requested = true;
+          } else if (event.key.keysym.sym == SDLK_F10) {
+            if (toggle_hd_art_render_enabled()) {
+#if GLOOM_RUNTIME_HAS_AUTOSAVE
+              (void)snprintf(autosave_notice, sizeof(autosave_notice), "HD TEXTURES %s",
+                             hd_art_render_enabled() ? "ON" : "OFF");
+              autosave_notice_timer = 2.0;
+#endif
+            }
           } else if (event.key.keysym.sym == SDLK_F11) {
 #ifdef __EMSCRIPTEN__
             runtime_emscripten_canvas_fullscreen_toggle();

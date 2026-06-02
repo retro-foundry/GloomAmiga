@@ -23,6 +23,7 @@ Optional upscaled presentation art can be enabled on Windows native builds:
 ```
 
 The same path can be set in `GLOOM.INI` with `hd_art_path=D:\art-HD-v1`; the command-line option overrides the INI value.
+Once HD art is loaded, press `F10` during gameplay or use the pause menu's `HD TEXTURES` item to switch it on or off without reloading the level.
 
 The original Amiga assets remain required and authoritative; HD art only replaces sampled presentation pixels.
 

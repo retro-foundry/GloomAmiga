@@ -105,6 +105,10 @@
 
          hd_art_path=D:\art-HD-v1
 
+       Once loaded, press F10 during gameplay or use the pause menu's
+       HD TEXTURES item to switch HD presentation art on or off without
+       reloading the level.
+
        The original Amiga binary assets are still required; HD art only
        replaces sampled presentation pixels for walls, flats, sprites,
        projectiles, sparks, and the gun.
