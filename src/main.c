@@ -6499,6 +6499,21 @@ static bool load_flat_texture_set_for_map(const char *map_path, FlatTextureSet *
   return load_flat_texture_set_for_map_reusing(map_path, set, NULL);
 }
 
+static size_t wall_texture_coord_from_unit(float value, size_t extent) {
+  size_t coord = 0u;
+
+  if (extent == 0u) {
+    return 0u;
+  }
+
+  value = clampf(value, 0.0f, 1.0f);
+  coord = (size_t)(value * (float)extent);
+  if (coord >= extent) {
+    coord = extent - 1u;
+  }
+  return coord;
+}
+
 static uint32_t sample_wall_texture_argb_ex(const WallTextureSet *set, uint8_t texture_index, float u, float v,
                                             bool *out_transparent_column) {
   size_t screen_index = texture_index / (uint8_t)GLOOM_TEXTURES_PER_SCREEN;
@@ -6525,10 +6540,8 @@ static uint32_t sample_wall_texture_argb_ex(const WallTextureSet *set, uint8_t t
 
   u = clampf(u, 0.0f, 1.0f);
   v = clampf(v, 0.0f, 1.0f);
-  tx = (size_t)(u * (float)GLOOM_TEXTURE_WIDTH);
-  ty = (size_t)(v * (float)GLOOM_TEXTURE_HEIGHT);
-  if (tx >= (size_t)GLOOM_TEXTURE_WIDTH) tx = (size_t)GLOOM_TEXTURE_WIDTH - 1u;
-  if (ty >= (size_t)GLOOM_TEXTURE_HEIGHT) ty = (size_t)GLOOM_TEXTURE_HEIGHT - 1u;
+  tx = wall_texture_coord_from_unit(u, (size_t)GLOOM_TEXTURE_WIDTH);
+  ty = wall_texture_coord_from_unit(v, (size_t)GLOOM_TEXTURE_HEIGHT);
 
   offset = local_index * ((size_t)GLOOM_TEXTURE_WIDTH * (size_t)GLOOM_TEXTURE_HEIGHT) +
            ty * (size_t)GLOOM_TEXTURE_WIDTH + tx;
@@ -6547,7 +6560,9 @@ static uint32_t sample_wall_texture_argb_ex(const WallTextureSet *set, uint8_t t
     const WallTextureScreen *screen = &set->screens[screen_index];
     const uint32_t *hd_pixels = screen->hd_argb_texels +
                                 local_index * (size_t)screen->hd_width * (size_t)screen->hd_height;
-    uint32_t argb = sample_hd_bitmap_argb(hd_pixels, screen->hd_width, screen->hd_height, u, v);
+    size_t hd_tx = wall_texture_coord_from_unit(u, (size_t)screen->hd_width);
+    size_t hd_ty = wall_texture_coord_from_unit(v, (size_t)screen->hd_height);
+    uint32_t argb = hd_pixels[hd_ty * (size_t)screen->hd_width + hd_tx];
 
     if (transparent_column && ((argb >> 24u) == 0u || palette_index == 0u)) {
       return 0x00000000u;
@@ -6608,10 +6623,7 @@ static void zone_wall_texture_coordinates(const GloomZone *zone, float wall_u, i
   if (local_u > 1.0f) local_u = 1.0f;
 
   tile_index = tile_base & 7;
-  texture_x = (size_t)(local_u * (float)GLOOM_TEXTURE_WIDTH);
-  if (texture_x >= (size_t)GLOOM_TEXTURE_WIDTH) {
-    texture_x = (size_t)GLOOM_TEXTURE_WIDTH - 1u;
-  }
+  texture_x = wall_texture_coord_from_unit(local_u, (size_t)GLOOM_TEXTURE_WIDTH);
 
   if (out_tile_index != NULL) {
     *out_tile_index = tile_index;
@@ -11242,6 +11254,39 @@ static uint32_t apply_amiga_depth_argb(uint32_t argb, float depth) {
   return shade_argb_subtract(argb, depth_subtract_for_depth(depth));
 }
 
+static bool sample_fast_wall_column_argb(const uint8_t *wall_texels, const uint32_t *wall_palette,
+                                         size_t wall_texel_base, bool transparent_wall_column,
+                                         const uint32_t *wall_hd_texels, int wall_hd_width, int wall_hd_height,
+                                         size_t wall_hd_texel_base, float wall_v, int subtract,
+                                         uint32_t *out_argb) {
+  size_t ty = 0u;
+  uint8_t palette_index = 0u;
+
+  if (out_argb == NULL || wall_texels == NULL || wall_palette == NULL) {
+    return false;
+  }
+
+  ty = wall_texture_coord_from_unit(wall_v, (size_t)GLOOM_TEXTURE_HEIGHT);
+  palette_index = wall_texels[wall_texel_base + (ty * (size_t)GLOOM_TEXTURE_WIDTH)];
+  if (transparent_wall_column && palette_index == 0u) {
+    return false;
+  }
+
+  if (wall_hd_texels != NULL && wall_hd_width > 0 && wall_hd_height > 0) {
+    size_t hd_ty = wall_texture_coord_from_unit(wall_v, (size_t)wall_hd_height);
+    uint32_t argb = wall_hd_texels[wall_hd_texel_base + hd_ty * (size_t)wall_hd_width];
+
+    if ((argb >> 24u) == 0u) {
+      return false;
+    }
+    *out_argb = shade_argb_subtract(argb, subtract);
+    return true;
+  }
+
+  *out_argb = wall_palette[palette_index];
+  return true;
+}
+
 static uint32_t amiga_blood_argb(uint16_t color_mask, float depth) {
   static const uint16_t blcols[16] = {0x0cccu, 0x0bbbu, 0x0aaau, 0x0999u, 0x0888u, 0x0777u, 0x0666u, 0x0555u,
                                      0x0444u, 0x0333u, 0x0222u, 0x0111u, 0x0111u, 0x0111u, 0x0111u, 0x0111u};
@@ -13789,11 +13834,7 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
             wall_texel_base = local_index * ((size_t)GLOOM_TEXTURE_WIDTH * (size_t)GLOOM_TEXTURE_HEIGHT) + tx;
             if (hd_art_render_enabled() && screen->hd_argb_texels != NULL && screen->hd_width > 0 &&
                 screen->hd_height > 0) {
-              size_t hd_tx = (size_t)(local_u * (float)(screen->hd_width - 1));
-
-              if (hd_tx >= (size_t)screen->hd_width) {
-                hd_tx = (size_t)screen->hd_width - 1u;
-              }
+              size_t hd_tx = wall_texture_coord_from_unit(local_u, (size_t)screen->hd_width);
               wall_hd_texels = screen->hd_argb_texels;
               wall_hd_width = screen->hd_width;
               wall_hd_height = screen->hd_height;
@@ -13864,29 +13905,10 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
         }
 
         if (fast_wall_column) {
-          size_t ty = 0u;
-          uint8_t palette_index = 0u;
-
-          if (wall_v < 0.0f) wall_v = 0.0f;
-          if (wall_v > 1.0f) wall_v = 1.0f;
-          ty = (size_t)(wall_v * (float)(GLOOM_TEXTURE_HEIGHT - 1));
-          palette_index = wall_texels[wall_texel_base + (ty * (size_t)GLOOM_TEXTURE_WIDTH)];
-          if (transparent_wall_column && palette_index == 0u) {
+          if (!sample_fast_wall_column_argb(wall_texels, wall_palette, wall_texel_base, transparent_wall_column,
+                                            wall_hd_texels, wall_hd_width, wall_hd_height, wall_hd_texel_base,
+                                            wall_v, subtract, &argb)) {
             continue;
-          }
-          if (wall_hd_texels != NULL && wall_hd_width > 0 && wall_hd_height > 0) {
-            size_t hd_ty = (size_t)(wall_v * (float)(wall_hd_height - 1));
-
-            if (hd_ty >= (size_t)wall_hd_height) {
-              hd_ty = (size_t)wall_hd_height - 1u;
-            }
-            argb = wall_hd_texels[wall_hd_texel_base + hd_ty * (size_t)wall_hd_width];
-            if ((argb >> 24u) == 0u) {
-              continue;
-            }
-            argb = shade_argb_subtract(argb, subtract);
-          } else {
-            argb = wall_palette[palette_index];
           }
         } else {
           argb = sample_zone_wall_texture_argb(wall_textures, state, hit->wall->zone, hit->wall_u, wall_v);
@@ -19411,6 +19433,75 @@ static int run_wall_selftest(void) {
       fprintf(stderr, "Wall selftest failed: wl_sc=-1 no longer matches the Amiga shifted texture coordinate\n");
       return 1;
     }
+  }
+
+  {
+    WallTextureSet wall_textures;
+    WallTextureScreen *screen = NULL;
+    uint8_t texels[GLOOM_TEXTURE_WIDTH * GLOOM_TEXTURE_HEIGHT];
+    uint8_t column_flags[GLOOM_TEXTURE_WIDTH];
+    uint32_t hd_texels[GLOOM_TEXTURE_WIDTH * GLOOM_TEXTURE_HEIGHT];
+    uint32_t argb = 0u;
+    size_t half_y = wall_texture_coord_from_unit(0.5f, (size_t)GLOOM_TEXTURE_HEIGHT);
+    bool old_hd_art_enabled = g_hd_art_enabled;
+    bool old_hd_art_render_enabled = g_hd_art_render_enabled;
+
+    memset(&wall_textures, 0, sizeof(wall_textures));
+    memset(texels, 1, sizeof(texels));
+    memset(column_flags, 0, sizeof(column_flags));
+    memset(hd_texels, 0xff, sizeof(hd_texels));
+    screen = &wall_textures.screens[0];
+    screen->loaded = true;
+    screen->texels = texels;
+    screen->column_flags = column_flags;
+    screen->hd_argb_texels = hd_texels;
+    screen->hd_width = GLOOM_TEXTURE_WIDTH;
+    screen->hd_height = GLOOM_TEXTURE_HEIGHT;
+    screen->texture_count = 1u;
+    screen->palette[1] = 0xff123456u;
+    screen->shaded_palette[0][1] = 0xff123456u;
+    column_flags[0] = 1u;
+    texels[half_y * (size_t)GLOOM_TEXTURE_WIDTH] = 0u;
+
+    g_hd_art_enabled = true;
+    g_hd_art_render_enabled = true;
+    argb = sample_wall_texture_argb_ex(&wall_textures, 0u, 0.0f, 0.5f, NULL);
+    if ((argb >> 24u) != 0u) {
+      g_hd_art_enabled = old_hd_art_enabled;
+      g_hd_art_render_enabled = old_hd_art_render_enabled;
+      fprintf(stderr, "Wall selftest failed: HD wall sampler ignored Amiga transparent-column mask\n");
+      return 1;
+    }
+    if (sample_fast_wall_column_argb(texels, screen->shaded_palette[0], 0u, true, hd_texels, GLOOM_TEXTURE_WIDTH,
+                                     GLOOM_TEXTURE_HEIGHT, 0u, 0.5f, 0, &argb)) {
+      g_hd_art_enabled = old_hd_art_enabled;
+      g_hd_art_render_enabled = old_hd_art_render_enabled;
+      fprintf(stderr, "Wall selftest failed: fast HD wall column ignored Amiga transparent-column mask\n");
+      return 1;
+    }
+
+    texels[half_y * (size_t)GLOOM_TEXTURE_WIDTH] = 1u;
+    hd_texels[half_y * (size_t)GLOOM_TEXTURE_WIDTH] = 0x00000000u;
+    if (sample_fast_wall_column_argb(texels, screen->shaded_palette[0], 0u, true, hd_texels, GLOOM_TEXTURE_WIDTH,
+                                     GLOOM_TEXTURE_HEIGHT, 0u, 0.5f, 0, &argb)) {
+      g_hd_art_enabled = old_hd_art_enabled;
+      g_hd_art_render_enabled = old_hd_art_render_enabled;
+      fprintf(stderr, "Wall selftest failed: fast HD wall column ignored PNG alpha transparency\n");
+      return 1;
+    }
+
+    hd_texels[half_y * (size_t)GLOOM_TEXTURE_WIDTH] = 0xffabcdefu;
+    if (!sample_fast_wall_column_argb(texels, screen->shaded_palette[0], 0u, true, hd_texels, GLOOM_TEXTURE_WIDTH,
+                                      GLOOM_TEXTURE_HEIGHT, 0u, 0.5f, 0, &argb) ||
+        argb != 0xffabcdefu) {
+      g_hd_art_enabled = old_hd_art_enabled;
+      g_hd_art_render_enabled = old_hd_art_render_enabled;
+      fprintf(stderr, "Wall selftest failed: fast HD wall column did not draw an opaque replacement texel\n");
+      return 1;
+    }
+
+    g_hd_art_enabled = old_hd_art_enabled;
+    g_hd_art_render_enabled = old_hd_art_render_enabled;
   }
 
   memset(&state, 0, sizeof(state));
