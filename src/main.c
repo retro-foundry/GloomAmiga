@@ -696,12 +696,15 @@ typedef struct {
 
 typedef struct {
   uint32_t *argb_pixels;
+  uint32_t *hd_argb_pixels;
 #ifdef GLOOM_DOS_SDL3
   uint8_t *indexed_pixels;
   uint8_t *coverage;
 #endif
   int width;
   int height;
+  int hd_width;
+  int hd_height;
 } HudGlyph;
 
 typedef struct {
@@ -718,6 +721,7 @@ typedef struct {
 typedef struct {
   bool loaded;
   uint32_t *pixels;
+  uint32_t *hd_pixels;
 #ifdef GLOOM_DOS_SDL3
   uint8_t *indices;
   uint32_t palette[256];
@@ -725,6 +729,8 @@ typedef struct {
 #endif
   int width;
   int height;
+  int hd_width;
+  int hd_height;
 } MenuImage;
 
 typedef struct {
@@ -785,6 +791,7 @@ typedef struct {
   uint8_t *texels;
   uint8_t *column_flags;
   uint32_t *hd_argb_texels;
+  uint8_t *hd_texture_loaded;
   int hd_width;
   int hd_height;
   size_t texture_count;
@@ -3512,6 +3519,7 @@ static void free_wall_texture_set(WallTextureSet *set) {
     free(set->screens[i].texels);
     free(set->screens[i].column_flags);
     free(set->screens[i].hd_argb_texels);
+    free(set->screens[i].hd_texture_loaded);
 #ifdef GLOOM_DOS_SDL3
     free(set->screens[i].column_texels);
     free(set->screens[i].column_shaded_texels);
@@ -3533,6 +3541,7 @@ static bool clone_wall_texture_screen(const WallTextureScreen *source, WallTextu
   free(destination->texels);
   free(destination->column_flags);
   free(destination->hd_argb_texels);
+  free(destination->hd_texture_loaded);
 #ifdef GLOOM_DOS_SDL3
   free(destination->column_texels);
   free(destination->column_shaded_texels);
@@ -3541,6 +3550,7 @@ static bool clone_wall_texture_screen(const WallTextureScreen *source, WallTextu
   destination->texels = NULL;
   destination->column_flags = NULL;
   destination->hd_argb_texels = NULL;
+  destination->hd_texture_loaded = NULL;
 #ifdef GLOOM_DOS_SDL3
   destination->column_texels = NULL;
   destination->column_shaded_texels = NULL;
@@ -3587,6 +3597,7 @@ static bool clone_wall_texture_screen(const WallTextureScreen *source, WallTextu
     if (destination->column_flags == NULL) {
       free(destination->texels);
       free(destination->hd_argb_texels);
+      free(destination->hd_texture_loaded);
 #ifdef GLOOM_DOS_SDL3
       free(destination->column_texels);
       free(destination->column_shaded_texels);
@@ -3604,6 +3615,7 @@ static bool clone_wall_texture_screen(const WallTextureScreen *source, WallTextu
     if (destination->hd_argb_texels == NULL) {
       free(destination->texels);
       free(destination->column_flags);
+      free(destination->hd_texture_loaded);
 #ifdef GLOOM_DOS_SDL3
       free(destination->column_texels);
       free(destination->column_shaded_texels);
@@ -3612,6 +3624,23 @@ static bool clone_wall_texture_screen(const WallTextureScreen *source, WallTextu
       return false;
     }
     memcpy(destination->hd_argb_texels, source->hd_argb_texels, hd_count * sizeof(*destination->hd_argb_texels));
+  }
+
+  if (source->hd_texture_loaded != NULL) {
+    destination->hd_texture_loaded = (uint8_t *)malloc(source->texture_count * sizeof(*destination->hd_texture_loaded));
+    if (destination->hd_texture_loaded == NULL) {
+      free(destination->texels);
+      free(destination->column_flags);
+      free(destination->hd_argb_texels);
+#ifdef GLOOM_DOS_SDL3
+      free(destination->column_texels);
+      free(destination->column_shaded_texels);
+#endif
+      memset(destination, 0, sizeof(*destination));
+      return false;
+    }
+    memcpy(destination->hd_texture_loaded, source->hd_texture_loaded,
+           source->texture_count * sizeof(*destination->hd_texture_loaded));
   }
 
   return true;
@@ -4336,6 +4365,238 @@ static bool resolve_hd_art_file_for_keys(const char *category, const char *const
   return false;
 }
 
+static bool append_hd_lookup_key(const char *key, char keys[][256], size_t *key_count, size_t max_keys) {
+  size_t i = 0u;
+
+  if (key == NULL || key[0] == '\0' || keys == NULL || key_count == NULL || *key_count >= max_keys) {
+    return false;
+  }
+
+  for (i = 0u; i < *key_count; ++i) {
+    if (strcmp(keys[i], key) == 0) {
+      return true;
+    }
+  }
+
+  (void)snprintf(keys[*key_count], 256u, "%s", key);
+  *key_count += 1u;
+  return true;
+}
+
+static bool hd_lookup_key_without_extension(const char *key, char *out_key, size_t out_key_size) {
+  const char *dot = NULL;
+  size_t length = 0u;
+
+  if (key == NULL || key[0] == '\0' || out_key == NULL || out_key_size == 0u) {
+    return false;
+  }
+
+  dot = strrchr(key, '.');
+  if (dot == NULL || dot == key) {
+    return false;
+  }
+
+  length = (size_t)(dot - key);
+  if (length == 0u || length >= out_key_size) {
+    return false;
+  }
+  memcpy(out_key, key, length);
+  out_key[length] = '\0';
+  return true;
+}
+
+static size_t collect_hd_asset_keys(const char *resolved_path, const char *fallback, char keys[][256],
+                                    size_t max_keys) {
+  char key[256] = {0};
+  char key_without_ext[256] = {0};
+  size_t key_count = 0u;
+  size_t i = 0u;
+  size_t initial_count = 0u;
+
+  if (keys == NULL || max_keys == 0u) {
+    return 0u;
+  }
+
+  if (hd_asset_key_from_runtime_path(resolved_path, fallback, key, sizeof(key))) {
+    (void)append_hd_lookup_key(key, keys, &key_count, max_keys);
+  }
+  if (fallback != NULL && fallback[0] != '\0' && sanitize_hd_asset_key(fallback, key, sizeof(key))) {
+    (void)append_hd_lookup_key(key, keys, &key_count, max_keys);
+  }
+
+  initial_count = key_count;
+  for (i = 0u; i < initial_count; ++i) {
+    if (hd_lookup_key_without_extension(keys[i], key_without_ext, sizeof(key_without_ext))) {
+      (void)append_hd_lookup_key(key_without_ext, keys, &key_count, max_keys);
+    }
+  }
+
+  return key_count;
+}
+
+static bool resolve_hd_menu_image_file(const char *resolved_path, const char *fallback, char *out_path,
+                                       size_t out_path_size) {
+  char keys[12][256];
+  size_t key_count = 0u;
+  size_t i = 0u;
+
+  if (!g_hd_art_enabled || out_path == NULL || out_path_size == 0u) {
+    return false;
+  }
+
+  memset(keys, 0, sizeof(keys));
+  key_count = collect_hd_asset_keys(resolved_path, fallback, keys, sizeof(keys) / sizeof(keys[0]));
+  for (i = 0u; i < key_count; ++i) {
+    char file_name[320] = {0};
+    size_t key_length = strlen(keys[i]);
+
+    if (resolve_hd_art_file("menu_images", keys[i], "image.png", out_path, out_path_size) ||
+        resolve_hd_art_file("menus", keys[i], "image.png", out_path, out_path_size) ||
+        resolve_hd_art_file("form", keys[i], "frame_0001.png", out_path, out_path_size) ||
+        resolve_hd_art_file("form", keys[i], "frame_0000.png", out_path, out_path_size)) {
+      return true;
+    }
+
+    if (key_length + 5u > sizeof(file_name)) {
+      continue;
+    }
+    memcpy(file_name, keys[i], key_length);
+    memcpy(file_name + key_length, ".png", 5u);
+    if (resolve_hd_art_file("menu_images", NULL, file_name, out_path, out_path_size) ||
+        resolve_hd_art_file("menus", NULL, file_name, out_path, out_path_size) ||
+        resolve_hd_art_file("trimmed_pictures", NULL, file_name, out_path, out_path_size)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+static bool resolve_hd_font_glyph_file(const char *resolved_path, const char *fallback, size_t glyph_index,
+                                       char *out_path, size_t out_path_size) {
+  char keys[12][256];
+  char shape_file[32] = {0};
+  char frame_file[32] = {0};
+  char glyph_file[32] = {0};
+  size_t key_count = 0u;
+  size_t i = 0u;
+
+  if (!g_hd_art_enabled || out_path == NULL || out_path_size == 0u) {
+    return false;
+  }
+
+  memset(keys, 0, sizeof(keys));
+  key_count = collect_hd_asset_keys(resolved_path, fallback, keys, sizeof(keys) / sizeof(keys[0]));
+  (void)snprintf(shape_file, sizeof(shape_file), "shape_%04zu.png", glyph_index);
+  (void)snprintf(frame_file, sizeof(frame_file), "frame_%04zu.png", glyph_index);
+  (void)snprintf(glyph_file, sizeof(glyph_file), "glyph_%04zu.png", glyph_index);
+
+  for (i = 0u; i < key_count; ++i) {
+    if (resolve_hd_art_file("fonts", keys[i], glyph_file, out_path, out_path_size) ||
+        resolve_hd_art_file("fonts", keys[i], shape_file, out_path, out_path_size) ||
+        resolve_hd_art_file("fonts", keys[i], frame_file, out_path, out_path_size) ||
+        resolve_hd_art_file("blit2", keys[i], shape_file, out_path, out_path_size) ||
+        resolve_hd_art_file("blit", keys[i], shape_file, out_path, out_path_size) ||
+        resolve_hd_art_file("objects", keys[i], frame_file, out_path, out_path_size)) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+static bool load_hd_menu_image_pixels(const char *resolved_path, const char *fallback, MenuImage *image) {
+  char hd_path[1280] = {0};
+  HdBitmap bitmap;
+
+  memset(&bitmap, 0, sizeof(bitmap));
+  if (!g_hd_art_enabled) {
+    return true;
+  }
+  if (image == NULL || !image->loaded || image->width <= 0 || image->height <= 0) {
+    return false;
+  }
+  if (!resolve_hd_menu_image_file(resolved_path, fallback, hd_path, sizeof(hd_path))) {
+    return true;
+  }
+  if (!load_png_file_argb(hd_path, &bitmap)) {
+    return false;
+  }
+  if (bitmap.width < image->width || bitmap.height < image->height) {
+    fprintf(stderr, "HD menu image %s is %dx%d, smaller than original logical image %dx%d\n", hd_path,
+            bitmap.width, bitmap.height, image->width, image->height);
+    free_hd_bitmap(&bitmap);
+    return false;
+  }
+
+  free(image->hd_pixels);
+  image->hd_pixels = bitmap.pixels;
+  image->hd_width = bitmap.width;
+  image->hd_height = bitmap.height;
+  bitmap.pixels = NULL;
+  printf("Loaded HD menu artwork %s for %s (%dx%d)\n", hd_path, fallback != NULL ? fallback : resolved_path,
+         image->hd_width, image->hd_height);
+  free_hd_bitmap(&bitmap);
+  return true;
+}
+
+static bool load_hd_font_glyphs(const char *resolved_path, const char *fallback, HudFont *font) {
+  size_t glyph_index = 0u;
+  size_t loaded_count = 0u;
+
+  if (!g_hd_art_enabled) {
+    return true;
+  }
+  if (font == NULL || !font->loaded || font->glyphs == NULL || font->glyph_count == 0u) {
+    return false;
+  }
+
+  for (glyph_index = 0u; glyph_index < font->glyph_count; ++glyph_index) {
+    HudGlyph *glyph = &font->glyphs[glyph_index];
+    char hd_path[1280] = {0};
+    HdBitmap bitmap;
+
+    memset(&bitmap, 0, sizeof(bitmap));
+    if (!resolve_hd_font_glyph_file(resolved_path, fallback, glyph_index, hd_path, sizeof(hd_path))) {
+      if (loaded_count > 0u) {
+        size_t cleanup_index = 0u;
+
+        for (cleanup_index = 0u; cleanup_index < glyph_index; ++cleanup_index) {
+          free(font->glyphs[cleanup_index].hd_argb_pixels);
+          font->glyphs[cleanup_index].hd_argb_pixels = NULL;
+          font->glyphs[cleanup_index].hd_width = 0;
+          font->glyphs[cleanup_index].hd_height = 0;
+        }
+        fprintf(stderr, "Ignoring partial HD font for %s; missing glyph %zu\n",
+                fallback != NULL ? fallback : resolved_path, glyph_index);
+      }
+      return true;
+    }
+    if (!load_png_file_argb(hd_path, &bitmap)) {
+      return false;
+    }
+    if (bitmap.width < glyph->width || bitmap.height < glyph->height) {
+      fprintf(stderr, "HD font glyph %s is %dx%d, smaller than original logical glyph %dx%d\n", hd_path,
+              bitmap.width, bitmap.height, glyph->width, glyph->height);
+      free_hd_bitmap(&bitmap);
+      return false;
+    }
+
+    free(glyph->hd_argb_pixels);
+    glyph->hd_argb_pixels = bitmap.pixels;
+    glyph->hd_width = bitmap.width;
+    glyph->hd_height = bitmap.height;
+    bitmap.pixels = NULL;
+    free_hd_bitmap(&bitmap);
+    loaded_count += 1u;
+  }
+
+  if (loaded_count > 0u) {
+    printf("Loaded %zu HD font glyphs for %s\n", loaded_count, fallback != NULL ? fallback : resolved_path);
+  }
+  return true;
+}
+
 static bool load_hd_wall_texture_screen(const char *resolved_path, const char *source_name,
                                         WallTextureScreen *screen) {
   char key_from_path[256] = {0};
@@ -4347,9 +4608,11 @@ static bool load_hd_wall_texture_screen(const char *resolved_path, const char *s
   const char *keys[6] = {NULL, NULL, NULL, NULL, NULL, NULL};
   size_t key_count = 0u;
   uint32_t *hd_pixels = NULL;
+  uint8_t *hd_texture_loaded = NULL;
   int hd_width = 0;
   int hd_height = 0;
   size_t texture_index = 0u;
+  size_t loaded_count = 0u;
 
   if (!g_hd_art_enabled) {
     return true;
@@ -4374,6 +4637,13 @@ static bool load_hd_wall_texture_screen(const char *resolved_path, const char *s
     keys[key_count++] = key_data_ggfx;
   }
 
+  hd_texture_loaded = (uint8_t *)calloc(screen->texture_count, sizeof(*hd_texture_loaded));
+  if (hd_texture_loaded == NULL) {
+    fprintf(stderr, "Out of memory while loading HD wall texture screen %s\n",
+            source_name != NULL ? source_name : resolved_path);
+    return false;
+  }
+
   for (texture_index = 0u; texture_index < screen->texture_count; ++texture_index) {
     char file_name[32] = {0};
     char hd_path[1280] = {0};
@@ -4383,13 +4653,11 @@ static bool load_hd_wall_texture_screen(const char *resolved_path, const char *s
     memset(&bitmap, 0, sizeof(bitmap));
     (void)snprintf(file_name, sizeof(file_name), "texture_%02zu.png", texture_index);
     if (!resolve_hd_art_file_for_keys("wall_textures", keys, key_count, file_name, hd_path, sizeof(hd_path))) {
-      fprintf(stderr, "Missing HD wall texture %s for original texture screen %s\n", file_name,
-              source_name != NULL ? source_name : resolved_path);
-      free(hd_pixels);
-      return false;
+      continue;
     }
     if (!load_png_file_argb(hd_path, &bitmap)) {
       free(hd_pixels);
+      free(hd_texture_loaded);
       return false;
     }
     if (bitmap.width < GLOOM_TEXTURE_WIDTH || bitmap.height < GLOOM_TEXTURE_HEIGHT) {
@@ -4397,26 +4665,38 @@ static bool load_hd_wall_texture_screen(const char *resolved_path, const char *s
               bitmap.height, GLOOM_TEXTURE_WIDTH, GLOOM_TEXTURE_HEIGHT);
       free_hd_bitmap(&bitmap);
       free(hd_pixels);
+      free(hd_texture_loaded);
       return false;
     }
-    if (texture_index == 0u) {
+    if (hd_pixels == NULL) {
       size_t total_pixels = 0u;
+      size_t texture_pixels = 0u;
 
       hd_width = bitmap.width;
       hd_height = bitmap.height;
-      if ((size_t)hd_width > SIZE_MAX / (size_t)hd_height ||
-          screen->texture_count > SIZE_MAX / ((size_t)hd_width * (size_t)hd_height)) {
+      if ((size_t)hd_width > SIZE_MAX / (size_t)hd_height) {
         fprintf(stderr, "HD wall texture screen %s is too large to allocate\n",
                 source_name != NULL ? source_name : resolved_path);
         free_hd_bitmap(&bitmap);
+        free(hd_texture_loaded);
         return false;
       }
-      total_pixels = screen->texture_count * (size_t)hd_width * (size_t)hd_height;
-      hd_pixels = (uint32_t *)malloc(total_pixels * sizeof(*hd_pixels));
+      texture_pixels = (size_t)hd_width * (size_t)hd_height;
+      if (screen->texture_count > SIZE_MAX / texture_pixels ||
+          screen->texture_count * texture_pixels > SIZE_MAX / sizeof(*hd_pixels)) {
+        fprintf(stderr, "HD wall texture screen %s is too large to allocate\n",
+                source_name != NULL ? source_name : resolved_path);
+        free_hd_bitmap(&bitmap);
+        free(hd_texture_loaded);
+        return false;
+      }
+      total_pixels = screen->texture_count * texture_pixels;
+      hd_pixels = (uint32_t *)calloc(total_pixels, sizeof(*hd_pixels));
       if (hd_pixels == NULL) {
         fprintf(stderr, "Out of memory while loading HD wall texture screen %s\n",
                 source_name != NULL ? source_name : resolved_path);
         free_hd_bitmap(&bitmap);
+        free(hd_texture_loaded);
         return false;
       }
     } else if (bitmap.width != hd_width || bitmap.height != hd_height) {
@@ -4424,20 +4704,37 @@ static bool load_hd_wall_texture_screen(const char *resolved_path, const char *s
               bitmap.width, bitmap.height, hd_width, hd_height);
       free_hd_bitmap(&bitmap);
       free(hd_pixels);
+      free(hd_texture_loaded);
       return false;
     }
 
     bitmap_pixels = (size_t)hd_width * (size_t)hd_height;
     memcpy(hd_pixels + texture_index * bitmap_pixels, bitmap.pixels, bitmap_pixels * sizeof(*hd_pixels));
+    hd_texture_loaded[texture_index] = 1u;
+    loaded_count += 1u;
     free_hd_bitmap(&bitmap);
   }
 
+  if (loaded_count == 0u) {
+    free(hd_pixels);
+    free(hd_texture_loaded);
+    free(screen->hd_argb_texels);
+    free(screen->hd_texture_loaded);
+    screen->hd_argb_texels = NULL;
+    screen->hd_texture_loaded = NULL;
+    screen->hd_width = 0;
+    screen->hd_height = 0;
+    return true;
+  }
+
   free(screen->hd_argb_texels);
+  free(screen->hd_texture_loaded);
   screen->hd_argb_texels = hd_pixels;
+  screen->hd_texture_loaded = hd_texture_loaded;
   screen->hd_width = hd_width;
   screen->hd_height = hd_height;
-  printf("Loaded HD wall texture screen %s at %dx%d per texture\n",
-         source_name != NULL ? source_name : resolved_path, hd_width, hd_height);
+  printf("Loaded %zu/%zu HD wall textures for %s at %dx%d per texture\n", loaded_count,
+         screen->texture_count, source_name != NULL ? source_name : resolved_path, hd_width, hd_height);
   return true;
 }
 
@@ -4486,8 +4783,11 @@ static bool load_hd_flat_texture(const char *resolved_path, const char *kind, co
       }
     }
     if (!found) {
-      fprintf(stderr, "Missing HD %s tile for script tile_%s\n", kind, tile_tag);
-      return false;
+      free(texture->hd_argb_texels);
+      texture->hd_argb_texels = NULL;
+      texture->hd_width = 0;
+      texture->hd_height = 0;
+      return true;
     }
   }
 
@@ -4521,6 +4821,7 @@ static bool load_hd_object_visual_frames(const char *resolved_path, const char *
   const char *keys[5] = {NULL, NULL, NULL, NULL, NULL};
   size_t key_count = 0u;
   size_t frame_index = 0u;
+  size_t loaded_count = 0u;
 
   if (!g_hd_art_enabled) {
     return true;
@@ -4554,9 +4855,11 @@ static bool load_hd_object_visual_frames(const char *resolved_path, const char *
     memset(&bitmap, 0, sizeof(bitmap));
     (void)snprintf(file_name, sizeof(file_name), "frame_%04zu.png", frame_index);
     if (!resolve_hd_art_file_for_keys("objects", keys, key_count, file_name, hd_path, sizeof(hd_path))) {
-      fprintf(stderr, "Missing HD object frame %s for original asset %s\n", file_name,
-              asset_name != NULL ? asset_name : resolved_path);
-      return false;
+      free(frame->hd_argb_pixels);
+      frame->hd_argb_pixels = NULL;
+      frame->hd_bitmap_width = 0;
+      frame->hd_bitmap_height = 0;
+      continue;
     }
     if (!load_png_file_argb(hd_path, &bitmap)) {
       return false;
@@ -4574,6 +4877,11 @@ static bool load_hd_object_visual_frames(const char *resolved_path, const char *
     frame->hd_bitmap_height = bitmap.height;
     bitmap.pixels = NULL;
     free_hd_bitmap(&bitmap);
+    loaded_count += 1u;
+  }
+
+  if (loaded_count == 0u) {
+    return true;
   }
 
   {
@@ -4583,7 +4891,8 @@ static bool load_hd_object_visual_frames(const char *resolved_path, const char *
       (void)snprintf(visual->source_name + len, sizeof(visual->source_name) - len, " + HD art");
     }
   }
-  printf("Loaded %zu HD object frames for %s\n", visual->frame_count, asset_name != NULL ? asset_name : resolved_path);
+  printf("Loaded %zu/%zu HD object frames for %s\n", loaded_count, visual->frame_count,
+         asset_name != NULL ? asset_name : resolved_path);
   return true;
 }
 
@@ -4596,6 +4905,7 @@ static void free_hud_font(HudFont *font) {
 
   for (i = 0u; i < font->glyph_count; ++i) {
     free(font->glyphs[i].argb_pixels);
+    free(font->glyphs[i].hd_argb_pixels);
 #ifdef GLOOM_DOS_SDL3
     free(font->glyphs[i].indexed_pixels);
     free(font->glyphs[i].coverage);
@@ -4686,14 +4996,19 @@ static bool load_hud_panel_shapes(HudFont *font, const char *resolved_path, cons
   font->glyph_count = shape_count;
   font->glyphs = glyphs;
   (void)snprintf(font->source_name, sizeof(font->source_name), "%s", resolved_path);
+  if (!load_hd_font_glyphs(resolved_path, "misc/smallfont2.bin", font)) {
+    goto fail;
+  }
   printf("Loaded %zu HUD panel shapes from original showstats panel asset\n", shape_count);
   return true;
 
 fail:
   for (shape_index = 0u; shape_index < shape_count; ++shape_index) {
     free(glyphs[shape_index].argb_pixels);
+    free(glyphs[shape_index].hd_argb_pixels);
   }
   free(glyphs);
+  memset(font, 0, sizeof(*font));
   return false;
 }
 
@@ -4852,6 +5167,9 @@ static bool load_hud_font(HudFont *font) {
   font->glyph_count = glyph_count;
   font->glyphs = glyphs;
   (void)snprintf(font->source_name, sizeof(font->source_name), "%s", resolved_path);
+  if (!load_hd_font_glyphs(resolved_path, "misc/smallfont2.bin", font)) {
+    goto fail;
+  }
 
   free(data);
   printf("Loaded %zu HUD glyphs from original smallfont shape table\n", glyph_count);
@@ -4860,9 +5178,11 @@ static bool load_hud_font(HudFont *font) {
 fail:
   for (glyph_index = 0u; glyph_index < glyph_count; ++glyph_index) {
     free(glyphs[glyph_index].argb_pixels);
+    free(glyphs[glyph_index].hd_argb_pixels);
   }
   free(glyphs);
   free(data);
+  memset(font, 0, sizeof(*font));
   return false;
 }
 
@@ -5050,6 +5370,9 @@ static bool load_menu_big_font(HudFont *font) {
   memcpy(font->palette_used, palette_used, sizeof(font->palette_used));
 #endif
   (void)snprintf(font->source_name, sizeof(font->source_name), "%s", resolved_path);
+  if (!load_hd_font_glyphs(resolved_path, "misc/bigfont2.bin", font)) {
+    goto fail;
+  }
   free(data);
   dos_logf("DOS checkpoint: menu big font loaded %zu glyphs", glyph_count);
   printf("Loaded %zu menu glyphs from original bigfont asset\n", glyph_count);
@@ -5058,6 +5381,7 @@ static bool load_menu_big_font(HudFont *font) {
 fail:
   for (glyph_index = 0u; glyph_index < glyph_count; ++glyph_index) {
     free(glyphs[glyph_index].argb_pixels);
+    free(glyphs[glyph_index].hd_argb_pixels);
 #ifdef GLOOM_DOS_SDL3
     free(glyphs[glyph_index].indexed_pixels);
     free(glyphs[glyph_index].coverage);
@@ -5065,6 +5389,7 @@ fail:
   }
   free(glyphs);
   free(data);
+  memset(font, 0, sizeof(*font));
   return false;
 }
 
@@ -5200,6 +5525,7 @@ static bool load_wall_texture_screen(const char *path, const char *source_name, 
     free(out_screen->texels);
     free(out_screen->column_flags);
     free(out_screen->hd_argb_texels);
+    free(out_screen->hd_texture_loaded);
 #ifdef GLOOM_DOS_SDL3
     free(out_screen->column_texels);
     free(out_screen->column_shaded_texels);
@@ -6554,23 +6880,27 @@ static uint32_t sample_wall_texture_argb_ex(const WallTextureSet *set, uint8_t t
     *out_transparent_column = transparent_column;
   }
 
-  if (hd_art_render_enabled() && set->screens[screen_index].hd_argb_texels != NULL &&
-      set->screens[screen_index].hd_width > 0 &&
-      set->screens[screen_index].hd_height > 0) {
+  {
     const WallTextureScreen *screen = &set->screens[screen_index];
-    const uint32_t *hd_pixels = screen->hd_argb_texels +
-                                local_index * (size_t)screen->hd_width * (size_t)screen->hd_height;
-    size_t hd_tx = wall_texture_coord_from_unit(u, (size_t)screen->hd_width);
-    size_t hd_ty = wall_texture_coord_from_unit(v, (size_t)screen->hd_height);
-    uint32_t argb = hd_pixels[hd_ty * (size_t)screen->hd_width + hd_tx];
+    bool hd_texture_available =
+        screen->hd_texture_loaded == NULL || screen->hd_texture_loaded[local_index] != 0u;
 
-    if (transparent_column && ((argb >> 24u) == 0u || palette_index == 0u)) {
-      return 0x00000000u;
+    if (hd_art_render_enabled() && screen->hd_argb_texels != NULL && screen->hd_width > 0 &&
+        screen->hd_height > 0 && hd_texture_available) {
+      const uint32_t *hd_pixels = screen->hd_argb_texels +
+                                  local_index * (size_t)screen->hd_width * (size_t)screen->hd_height;
+      size_t hd_tx = wall_texture_coord_from_unit(u, (size_t)screen->hd_width);
+      size_t hd_ty = wall_texture_coord_from_unit(v, (size_t)screen->hd_height);
+      uint32_t argb = hd_pixels[hd_ty * (size_t)screen->hd_width + hd_tx];
+
+      if (transparent_column && ((argb >> 24u) == 0u || palette_index == 0u)) {
+        return 0x00000000u;
+      }
+      if ((argb >> 24u) == 0u) {
+        return 0x00000000u;
+      }
+      return argb;
     }
-    if ((argb >> 24u) == 0u) {
-      return 0x00000000u;
-    }
-    return argb;
   }
 
   if (transparent_column && palette_index == 0u) {
@@ -13833,7 +14163,8 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
             wall_palette = screen->shaded_palette[dark_index];
             wall_texel_base = local_index * ((size_t)GLOOM_TEXTURE_WIDTH * (size_t)GLOOM_TEXTURE_HEIGHT) + tx;
             if (hd_art_render_enabled() && screen->hd_argb_texels != NULL && screen->hd_width > 0 &&
-                screen->hd_height > 0) {
+                screen->hd_height > 0 &&
+                (screen->hd_texture_loaded == NULL || screen->hd_texture_loaded[local_index] != 0u)) {
               size_t hd_tx = wall_texture_coord_from_unit(local_u, (size_t)screen->hd_width);
               wall_hd_texels = screen->hd_argb_texels;
               wall_hd_width = screen->hd_width;
@@ -14621,6 +14952,81 @@ static void render_argb_pixels_scaled(RenderFramebuffer *framebuffer, const uint
   }
 }
 
+static void render_argb_pixels_resized_brightness(RenderFramebuffer *framebuffer, const uint32_t *pixels,
+                                                  int src_width, int src_height, int dst_x, int dst_y, int dst_width,
+                                                  int dst_height, uint8_t brightness) {
+  int y0 = 0;
+  int y1 = 0;
+  int draw_y = 0;
+
+  if (framebuffer == NULL || pixels == NULL || src_width <= 0 || src_height <= 0 || dst_width <= 0 ||
+      dst_height <= 0) {
+    return;
+  }
+#ifdef GLOOM_DOS_SDL3
+  if (framebuffer->index_pixels == NULL || framebuffer->index_pitch_pixels < framebuffer->width) {
+    return;
+  }
+#else
+  if (framebuffer->pixels == NULL || framebuffer->pitch_pixels < framebuffer->width) {
+    return;
+  }
+#endif
+
+  if (dst_x + dst_width <= 0 || dst_y + dst_height <= 0 || dst_x >= framebuffer->width ||
+      dst_y >= framebuffer->height) {
+    return;
+  }
+
+  y0 = dst_y < 0 ? 0 : dst_y;
+  y1 = dst_y + dst_height;
+  if (y1 > framebuffer->height) {
+    y1 = framebuffer->height;
+  }
+
+  for (draw_y = y0; draw_y < y1; ++draw_y) {
+    int rel_y = draw_y - dst_y;
+    int src_y = (int)(((int64_t)rel_y * (int64_t)src_height) / (int64_t)dst_height);
+    int x0 = dst_x < 0 ? 0 : dst_x;
+    int x1 = dst_x + dst_width;
+    int draw_x = 0;
+
+    if (src_y < 0) src_y = 0;
+    if (src_y >= src_height) src_y = src_height - 1;
+    if (x1 > framebuffer->width) {
+      x1 = framebuffer->width;
+    }
+
+    for (draw_x = x0; draw_x < x1; ++draw_x) {
+      int rel_x = draw_x - dst_x;
+      int src_x = (int)(((int64_t)rel_x * (int64_t)src_width) / (int64_t)dst_width);
+      uint32_t argb = 0u;
+      uint32_t alpha = 0u;
+      uint32_t r = 0u;
+      uint32_t g = 0u;
+      uint32_t b = 0u;
+
+      if (src_x < 0) src_x = 0;
+      if (src_x >= src_width) src_x = src_width - 1;
+      argb = pixels[(size_t)src_y * (size_t)src_width + (size_t)src_x];
+      alpha = argb >> 24u;
+      if (alpha == 0u) {
+        continue;
+      }
+      r = ((argb >> 16u) & 0xffu) * (uint32_t)brightness / 255u;
+      g = ((argb >> 8u) & 0xffu) * (uint32_t)brightness / 255u;
+      b = (argb & 0xffu) * (uint32_t)brightness / 255u;
+#ifdef GLOOM_DOS_SDL3
+      framebuffer->index_pixels[(size_t)draw_y * (size_t)framebuffer->index_pitch_pixels + (size_t)draw_x] =
+          dos_argb_to_opaque_index(0xFF000000u | (r << 16u) | (g << 8u) | b);
+#else
+      framebuffer->pixels[(size_t)draw_y * (size_t)framebuffer->pitch_pixels + (size_t)draw_x] =
+          0xFF000000u | (r << 16u) | (g << 8u) | b;
+#endif
+    }
+  }
+}
+
 #ifndef GLOOM_DOS_SDL3
 static void render_object_frame_scaled(RenderFramebuffer *framebuffer, const ObjectFrame *frame, int screen_x,
                                        int screen_y, int scale) {
@@ -14894,6 +15300,13 @@ static void render_hud_glyph_scaled(RenderFramebuffer *framebuffer, const HudGly
     return;
   }
 
+  if (hd_art_render_enabled() && glyph->hd_argb_pixels != NULL && glyph->hd_width > 0 && glyph->hd_height > 0 &&
+      glyph->width > 0 && glyph->height > 0) {
+    render_argb_pixels_resized_brightness(framebuffer, glyph->hd_argb_pixels, glyph->hd_width, glyph->hd_height, x,
+                                          y, glyph->width * scale, glyph->height * scale, 255u);
+    return;
+  }
+
 #ifdef GLOOM_DOS_SDL3
   if (g_dos_menu_palette_active && glyph->indexed_pixels != NULL && glyph->coverage != NULL) {
     render_hud_glyph_scaled_dos_indexed(framebuffer, glyph, x, y, scale);
@@ -14922,6 +15335,13 @@ static void render_hud_glyph_scaled_brightness(RenderFramebuffer *framebuffer, c
 
   if (brightness >= 255u) {
     render_hud_glyph_scaled(framebuffer, glyph, x, y, scale);
+    return;
+  }
+
+  if (hd_art_render_enabled() && glyph->hd_argb_pixels != NULL && glyph->hd_width > 0 && glyph->hd_height > 0 &&
+      glyph->width > 0 && glyph->height > 0) {
+    render_argb_pixels_resized_brightness(framebuffer, glyph->hd_argb_pixels, glyph->hd_width, glyph->hd_height, x,
+                                          y, glyph->width * scale, glyph->height * scale, brightness);
     return;
   }
 
@@ -15220,6 +15640,7 @@ static void free_menu_image(MenuImage *image) {
   }
 
   free(image->pixels);
+  free(image->hd_pixels);
 #ifdef GLOOM_DOS_SDL3
   free(image->indices);
 #endif
@@ -15309,6 +15730,11 @@ static bool load_menu_title_image(MenuImage *out_image) {
 #endif
     out_image->width = (int)image.width;
     out_image->height = (int)image.height;
+    if (!load_hd_menu_image_pixels(resolved_path, candidates[i], out_image)) {
+      gloom_iff_free(&image);
+      free_menu_image(out_image);
+      return false;
+    }
     gloom_iff_free(&image);
     dos_logf("DOS checkpoint: menu title loaded %dx%d", out_image->width, out_image->height);
     printf("Loaded original title image %s for menu\n", resolved_path);
@@ -15389,6 +15815,11 @@ static bool load_iff_menu_image_from_candidates(const char *const *candidates, s
 #endif
     out_image->width = (int)image.width;
     out_image->height = (int)image.height;
+    if (!load_hd_menu_image_pixels(resolved_path, candidates[i], out_image)) {
+      gloom_iff_free(&image);
+      free_menu_image(out_image);
+      return false;
+    }
     gloom_iff_free(&image);
     printf("Loaded original script picture %s\n", resolved_path);
     return true;
@@ -15489,9 +15920,72 @@ static int menu_pixel_scale_for_viewport(int render_width, int render_height) {
   return power;
 }
 
+static bool menu_image_hd_active(const MenuImage *image) {
+  return hd_art_render_enabled() && image != NULL && image->hd_pixels != NULL && image->hd_width > 0 &&
+         image->hd_height > 0;
+}
+
+static const uint32_t *menu_image_argb_pixels(const MenuImage *image, int *out_width, int *out_height) {
+  if (out_width != NULL) {
+    *out_width = 0;
+  }
+  if (out_height != NULL) {
+    *out_height = 0;
+  }
+  if (image == NULL) {
+    return NULL;
+  }
+  if (menu_image_hd_active(image)) {
+    if (out_width != NULL) {
+      *out_width = image->hd_width;
+    }
+    if (out_height != NULL) {
+      *out_height = image->hd_height;
+    }
+    return image->hd_pixels;
+  }
+  if (out_width != NULL) {
+    *out_width = image->width;
+  }
+  if (out_height != NULL) {
+    *out_height = image->height;
+  }
+  return image->pixels;
+}
+
+static uint32_t menu_image_sample_argb_logical(const MenuImage *image, int logical_x, int logical_y) {
+  const uint32_t *pixels = NULL;
+  int pixel_width = 0;
+  int pixel_height = 0;
+  int sample_x = 0;
+  int sample_y = 0;
+
+  if (image == NULL || image->width <= 0 || image->height <= 0) {
+    return 0xFF000000u;
+  }
+  pixels = menu_image_argb_pixels(image, &pixel_width, &pixel_height);
+  if (pixels == NULL || pixel_width <= 0 || pixel_height <= 0) {
+    return 0xFF000000u;
+  }
+
+  if (logical_x < 0) logical_x = 0;
+  if (logical_y < 0) logical_y = 0;
+  if (logical_x >= image->width) logical_x = image->width - 1;
+  if (logical_y >= image->height) logical_y = image->height - 1;
+
+  sample_x = (int)(((int64_t)logical_x * (int64_t)pixel_width) / (int64_t)image->width);
+  sample_y = (int)(((int64_t)logical_y * (int64_t)pixel_height) / (int64_t)image->height);
+  if (sample_x < 0) sample_x = 0;
+  if (sample_y < 0) sample_y = 0;
+  if (sample_x >= pixel_width) sample_x = pixel_width - 1;
+  if (sample_y >= pixel_height) sample_y = pixel_height - 1;
+  return pixels[(size_t)sample_y * (size_t)pixel_width + (size_t)sample_x];
+}
+
 static void render_menu_image(RenderFramebuffer *framebuffer, const MenuImage *image, int render_width,
                               int render_height) {
   int dst_y = 0;
+  bool using_hd_image = false;
 
   if (framebuffer == NULL || image == NULL || !image->loaded) {
     return;
@@ -15516,6 +16010,7 @@ static void render_menu_image(RenderFramebuffer *framebuffer, const MenuImage *i
   }
 #endif
 
+  using_hd_image = menu_image_hd_active(image);
   for (dst_y = 0; dst_y < render_height; ++dst_y) {
 #ifdef GLOOM_DOS_SDL3
     uint8_t *dst_row = framebuffer->index_pixels + ((size_t)dst_y * (size_t)framebuffer->index_pitch_pixels);
@@ -15549,13 +16044,17 @@ static void render_menu_image(RenderFramebuffer *framebuffer, const MenuImage *i
       if (src_x >= image->width) src_x = image->width - 1;
       if (src_y >= image->height) src_y = image->height - 1;
 #ifdef GLOOM_DOS_SDL3
-      if (g_dos_menu_palette_active && image->indices != NULL) {
+      if (!using_hd_image && g_dos_menu_palette_active && image->indices != NULL) {
         dst_row[dst_x] = image->indices[(size_t)src_y * (size_t)image->width + (size_t)src_x];
       } else {
-        dst_row[dst_x] = dos_argb_to_index(image->pixels[(size_t)src_y * (size_t)image->width + (size_t)src_x]);
+        dst_row[dst_x] = dos_argb_to_index(menu_image_sample_argb_logical(image, (int)src_x, (int)src_y));
       }
 #else
-      dst_row[dst_x] = image->pixels[(size_t)src_y * (size_t)image->width + (size_t)src_x];
+      {
+        uint32_t argb = menu_image_sample_argb_logical(image, (int)src_x, (int)src_y);
+
+        dst_row[dst_x] = (argb >> 24u) == 0u ? 0xFF000000u : (0xFF000000u | (argb & 0x00FFFFFFu));
+      }
 #endif
     }
   }
@@ -15566,6 +16065,9 @@ static void menu_image_content_bounds(const MenuImage *image, int *out_x, int *o
   int min_y = 0;
   int max_x = 0;
   int max_y = 0;
+  const uint32_t *pixels = NULL;
+  int pixel_width = 0;
+  int pixel_height = 0;
   int y = 0;
   bool found = false;
 
@@ -15576,15 +16078,19 @@ static void menu_image_content_bounds(const MenuImage *image, int *out_x, int *o
   *out_y = 0;
   *out_w = image != NULL ? image->width : 0;
   *out_h = image != NULL ? image->height : 0;
-  if (image == NULL || image->pixels == NULL || image->width <= 0 || image->height <= 0) {
+  if (image == NULL || image->width <= 0 || image->height <= 0) {
+    return;
+  }
+  pixels = menu_image_argb_pixels(image, &pixel_width, &pixel_height);
+  if (pixels == NULL || pixel_width <= 0 || pixel_height <= 0) {
     return;
   }
 
-  for (y = 0; y < image->height; ++y) {
+  for (y = 0; y < pixel_height; ++y) {
     int x = 0;
 
-    for (x = 0; x < image->width; ++x) {
-      uint32_t argb = image->pixels[(size_t)y * (size_t)image->width + (size_t)x];
+    for (x = 0; x < pixel_width; ++x) {
+      uint32_t argb = pixels[(size_t)y * (size_t)pixel_width + (size_t)x];
 
       if ((argb >> 24u) == 0u || (argb & 0x00FFFFFFu) == 0u) {
         continue;
@@ -15603,20 +16109,42 @@ static void menu_image_content_bounds(const MenuImage *image, int *out_x, int *o
   }
 
   if (found) {
-    *out_x = min_x;
-    *out_y = min_y;
-    *out_w = (max_x - min_x) + 1;
-    *out_h = (max_y - min_y) + 1;
+    int logical_min_x = (int)(((int64_t)min_x * (int64_t)image->width) / (int64_t)pixel_width);
+    int logical_min_y = (int)(((int64_t)min_y * (int64_t)image->height) / (int64_t)pixel_height);
+    int logical_max_x =
+        (int)((((int64_t)(max_x + 1) * (int64_t)image->width) + (int64_t)pixel_width - 1) /
+              (int64_t)pixel_width) -
+        1;
+    int logical_max_y =
+        (int)((((int64_t)(max_y + 1) * (int64_t)image->height) + (int64_t)pixel_height - 1) /
+              (int64_t)pixel_height) -
+        1;
+
+    if (logical_min_x < 0) logical_min_x = 0;
+    if (logical_min_y < 0) logical_min_y = 0;
+    if (logical_max_x >= image->width) logical_max_x = image->width - 1;
+    if (logical_max_y >= image->height) logical_max_y = image->height - 1;
+    *out_x = logical_min_x;
+    *out_y = logical_min_y;
+    *out_w = (logical_max_x - logical_min_x) + 1;
+    *out_h = (logical_max_y - logical_min_y) + 1;
   }
 }
 
 static uint32_t *prescale_menu_image_region_box(const MenuImage *image, int src_x, int src_y, int src_w, int src_h,
                                                 int dst_w, int dst_h) {
   uint32_t *pixels = NULL;
+  const uint32_t *source_pixels = NULL;
+  int source_width = 0;
+  int source_height = 0;
   int y = 0;
 
-  if (image == NULL || image->pixels == NULL || image->width <= 0 || image->height <= 0 || src_w <= 0 || src_h <= 0 ||
+  if (image == NULL || image->width <= 0 || image->height <= 0 || src_w <= 0 || src_h <= 0 ||
       dst_w <= 0 || dst_h <= 0) {
+    return NULL;
+  }
+  source_pixels = menu_image_argb_pixels(image, &source_width, &source_height);
+  if (source_pixels == NULL || source_width <= 0 || source_height <= 0) {
     return NULL;
   }
 
@@ -15640,6 +16168,10 @@ static uint32_t *prescale_menu_image_region_box(const MenuImage *image, int src_
     for (x = 0; x < dst_w; ++x) {
       int sample_x0 = src_x + (int)(((int64_t)x * (int64_t)src_w) / (int64_t)dst_w);
       int sample_x1 = src_x + (int)(((int64_t)(x + 1) * (int64_t)src_w) / (int64_t)dst_w);
+      int source_sample_x0 = 0;
+      int source_sample_x1 = 0;
+      int source_sample_y0 = 0;
+      int source_sample_y1 = 0;
       uint32_t r = 0u;
       uint32_t g = 0u;
       uint32_t b = 0u;
@@ -15653,11 +16185,26 @@ static uint32_t *prescale_menu_image_region_box(const MenuImage *image, int src_
       if (sample_x1 > src_x + src_w) sample_x1 = src_x + src_w;
       if (sample_x1 > image->width) sample_x1 = image->width;
 
-      for (sy = sample_y0; sy < sample_y1; ++sy) {
+      source_sample_x0 = (int)(((int64_t)sample_x0 * (int64_t)source_width) / (int64_t)image->width);
+      source_sample_x1 =
+          (int)((((int64_t)sample_x1 * (int64_t)source_width) + (int64_t)image->width - 1) /
+                (int64_t)image->width);
+      source_sample_y0 = (int)(((int64_t)sample_y0 * (int64_t)source_height) / (int64_t)image->height);
+      source_sample_y1 =
+          (int)((((int64_t)sample_y1 * (int64_t)source_height) + (int64_t)image->height - 1) /
+                (int64_t)image->height);
+      if (source_sample_x0 < 0) source_sample_x0 = 0;
+      if (source_sample_y0 < 0) source_sample_y0 = 0;
+      if (source_sample_x1 <= source_sample_x0) source_sample_x1 = source_sample_x0 + 1;
+      if (source_sample_y1 <= source_sample_y0) source_sample_y1 = source_sample_y0 + 1;
+      if (source_sample_x1 > source_width) source_sample_x1 = source_width;
+      if (source_sample_y1 > source_height) source_sample_y1 = source_height;
+
+      for (sy = source_sample_y0; sy < source_sample_y1; ++sy) {
         int sx = 0;
 
-        for (sx = sample_x0; sx < sample_x1; ++sx) {
-          uint32_t argb = image->pixels[(size_t)sy * (size_t)image->width + (size_t)sx];
+        for (sx = source_sample_x0; sx < source_sample_x1; ++sx) {
+          uint32_t argb = source_pixels[(size_t)sy * (size_t)source_width + (size_t)sx];
 
           if ((argb >> 24u) == 0u || (argb & 0x00FFFFFFu) == 0u) {
             continue;
@@ -19099,6 +19646,25 @@ static int run_hud_selftest(void) {
     free(status_pixels);
   }
 
+  if (g_hd_art_enabled) {
+    HudFont hd_font;
+
+    memset(&hd_font, 0, sizeof(hd_font));
+    if (!load_hud_font(&hd_font)) {
+      fprintf(stderr, "HUD selftest failed: HD art root prevented original HUD font loading\n");
+      return 1;
+    }
+    if (hd_font.glyph_count <= (size_t)GLOOM_HUD_LIFE_CHAR ||
+        hd_font.glyphs[GLOOM_HUD_LIFE_CHAR].hd_argb_pixels == NULL ||
+        hd_font.glyphs[GLOOM_HUD_LIFE_CHAR].hd_width <= 0 ||
+        hd_font.glyphs[GLOOM_HUD_LIFE_CHAR].hd_height <= 0) {
+      fprintf(stderr, "HUD selftest failed: HD HUD font glyphs were not loaded from the art root\n");
+      free_hud_font(&hd_font);
+      return 1;
+    }
+    free_hud_font(&hd_font);
+  }
+
   printf("HUD selftest passed\n");
   return 0;
 }
@@ -19120,6 +19686,36 @@ static int run_menu_selftest(void) {
     fprintf(stderr, "Menu selftest failed: bigfont lacks printmess2 glyph mappings\n");
     free_menu_assets(&assets);
     return 1;
+  }
+  if (g_hd_art_enabled) {
+    MenuImage script_picture;
+
+    memset(&script_picture, 0, sizeof(script_picture));
+    if (assets.title.hd_pixels == NULL || assets.title.hd_width <= 0 || assets.title.hd_height <= 0) {
+      fprintf(stderr, "Menu selftest failed: HD title artwork was not loaded from the art root\n");
+      free_menu_assets(&assets);
+      return 1;
+    }
+    if (assets.black_magic_logo.hd_pixels == NULL || assets.black_magic_logo.hd_width <= 0 ||
+        assets.black_magic_logo.hd_height <= 0) {
+      fprintf(stderr, "Menu selftest failed: HD Black Magic artwork was not loaded from the art root\n");
+      free_menu_assets(&assets);
+      return 1;
+    }
+    if (assets.big_font.glyphs[0].hd_argb_pixels == NULL || assets.big_font.glyphs[0].hd_width <= 0 ||
+        assets.big_font.glyphs[0].hd_height <= 0) {
+      fprintf(stderr, "Menu selftest failed: HD menu font glyphs were not loaded from the art root\n");
+      free_menu_assets(&assets);
+      return 1;
+    }
+    if (!load_script_picture_image("spacehulk", &script_picture) || script_picture.hd_pixels == NULL ||
+        script_picture.hd_width <= 0 || script_picture.hd_height <= 0) {
+      fprintf(stderr, "Menu selftest failed: HD script/menu picture artwork was not loaded from the art root\n");
+      free_menu_image(&script_picture);
+      free_menu_assets(&assets);
+      return 1;
+    }
+    free_menu_image(&script_picture);
   }
   {
     const int render_width = 320;
@@ -21746,6 +22342,20 @@ int main(int argc, char **argv) {
 
   if (argc > 1 && strcmp(argv[1], "--menu-selftest") == 0) {
     return run_menu_selftest();
+  }
+
+  if (argc > 1 && strcmp(argv[1], "--hd-art-selftest") == 0) {
+    int result = 0;
+
+    if (argc < 3 || !set_hd_art_root(argv[2])) {
+      fprintf(stderr, "--hd-art-selftest requires an HD art root path\n");
+      return 1;
+    }
+    result = run_menu_selftest();
+    if (result != 0) {
+      return result;
+    }
+    return run_hud_selftest();
   }
 
   if (argc > 1 && strcmp(argv[1], "--completion-selftest") == 0) {

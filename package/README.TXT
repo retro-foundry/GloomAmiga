@@ -111,7 +111,9 @@
 
        The original Amiga binary assets are still required; HD art only
        replaces sampled presentation pixels for walls, flats, sprites,
-       projectiles, sparks, and the gun.
+       projectiles, sparks, the gun, menu/screen artwork, and fonts.
+       HD art packs may be partial; any missing replacement falls back to
+       the original SD asset at runtime.
 
    ---------------------------------------------------------------------
 
