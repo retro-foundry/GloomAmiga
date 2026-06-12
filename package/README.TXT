@@ -64,6 +64,13 @@
        viewport_size enables an Amiga-style centered gameplay window.
        viewport_pixel_size accepts 1x1 or 2x2.
 
+       GLOOM.INI controls the source-derived software framebuffer size,
+       optional viewport, HD art, control-source, and keyboard settings.
+       Windows writes the loaded GLOOM.INI path and final framebuffer/window
+       size to GLOOM.LOG next to gloom_pc.exe.
+
+       There is no hardware renderer setting.
+
        Keyboard controls can be changed in the same file:
 
          player1_control=Keyboard

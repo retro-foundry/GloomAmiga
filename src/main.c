@@ -43,6 +43,8 @@
 #define GLOOM_RUNTIME_HAS_AUTOSAVE 0
 #endif
 
+static bool get_executable_dir(char *out_dir, size_t out_dir_size);
+
 #ifdef GLOOM_DOS_SDL3
 static void dos_logf(const char *fmt, ...) {
   FILE *file = fopen("GLOOM.LOG", "a");
@@ -66,6 +68,44 @@ static void dos_logf(const char *fmt, ...) {
   (void)fmt;
 }
 #endif
+
+static void runtime_logf(const char *fmt, ...) {
+  char line[512];
+  va_list args;
+
+  if (fmt == NULL) {
+    return;
+  }
+
+  va_start(args, fmt);
+  (void)vsnprintf(line, sizeof(line), fmt, args);
+  va_end(args);
+  line[sizeof(line) - 1u] = '\0';
+
+  printf("%s\n", line);
+#ifdef GLOOM_DOS_SDL3
+  dos_logf("%s", line);
+#elif defined(_WIN32)
+  {
+    char log_path[1280] = {0};
+    FILE *file = NULL;
+
+    if (get_executable_dir(log_path, sizeof(log_path)) &&
+        strlen(log_path) + strlen("/GLOOM.LOG") + 1u < sizeof(log_path)) {
+      strcat(log_path, "/GLOOM.LOG");
+      file = fopen(log_path, "a");
+    }
+    if (file == NULL) {
+      file = fopen("GLOOM.LOG", "a");
+    }
+    if (file != NULL) {
+      fputs(line, file);
+      fputc('\n', file);
+      fclose(file);
+    }
+  }
+#endif
+}
 
 static const char *runtime_title(void) {
 #if GLOOM_RUNTIME_IS_BINARY
@@ -645,6 +685,8 @@ typedef struct {
 } RuntimeControlConfig;
 
 typedef struct {
+  bool ini_loaded;
+  char ini_path[1280];
   bool has_resolution;
   int resolution_width;
   int resolution_height;
@@ -654,6 +696,8 @@ typedef struct {
   int gameplay_pixel_width;
   int gameplay_pixel_height;
 } RuntimeDisplayIniConfig;
+
+static RuntimeDisplayIniConfig g_runtime_display_ini;
 
 typedef struct {
   bool active;
@@ -21799,8 +21843,6 @@ static bool set_gameplay_start_mouse_capture(SDL_Window *window) {
   return captured;
 }
 
-static RuntimeDisplayIniConfig g_runtime_display_ini;
-
 static char *trim_ini_token(char *text) {
   char *end = NULL;
 
@@ -22074,6 +22116,8 @@ static void load_runtime_display_ini(RuntimeDisplayIniConfig *config) {
   for (candidate_index = 0u; candidate_index < sizeof(candidates) / sizeof(candidates[0]); ++candidate_index) {
     file = fopen(candidates[candidate_index], "r");
     if (file != NULL) {
+      config->ini_loaded = true;
+      (void)snprintf(config->ini_path, sizeof(config->ini_path), "%s", candidates[candidate_index]);
       break;
     }
   }
@@ -22085,6 +22129,8 @@ static void load_runtime_display_ini(RuntimeDisplayIniConfig *config) {
 
     file = fopen(resolved_ini_path, "r");
     if (file != NULL) {
+      config->ini_loaded = true;
+      (void)snprintf(config->ini_path, sizeof(config->ini_path), "%s", resolved_ini_path);
       break;
     }
   }
@@ -22213,6 +22259,63 @@ static RuntimeGameplayViewport runtime_gameplay_viewport_for_render_target(int r
   return viewport;
 }
 
+static void log_runtime_display_config(const RuntimeDisplayIniConfig *config, int render_width, int render_height,
+                                       int window_width, int window_height) {
+  char resolution[32];
+
+  if (config == NULL) {
+    return;
+  }
+
+  if (config->has_resolution) {
+    (void)snprintf(resolution, sizeof(resolution), "%dx%d", config->resolution_width, config->resolution_height);
+  } else {
+    (void)snprintf(resolution, sizeof(resolution), "default");
+  }
+
+  runtime_logf("Display config: GLOOM.INI=%s",
+               config->ini_loaded ? config->ini_path : "not found; using built-in defaults");
+#ifdef GLOOM_DOS_SDL3
+  runtime_logf("Display config: DOS indexed software framebuffer resolution=%s framebuffer=%dx%d window=%dx%d",
+               resolution, render_width, render_height, window_width, window_height);
+#else
+  runtime_logf("Display config: software framebuffer resolution=%s framebuffer=%dx%d window=%dx%d", resolution,
+               render_width, render_height, window_width, window_height);
+#endif
+}
+
+/* amiga/gloom2.s draws through drawall into chunky pixels, then doc2p presents them.
+   The PC runtime keeps that software framebuffer flow and asks SDL for its software presenter. */
+static SDL_Renderer *create_runtime_renderer(SDL_Window *window) {
+  if (window == NULL) {
+    return NULL;
+  }
+
+  (void)SDL_SetHint(SDL_HINT_RENDER_DRIVER, "software");
+  return SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+}
+
+static void report_runtime_renderer_backend(SDL_Renderer *renderer) {
+#ifdef GLOOM_DOS_SDL3
+  const char *name = renderer != NULL ? SDL_GetRendererName(renderer) : NULL;
+
+  if (name != NULL) {
+    runtime_logf("Presentation backend: SDL %s renderer (software framebuffer)", name);
+  } else {
+    runtime_logf("Presentation backend: software framebuffer");
+  }
+#else
+  SDL_RendererInfo info;
+
+  memset(&info, 0, sizeof(info));
+  if (renderer != NULL && SDL_GetRendererInfo(renderer, &info) == 0 && info.name != NULL) {
+    runtime_logf("Presentation backend: SDL %s renderer (software framebuffer)", info.name);
+  } else {
+    runtime_logf("Presentation backend: software framebuffer");
+  }
+#endif
+}
+
 int main(int argc, char **argv) {
   const char *map_path = "amiga/maps/map1_1";
   const char *resolved_map_path = map_path;
@@ -22285,7 +22388,6 @@ int main(int argc, char **argv) {
     render_height = window_height;
     explicit_resolution = true;
   }
-
   if (argc > 1 && strcmp(argv[1], "--version") == 0) {
     printf("%s\n", runtime_title());
     return 0;
@@ -22703,6 +22805,7 @@ int main(int argc, char **argv) {
     window_height = render_height;
   }
   configure_runtime_gameplay_viewport(render_width, render_height);
+  log_runtime_display_config(&g_runtime_display_ini, render_width, render_height, window_width, window_height);
   gamepad_init();
 
 #ifdef GLOOM_DOS_SDL3
@@ -22757,10 +22860,7 @@ int main(int argc, char **argv) {
   configure_dos_index_display_mode(window, render_width, render_height);
 #endif
 
-  renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
-  if (renderer == NULL) {
-    renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
-  }
+  renderer = create_runtime_renderer(window);
   if (renderer == NULL) {
     fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
     SDL_DestroyWindow(window);
@@ -22778,6 +22878,7 @@ int main(int argc, char **argv) {
     gloom_map_free(&state.map);
     return 1;
   }
+  report_runtime_renderer_backend(renderer);
 #ifdef GLOOM_DOS_SDL3
   dos_logf("DOS checkpoint: SDL_CreateRenderer ok");
   fprintf(stderr, "DOS checkpoint: SDL_CreateRenderer ok\n");

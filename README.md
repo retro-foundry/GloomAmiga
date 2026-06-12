@@ -30,6 +30,10 @@ walls, flats, sprites, weapon art, menu/screen artwork, and fonts.
 HD art packs may be partial: any wall, flat, sprite, weapon, menu image, or font replacement that is not present
 falls back to the original SD asset at runtime.
 
+`GLOOM.INI` controls the software framebuffer size with `resolution=WIDTHxHEIGHT`, plus optional viewport, HD art,
+control-source, and keyboard settings. Windows reads `GLOOM.INI` from the game/executable directory and writes the
+loaded INI path plus final framebuffer/window size to `GLOOM.LOG` next to `gloom_pc.exe`.
+
 The runtime consumes the source-derived layout emitted by `tools/extract_amiga_art.py`: menu and script pictures can
 come from `art/form/<asset-key>/frame_0001.png` or `art/trimmed_pictures/<asset-key>.png`, while HD font glyphs can
 come from `art/blit`, `art/blit2`, or `art/objects` glyph/frame folders. Use
