@@ -71,7 +71,7 @@ add_executable(gloom_pc
 
 set_target_properties(gloom_pc PROPERTIES
   VS_DEBUGGER_WORKING_DIRECTORY "$<TARGET_FILE_DIR:gloom_pc>"
-  VS_DPI_AWARE OFF
+  VS_DPI_AWARE PerMonitor
 )
 
 if(EMSCRIPTEN)
@@ -145,9 +145,10 @@ add_custom_command(TARGET gloom_pc POST_BUILD
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
     "${CMAKE_SOURCE_DIR}/package/README.TXT"
     "$<TARGET_FILE_DIR:gloom_pc>/README.TXT"
-  COMMAND ${CMAKE_COMMAND} -E copy_if_different
-    "${CMAKE_SOURCE_DIR}/package/GLOOM.INI"
-    "$<TARGET_FILE_DIR:gloom_pc>/GLOOM.INI"
+  COMMAND ${CMAKE_COMMAND}
+    -Dsrc="${CMAKE_SOURCE_DIR}/package/GLOOM.INI"
+    -Ddst="$<TARGET_FILE_DIR:gloom_pc>/GLOOM.INI"
+    -P "${CMAKE_SOURCE_DIR}/cmake/copy_if_missing.cmake"
   COMMAND ${CMAKE_COMMAND} -E copy_if_different
     "${CMAKE_SOURCE_DIR}/amiga/combat.iff"
     "${CMAKE_SOURCE_DIR}/amiga/title.iff"

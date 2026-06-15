@@ -240,6 +240,7 @@ enum {
   GLOOM_MENU_SELECT_PAUSE_MS = 120,
   GLOOM_MENU_BIG_FONT_WIDTH = 8,
   GLOOM_MENU_BIG_FONT_HEIGHT = 10,
+  GLOOM_MENU_MAX_PIXEL_SCALE = 4,
   GLOOM_MENU_FLASH_TICKS = 13,
   GLOOM_GAMEPAD_COUNT = 2,
   GLOOM_GAMEPAD_MOVE_DEADZONE = 8000,
@@ -1736,6 +1737,8 @@ static void trim_trailing_slashes(char *path);
 static bool g_hd_art_enabled = false;
 static bool g_hd_art_render_enabled = false;
 static char g_hd_art_root[1024];
+static char g_live_menu_frame_dump_path[1024];
+static bool g_live_menu_frame_dump_written = false;
 
 static bool hd_art_render_enabled(void) {
   return g_hd_art_enabled && g_hd_art_render_enabled;
@@ -12849,14 +12852,40 @@ static void end_render_framebuffer(RenderFramebuffer *framebuffer) {
 
 static void present_framebuffer_texture(SDL_Renderer *renderer, const RenderFramebuffer *framebuffer, int render_width,
                                         int render_height) {
-  SDL_Rect dst = {0, 0, render_width, render_height};
+#ifdef GLOOM_DOS_SDL3
+  (void)render_width;
+  (void)render_height;
+#else
+  static bool logged_present_config = false;
+#endif
 
   if (renderer == NULL || framebuffer == NULL || framebuffer->texture == NULL) {
     return;
   }
+#ifndef GLOOM_DOS_SDL3
+  if (!logged_present_config) {
+    int output_width = 0;
+    int output_height = 0;
+    int logical_width = 0;
+    int logical_height = 0;
+    SDL_Rect viewport;
+    float scale_x = 0.0f;
+    float scale_y = 0.0f;
+
+    memset(&viewport, 0, sizeof(viewport));
+    (void)SDL_GetRendererOutputSize(renderer, &output_width, &output_height);
+    SDL_RenderGetLogicalSize(renderer, &logical_width, &logical_height);
+    SDL_RenderGetViewport(renderer, &viewport);
+    SDL_RenderGetScale(renderer, &scale_x, &scale_y);
+    runtime_logf("Presentation viewport: framebuffer=%dx%d logical=%dx%d output=%dx%d viewport=%d,%d %dx%d scale=%.3fx%.3f",
+                 render_width, render_height, logical_width, logical_height, output_width, output_height, viewport.x,
+                 viewport.y, viewport.w, viewport.h, scale_x, scale_y);
+    logged_present_config = true;
+  }
+#endif
   SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
   SDL_RenderClear(renderer);
-  (void)SDL_RenderCopy(renderer, framebuffer->texture, NULL, &dst);
+  (void)SDL_RenderCopy(renderer, framebuffer->texture, NULL, NULL);
   SDL_RenderPresent(renderer);
 #ifdef GLOOM_DOS_SDL3
   audio_dos_pump(&g_audio);
@@ -15965,7 +15994,7 @@ static int menu_pixel_scale_for_viewport(int render_width, int render_height) {
   if (scale < 1) {
     return 1;
   }
-  while (power * 2 <= scale && power < 8) {
+  while (power * 2 <= scale && power < GLOOM_MENU_MAX_PIXEL_SCALE) {
     power *= 2;
   }
   return power;
@@ -16004,70 +16033,69 @@ static const uint32_t *menu_image_argb_pixels(const MenuImage *image, int *out_w
   return image->pixels;
 }
 
-static uint32_t menu_image_sample_argb_logical(const MenuImage *image, int logical_x, int logical_y) {
-  const uint32_t *pixels = NULL;
-  int pixel_width = 0;
-  int pixel_height = 0;
-  int sample_x = 0;
-  int sample_y = 0;
-
-  if (image == NULL || image->width <= 0 || image->height <= 0) {
-    return 0xFF000000u;
+static void menu_image_active_dimensions(const MenuImage *image, int *out_width, int *out_height) {
+  if (out_width != NULL) {
+    *out_width = 0;
   }
-  pixels = menu_image_argb_pixels(image, &pixel_width, &pixel_height);
-  if (pixels == NULL || pixel_width <= 0 || pixel_height <= 0) {
-    return 0xFF000000u;
+  if (out_height != NULL) {
+    *out_height = 0;
   }
-
-  if (logical_x < 0) logical_x = 0;
-  if (logical_y < 0) logical_y = 0;
-  if (logical_x >= image->width) logical_x = image->width - 1;
-  if (logical_y >= image->height) logical_y = image->height - 1;
-
-  sample_x = (int)(((int64_t)logical_x * (int64_t)pixel_width) / (int64_t)image->width);
-  sample_y = (int)(((int64_t)logical_y * (int64_t)pixel_height) / (int64_t)image->height);
-  if (sample_x < 0) sample_x = 0;
-  if (sample_y < 0) sample_y = 0;
-  if (sample_x >= pixel_width) sample_x = pixel_width - 1;
-  if (sample_y >= pixel_height) sample_y = pixel_height - 1;
-  return pixels[(size_t)sample_y * (size_t)pixel_width + (size_t)sample_x];
+  if (image == NULL) {
+    return;
+  }
+  if (menu_image_hd_active(image)) {
+    if (out_width != NULL) {
+      *out_width = image->hd_width;
+    }
+    if (out_height != NULL) {
+      *out_height = image->hd_height;
+    }
+    return;
+  }
+  if (out_width != NULL) {
+    *out_width = image->width;
+  }
+  if (out_height != NULL) {
+    *out_height = image->height;
+  }
 }
 
-static MenuImageFitRect menu_image_fit_rect(const MenuImage *image, int render_width, int render_height) {
+static MenuImageFitRect menu_image_fit_rect_for_dimensions(int image_width, int image_height, int render_width,
+                                                           int render_height) {
   MenuImageFitRect rect = {0, 0, 0, 0};
 
-  if (image == NULL || image->width <= 0 || image->height <= 0 || render_width <= 0 || render_height <= 0) {
+  if (image_width <= 0 || image_height <= 0 || render_width <= 0 || render_height <= 0) {
     return rect;
   }
 
-  if ((int64_t)render_width * (int64_t)image->height <= (int64_t)render_height * (int64_t)image->width) {
-    rect.w = render_width;
-    rect.h = (int)(((int64_t)render_width * (int64_t)image->height) / (int64_t)image->width);
-    if (rect.h <= 0) {
-      rect.h = 1;
-    }
-  } else {
-    rect.h = render_height;
-    rect.w = (int)(((int64_t)render_height * (int64_t)image->width) / (int64_t)image->height);
-    if (rect.w <= 0) {
-      rect.w = 1;
-    }
-  }
-  if (rect.w > render_width) {
-    rect.w = render_width;
-  }
-  if (rect.h > render_height) {
-    rect.h = render_height;
+  rect.h = render_height;
+  rect.w = (int)(((int64_t)render_height * (int64_t)image_width) / (int64_t)image_height);
+  if (rect.w <= 0) {
+    rect.w = 1;
   }
   rect.x = (render_width - rect.w) / 2;
-  rect.y = (render_height - rect.h) / 2;
+  rect.y = 0;
   return rect;
+}
+
+static MenuImageFitRect menu_image_fit_rect(const MenuImage *image, int render_width, int render_height) {
+  int image_width = 0;
+  int image_height = 0;
+
+  menu_image_active_dimensions(image, &image_width, &image_height);
+  return menu_image_fit_rect_for_dimensions(image_width, image_height, render_width, render_height);
 }
 
 static void render_menu_image(RenderFramebuffer *framebuffer, const MenuImage *image, int render_width,
                               int render_height) {
   int dst_y = 0;
   bool using_hd_image = false;
+#ifdef GLOOM_DOS_SDL3
+  bool using_original_dos_indices = false;
+#endif
+  const uint32_t *source_pixels = NULL;
+  int source_width = 0;
+  int source_height = 0;
   MenuImageFitRect fit_rect;
 
   if (framebuffer == NULL || image == NULL || !image->loaded) {
@@ -16094,7 +16122,24 @@ static void render_menu_image(RenderFramebuffer *framebuffer, const MenuImage *i
 #endif
 
   using_hd_image = menu_image_hd_active(image);
-  fit_rect = menu_image_fit_rect(image, render_width, render_height);
+#ifdef GLOOM_DOS_SDL3
+  using_original_dos_indices = !using_hd_image && g_dos_menu_palette_active && image->indices != NULL;
+  if (using_original_dos_indices) {
+    source_width = image->width;
+    source_height = image->height;
+  } else {
+    source_pixels = menu_image_argb_pixels(image, &source_width, &source_height);
+    if (source_pixels == NULL || source_width <= 0 || source_height <= 0) {
+      return;
+    }
+  }
+#else
+  source_pixels = menu_image_argb_pixels(image, &source_width, &source_height);
+  if (source_pixels == NULL || source_width <= 0 || source_height <= 0) {
+    return;
+  }
+#endif
+  fit_rect = menu_image_fit_rect_for_dimensions(source_width, source_height, render_width, render_height);
   if (fit_rect.w <= 0 || fit_rect.h <= 0) {
     return;
   }
@@ -16120,27 +16165,99 @@ static void render_menu_image(RenderFramebuffer *framebuffer, const MenuImage *i
         continue;
       }
 
-      src_x = ((int64_t)(dst_x - fit_rect.x) * (int64_t)image->width) / (int64_t)fit_rect.w;
-      src_y = ((int64_t)(dst_y - fit_rect.y) * (int64_t)image->height) / (int64_t)fit_rect.h;
+      src_x = ((int64_t)(dst_x - fit_rect.x) * (int64_t)source_width) / (int64_t)fit_rect.w;
+      src_y = ((int64_t)(dst_y - fit_rect.y) * (int64_t)source_height) / (int64_t)fit_rect.h;
       if (src_x < 0) src_x = 0;
       if (src_y < 0) src_y = 0;
-      if (src_x >= image->width) src_x = image->width - 1;
-      if (src_y >= image->height) src_y = image->height - 1;
+      if (src_x >= source_width) src_x = source_width - 1;
+      if (src_y >= source_height) src_y = source_height - 1;
 #ifdef GLOOM_DOS_SDL3
-      if (!using_hd_image && g_dos_menu_palette_active && image->indices != NULL) {
+      if (using_original_dos_indices) {
         dst_row[dst_x] = image->indices[(size_t)src_y * (size_t)image->width + (size_t)src_x];
       } else {
-        dst_row[dst_x] = dos_argb_to_index(menu_image_sample_argb_logical(image, (int)src_x, (int)src_y));
+        dst_row[dst_x] =
+            dos_argb_to_index(source_pixels[(size_t)src_y * (size_t)source_width + (size_t)src_x]);
       }
 #else
       {
-        uint32_t argb = menu_image_sample_argb_logical(image, (int)src_x, (int)src_y);
+        uint32_t argb = source_pixels[(size_t)src_y * (size_t)source_width + (size_t)src_x];
 
         dst_row[dst_x] = (argb >> 24u) == 0u ? 0xFF000000u : (0xFF000000u | (argb & 0x00FFFFFFu));
       }
 #endif
     }
   }
+}
+
+static void clear_menu_image_side_bars(RenderFramebuffer *framebuffer, const MenuImage *image, int render_width,
+                                       int render_height) {
+  MenuImageFitRect rect;
+  int y = 0;
+  int right_x = 0;
+
+  if (framebuffer == NULL || image == NULL || render_width <= 0 || render_height <= 0) {
+    return;
+  }
+
+  rect = menu_image_fit_rect(image, render_width, render_height);
+  if (rect.x <= 0) {
+    return;
+  }
+
+  right_x = rect.x + rect.w;
+  if (right_x < 0) {
+    right_x = 0;
+  }
+  if (right_x > render_width) {
+    right_x = render_width;
+  }
+
+  for (y = 0; y < render_height; ++y) {
+    framebuffer_clear_row_span(framebuffer, y, 0, rect.x, 0xFF000000u);
+    framebuffer_clear_row_span(framebuffer, y, right_x, render_width - right_x, 0xFF000000u);
+  }
+}
+
+static bool write_argb_bmp_file(const char *path, const uint32_t *pixels, int width, int height, int pitch_pixels);
+
+static void maybe_write_live_menu_frame_dump(RenderFramebuffer *framebuffer, int render_width, int render_height) {
+#ifndef GLOOM_DOS_SDL3
+  if (g_live_menu_frame_dump_written || g_live_menu_frame_dump_path[0] == '\0') {
+    return;
+  }
+  g_live_menu_frame_dump_written = true;
+  if (framebuffer == NULL || framebuffer->pixels == NULL || framebuffer->pitch_pixels < framebuffer->width) {
+    runtime_logf("Live menu frame dump failed: framebuffer was not locked");
+    return;
+  }
+  if (write_argb_bmp_file(g_live_menu_frame_dump_path, framebuffer->pixels, render_width, render_height,
+                          framebuffer->pitch_pixels)) {
+    runtime_logf("Live menu frame dump: wrote %s (%dx%d)", g_live_menu_frame_dump_path, render_width, render_height);
+  } else {
+    runtime_logf("Live menu frame dump failed: could not write %s", g_live_menu_frame_dump_path);
+  }
+#else
+  (void)framebuffer;
+  (void)render_width;
+  (void)render_height;
+#endif
+}
+
+static void log_start_menu_title_fit_once(const MenuAssets *assets, int render_width, int render_height) {
+  static bool logged = false;
+  int active_w = 0;
+  int active_h = 0;
+  MenuImageFitRect rect;
+
+  if (logged || assets == NULL) {
+    return;
+  }
+  logged = true;
+  menu_image_active_dimensions(&assets->title, &active_w, &active_h);
+  rect = menu_image_fit_rect(&assets->title, render_width, render_height);
+  runtime_logf("Menu title fit: active_art=%dx%d logical_art=%dx%d framebuffer=%dx%d rect=%d,%d %dx%d",
+               active_w, active_h, assets->title.width, assets->title.height, render_width, render_height, rect.x,
+               rect.y, rect.w, rect.h);
 }
 
 static void menu_image_content_bounds(const MenuImage *image, int *out_x, int *out_y, int *out_w, int *out_h) {
@@ -16413,6 +16530,7 @@ static void compute_start_menu_layout(int render_width, int render_height, int i
   int logo_scale = 1;
   int logo_area_top = 0;
   int logo_area_h = 0;
+  int logo_bottom_limit = 0;
   int menu_bottom = 0;
 
   if (out_layout == NULL) {
@@ -16457,9 +16575,17 @@ static void compute_start_menu_layout(int render_width, int render_height, int i
     layout.title_y = top_margin;
   }
   logo_area_top = menu_bottom + menu_logo_gap;
-  logo_max_h = layout.credit_y - logo_credit_gap - logo_area_top;
+  logo_bottom_limit = layout.credit_y - logo_credit_gap;
+  if (logo_bottom_limit > render_height - bottom_margin) {
+    logo_bottom_limit = render_height - bottom_margin;
+  }
+  logo_area_h = logo_bottom_limit - logo_area_top;
+  logo_max_h = logo_area_h;
   if (logo_max_h > 144 * layout.scale) {
     logo_max_h = 144 * layout.scale;
+  }
+  if (logo_max_h > render_height / 4) {
+    logo_max_h = render_height / 4;
   }
   if (logo_src_w > 0 && logo_src_h > 0 && logo_max_w > 0 && logo_max_h > 0) {
     while (logo_scale < layout.scale && (logo_src_w * (logo_scale + 1)) <= logo_max_w &&
@@ -16488,11 +16614,16 @@ static void compute_start_menu_layout(int render_width, int render_height, int i
       layout.logo_h = 0;
     }
   }
-  logo_area_h = layout.credit_y - logo_credit_gap - logo_area_top;
   layout.logo_x = (render_width - layout.logo_w) / 2;
   layout.logo_y = logo_area_top;
   if (layout.logo_h > 0 && logo_area_h > layout.logo_h) {
     layout.logo_y += (logo_area_h - layout.logo_h) / 2;
+  }
+  if (layout.logo_h > 0 && layout.logo_y + layout.logo_h > logo_bottom_limit) {
+    layout.logo_y = logo_bottom_limit - layout.logo_h;
+  }
+  if (layout.logo_y < logo_area_top) {
+    layout.logo_y = logo_area_top;
   }
 
   *out_layout = layout;
@@ -16632,7 +16763,9 @@ static bool cache_start_menu_background(RenderFramebuffer *framebuffer, const Me
   }
 
   framebuffer_clear(framebuffer, 0xFF000000u);
+  log_start_menu_title_fit_once(assets, render_width, render_height);
   render_menu_image(framebuffer, &assets->title, render_width, render_height);
+  clear_menu_image_side_bars(framebuffer, &assets->title, render_width, render_height);
 
   compute_start_menu_layout(render_width, render_height, start_menu_item_count(), g_start_menu_logo_src_w,
                             g_start_menu_logo_src_h, &layout);
@@ -16685,7 +16818,9 @@ static bool cache_start_menu_background_dos_indices(RenderFramebuffer *framebuff
   }
 
   framebuffer_clear(framebuffer, 0xFF000000u);
+  log_start_menu_title_fit_once(assets, render_width, render_height);
   render_menu_image(framebuffer, &assets->title, render_width, render_height);
+  clear_menu_image_side_bars(framebuffer, &assets->title, render_width, render_height);
 
   compute_start_menu_layout(render_width, render_height, start_menu_item_count(), g_start_menu_logo_src_w,
                             g_start_menu_logo_src_h, &layout);
@@ -16937,15 +17072,19 @@ static void render_start_menu_frame(RenderFramebuffer *framebuffer, const MenuAs
     copy_menu_background(framebuffer, background, render_width, render_height);
   } else {
     framebuffer_clear(framebuffer, 0xFF000000u);
+    log_start_menu_title_fit_once(assets, render_width, render_height);
     render_menu_image(framebuffer, &assets->title, render_width, render_height);
   }
+  clear_menu_image_side_bars(framebuffer, &assets->title, render_width, render_height);
 #else
   if (background != NULL) {
     copy_menu_background(framebuffer, background, render_width, render_height);
   } else {
     framebuffer_clear(framebuffer, 0xFF000000u);
+    log_start_menu_title_fit_once(assets, render_width, render_height);
     render_menu_image(framebuffer, &assets->title, render_width, render_height);
   }
+  clear_menu_image_side_bars(framebuffer, &assets->title, render_width, render_height);
 #endif
 
   scale = menu_pixel_scale_for_viewport(render_width, render_height);
@@ -17177,6 +17316,7 @@ static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer
       render_start_menu_frame(framebuffer, assets, menu_background_cache, NULL, render_width, render_height, selected_index,
                               selected_visible, *io_violence_mode, io_control_config);
 #endif
+      maybe_write_live_menu_frame_dump(framebuffer, render_width, render_height);
       end_render_framebuffer(framebuffer);
       present_framebuffer_texture(renderer, framebuffer, render_width, render_height);
 #ifdef __EMSCRIPTEN__
@@ -19796,6 +19936,52 @@ static int run_menu_selftest(void) {
     free_menu_assets(&assets);
     return 1;
   }
+  {
+    MenuImage hd_sample_image;
+    RenderFramebuffer hd_sample_framebuffer;
+    uint32_t logical_pixels[4] = {0xFF000000u, 0xFFFFFFFFu, 0xFFFFFFFFu, 0xFF000000u};
+    uint32_t hd_pixels[16];
+    uint32_t rendered_pixels[64];
+    bool old_hd_art_enabled = g_hd_art_enabled;
+    bool old_hd_art_render_enabled = g_hd_art_render_enabled;
+    int y = 0;
+
+    memset(&hd_sample_image, 0, sizeof(hd_sample_image));
+    memset(&hd_sample_framebuffer, 0, sizeof(hd_sample_framebuffer));
+    memset(rendered_pixels, 0, sizeof(rendered_pixels));
+    for (y = 0; y < 4; ++y) {
+      int x = 0;
+
+      for (x = 0; x < 4; ++x) {
+        hd_pixels[(size_t)y * 4u + (size_t)x] =
+            0xFF000000u | ((uint32_t)(x * 0x40) << 16u) | ((uint32_t)(y * 0x20) << 8u);
+      }
+    }
+    hd_sample_image.loaded = true;
+    hd_sample_image.pixels = logical_pixels;
+    hd_sample_image.hd_pixels = hd_pixels;
+    hd_sample_image.width = 2;
+    hd_sample_image.height = 2;
+    hd_sample_image.hd_width = 4;
+    hd_sample_image.hd_height = 4;
+    hd_sample_framebuffer.pixels = rendered_pixels;
+    hd_sample_framebuffer.width = 8;
+    hd_sample_framebuffer.height = 8;
+    hd_sample_framebuffer.pitch_pixels = 8;
+
+    g_hd_art_enabled = true;
+    g_hd_art_render_enabled = true;
+    render_menu_image(&hd_sample_framebuffer, &hd_sample_image, 8, 8);
+    g_hd_art_enabled = old_hd_art_enabled;
+    g_hd_art_render_enabled = old_hd_art_render_enabled;
+
+    if ((rendered_pixels[(size_t)2 * 8u + 2u] & 0x00FF0000u) != 0x00400000u ||
+        (rendered_pixels[(size_t)2 * 8u + 4u] & 0x00FF0000u) != 0x00800000u) {
+      fprintf(stderr, "Menu selftest failed: HD menu image sampling collapsed through logical pixels\n");
+      free_menu_assets(&assets);
+      return 1;
+    }
+  }
   if (g_hd_art_enabled) {
     MenuImage script_picture;
 
@@ -19846,7 +20032,7 @@ static int run_menu_selftest(void) {
     const int render_width = 3480;
     const int render_height = 2160;
     const int item_count = start_menu_item_count();
-    const int expected_scale = 8;
+    const int expected_scale = GLOOM_MENU_MAX_PIXEL_SCALE;
     int logo_src_x = 0;
     int logo_src_y = 0;
     int logo_src_w = 0;
@@ -19856,6 +20042,7 @@ static int run_menu_selftest(void) {
     int credit_bottom = 0;
     int expected_menu_y = 0;
     MenuImageFitRect title_rect;
+    MenuImageFitRect hd_canvas_title_rect;
     StartMenuLayout layout;
 
     memset(&layout, 0, sizeof(layout));
@@ -19863,6 +20050,21 @@ static int run_menu_selftest(void) {
     (void)logo_src_x;
     (void)logo_src_y;
     title_rect = menu_image_fit_rect(&assets.title, render_width, render_height);
+    {
+      MenuImage hd_canvas_title = assets.title;
+      uint32_t dummy_pixel = 0xFF000000u;
+      bool old_hd_art_enabled = g_hd_art_enabled;
+      bool old_hd_art_render_enabled = g_hd_art_render_enabled;
+
+      hd_canvas_title.hd_pixels = &dummy_pixel;
+      hd_canvas_title.hd_width = 3840;
+      hd_canvas_title.hd_height = 2160;
+      g_hd_art_enabled = true;
+      g_hd_art_render_enabled = true;
+      hd_canvas_title_rect = menu_image_fit_rect(&hd_canvas_title, 3840, 2160);
+      g_hd_art_enabled = old_hd_art_enabled;
+      g_hd_art_render_enabled = old_hd_art_render_enabled;
+    }
     compute_start_menu_layout(render_width, render_height, item_count, logo_src_w, logo_src_h, &layout);
     row_height = GLOOM_MENU_BIG_FONT_HEIGHT * layout.scale;
     menu_bottom = layout.menu_y + (item_count * row_height);
@@ -19883,11 +20085,19 @@ static int run_menu_selftest(void) {
       free_menu_assets(&assets);
       return 1;
     }
+    if (hd_canvas_title_rect.x != 0 || hd_canvas_title_rect.y != 0 || hd_canvas_title_rect.w != 3840 ||
+        hd_canvas_title_rect.h != 2160) {
+      fprintf(stderr,
+              "Menu selftest failed: HD canvas title image fit was %d,%d %dx%d, expected 0,0 3840x2160\n",
+              hd_canvas_title_rect.x, hd_canvas_title_rect.y, hd_canvas_title_rect.w, hd_canvas_title_rect.h);
+      free_menu_assets(&assets);
+      return 1;
+    }
     if (layout.menu_y != expected_menu_y || layout.title_y < 0 ||
         layout.title_y + (GLOOM_MENU_BIG_FONT_HEIGHT * layout.title_scale) > layout.menu_y ||
         menu_bottom > render_height || layout.credit_y < menu_bottom || credit_bottom > render_height ||
         layout.logo_w <= 0 || layout.logo_h <= 0 || layout.logo_y < menu_bottom ||
-        layout.logo_y + layout.logo_h > layout.credit_y) {
+        layout.logo_y + layout.logo_h > layout.credit_y || layout.logo_y + layout.logo_h > render_height) {
       fprintf(stderr, "Menu selftest failed: 3480x2160 start menu layout did not fit the framebuffer\n");
       free_menu_assets(&assets);
       return 1;
@@ -19900,11 +20110,236 @@ static int run_menu_selftest(void) {
       free_menu_assets(&assets);
       return 1;
     }
+    {
+      const int screenshot_width = 2048;
+      const int screenshot_height = 1152;
+      MenuImageFitRect screenshot_title_rect =
+          menu_image_fit_rect(&assets.title, screenshot_width, screenshot_height);
+      StartMenuLayout screenshot_layout;
+
+      memset(&screenshot_layout, 0, sizeof(screenshot_layout));
+      compute_start_menu_layout(screenshot_width, screenshot_height, item_count, logo_src_w, logo_src_h,
+                                &screenshot_layout);
+      if (screenshot_title_rect.x != 304 || screenshot_title_rect.y != 0 ||
+          screenshot_title_rect.w != 1440 || screenshot_title_rect.h != screenshot_height) {
+        fprintf(stderr,
+                "Menu selftest failed: 2048x1152 title image fit was %d,%d %dx%d, expected 304,0 1440x1152\n",
+                screenshot_title_rect.x, screenshot_title_rect.y, screenshot_title_rect.w,
+                screenshot_title_rect.h);
+        free_menu_assets(&assets);
+        return 1;
+      }
+#ifndef GLOOM_DOS_SDL3
+      {
+        RenderFramebuffer screenshot_framebuffer;
+        uint32_t *screenshot_pixels = NULL;
+        uint32_t *screenshot_cache = NULL;
+        size_t screenshot_cache_capacity = 0u;
+        const int bar_y = screenshot_height / 2;
+        const int right_bar_x = screenshot_title_rect.x + screenshot_title_rect.w;
+        const int old_logo_src_w = g_start_menu_logo_src_w;
+        const int old_logo_src_h = g_start_menu_logo_src_h;
+
+        memset(&screenshot_framebuffer, 0, sizeof(screenshot_framebuffer));
+        screenshot_pixels =
+            (uint32_t *)calloc((size_t)screenshot_width * (size_t)screenshot_height, sizeof(*screenshot_pixels));
+        if (screenshot_pixels == NULL) {
+          fprintf(stderr, "Menu selftest failed: could not allocate 2048x1152 menu framebuffer\n");
+          free_menu_assets(&assets);
+          return 1;
+        }
+        screenshot_framebuffer.pixels = screenshot_pixels;
+        screenshot_framebuffer.width = screenshot_width;
+        screenshot_framebuffer.height = screenshot_height;
+        screenshot_framebuffer.pitch_pixels = screenshot_width;
+        g_start_menu_logo_src_w = logo_src_w;
+        g_start_menu_logo_src_h = logo_src_h;
+        if (!cache_start_menu_background(&screenshot_framebuffer, &assets, screenshot_width, screenshot_height,
+                                         &screenshot_cache, &screenshot_cache_capacity)) {
+          fprintf(stderr, "Menu selftest failed: could not render 2048x1152 start-menu background\n");
+          g_start_menu_logo_src_w = old_logo_src_w;
+          g_start_menu_logo_src_h = old_logo_src_h;
+          free(screenshot_cache);
+          free(screenshot_pixels);
+          free_menu_assets(&assets);
+          return 1;
+        }
+        render_start_menu_frame(&screenshot_framebuffer, &assets, screenshot_cache, NULL, screenshot_width,
+                                screenshot_height, 0, true, GLOOM_VIOLENCE_MEATY_MESSY, NULL);
+        g_start_menu_logo_src_w = old_logo_src_w;
+        g_start_menu_logo_src_h = old_logo_src_h;
+        if (screenshot_title_rect.x <= 0 || right_bar_x >= screenshot_width ||
+            screenshot_pixels[(size_t)bar_y * (size_t)screenshot_width] != 0xFF000000u ||
+            screenshot_pixels[(size_t)bar_y * (size_t)screenshot_width + (size_t)(screenshot_title_rect.x - 1)] !=
+                0xFF000000u ||
+            screenshot_pixels[(size_t)bar_y * (size_t)screenshot_width + (size_t)right_bar_x] != 0xFF000000u ||
+            screenshot_pixels[(size_t)bar_y * (size_t)screenshot_width + (size_t)(screenshot_width - 1)] !=
+                0xFF000000u) {
+          fprintf(stderr, "Menu selftest failed: 2048x1152 start-menu background did not keep black side bars\n");
+          free(screenshot_cache);
+          free(screenshot_pixels);
+          free_menu_assets(&assets);
+          return 1;
+        }
+        free(screenshot_cache);
+        free(screenshot_pixels);
+      }
+#endif
+      if (screenshot_layout.logo_w <= 0 || screenshot_layout.logo_h <= 0 ||
+          screenshot_layout.logo_y + screenshot_layout.logo_h > screenshot_height ||
+          screenshot_layout.logo_y + screenshot_layout.logo_h > screenshot_layout.credit_y) {
+        fprintf(stderr, "Menu selftest failed: 2048x1152 Black Magic logo did not fit the framebuffer\n");
+        free_menu_assets(&assets);
+        return 1;
+      }
+    }
   }
 
   free_menu_assets(&assets);
   printf("Menu selftest passed\n");
   return 0;
+}
+
+static bool write_argb_bmp_file(const char *path, const uint32_t *pixels, int width, int height, int pitch_pixels) {
+  FILE *f = NULL;
+  uint32_t row_bytes = 0u;
+  uint32_t padded_row_bytes = 0u;
+  uint32_t pixel_bytes = 0u;
+  uint32_t file_bytes = 0u;
+  uint8_t header[54];
+  int y = 0;
+
+  if (path == NULL || pixels == NULL || width <= 0 || height <= 0 || pitch_pixels < width) {
+    return false;
+  }
+  row_bytes = (uint32_t)width * 3u;
+  padded_row_bytes = (row_bytes + 3u) & ~3u;
+  pixel_bytes = padded_row_bytes * (uint32_t)height;
+  file_bytes = 54u + pixel_bytes;
+
+  memset(header, 0, sizeof(header));
+  header[0] = 'B';
+  header[1] = 'M';
+  header[2] = (uint8_t)(file_bytes & 0xFFu);
+  header[3] = (uint8_t)((file_bytes >> 8u) & 0xFFu);
+  header[4] = (uint8_t)((file_bytes >> 16u) & 0xFFu);
+  header[5] = (uint8_t)((file_bytes >> 24u) & 0xFFu);
+  header[10] = 54u;
+  header[14] = 40u;
+  header[18] = (uint8_t)((uint32_t)width & 0xFFu);
+  header[19] = (uint8_t)(((uint32_t)width >> 8u) & 0xFFu);
+  header[20] = (uint8_t)(((uint32_t)width >> 16u) & 0xFFu);
+  header[21] = (uint8_t)(((uint32_t)width >> 24u) & 0xFFu);
+  header[22] = (uint8_t)((uint32_t)height & 0xFFu);
+  header[23] = (uint8_t)(((uint32_t)height >> 8u) & 0xFFu);
+  header[24] = (uint8_t)(((uint32_t)height >> 16u) & 0xFFu);
+  header[25] = (uint8_t)(((uint32_t)height >> 24u) & 0xFFu);
+  header[26] = 1u;
+  header[28] = 24u;
+  header[34] = (uint8_t)(pixel_bytes & 0xFFu);
+  header[35] = (uint8_t)((pixel_bytes >> 8u) & 0xFFu);
+  header[36] = (uint8_t)((pixel_bytes >> 16u) & 0xFFu);
+  header[37] = (uint8_t)((pixel_bytes >> 24u) & 0xFFu);
+
+  f = fopen(path, "wb");
+  if (f == NULL) {
+    return false;
+  }
+  if (fwrite(header, 1u, sizeof(header), f) != sizeof(header)) {
+    fclose(f);
+    return false;
+  }
+  for (y = height - 1; y >= 0; --y) {
+    const uint32_t *src = pixels + ((size_t)y * (size_t)pitch_pixels);
+    int x = 0;
+    uint32_t written = 0u;
+
+    for (x = 0; x < width; ++x) {
+      uint32_t argb = src[x];
+      fputc((int)(argb & 0xFFu), f);
+      fputc((int)((argb >> 8u) & 0xFFu), f);
+      fputc((int)((argb >> 16u) & 0xFFu), f);
+      written += 3u;
+    }
+    while (written < padded_row_bytes) {
+      fputc(0, f);
+      ++written;
+    }
+  }
+  fclose(f);
+  return true;
+}
+
+static int run_menu_frame_dump(int argc, char **argv) {
+#ifdef GLOOM_DOS_SDL3
+  (void)argc;
+  (void)argv;
+  fprintf(stderr, "--menu-frame-dump is only available for ARGB menu builds\n");
+  return 1;
+#else
+  const char *path = NULL;
+  int render_width = 2048;
+  int render_height = 1152;
+  MenuAssets assets;
+  RenderFramebuffer framebuffer;
+  uint32_t *pixels = NULL;
+  uint32_t *cache = NULL;
+  size_t cache_capacity = 0u;
+  int logo_src_x = 0;
+  int logo_src_y = 0;
+  bool ok = false;
+
+  if (argc < 3) {
+    fprintf(stderr, "--menu-frame-dump requires an output BMP path\n");
+    return 1;
+  }
+  path = argv[2];
+  if (argc >= 4) {
+    if (sscanf(argv[3], "%dx%d", &render_width, &render_height) != 2 || render_width <= 0 || render_height <= 0) {
+      fprintf(stderr, "--menu-frame-dump size must be WIDTHxHEIGHT\n");
+      return 1;
+    }
+  }
+  if (argc >= 5 && !set_hd_art_root(argv[4])) {
+    return 1;
+  }
+
+  memset(&assets, 0, sizeof(assets));
+  memset(&framebuffer, 0, sizeof(framebuffer));
+  if (!load_menu_assets(&assets)) {
+    fprintf(stderr, "Menu frame dump failed: could not load menu assets\n");
+    return 1;
+  }
+  pixels = (uint32_t *)calloc((size_t)render_width * (size_t)render_height, sizeof(*pixels));
+  if (pixels == NULL) {
+    fprintf(stderr, "Menu frame dump failed: could not allocate %dx%d pixels\n", render_width, render_height);
+    free_menu_assets(&assets);
+    return 1;
+  }
+  framebuffer.pixels = pixels;
+  framebuffer.width = render_width;
+  framebuffer.height = render_height;
+  framebuffer.pitch_pixels = render_width;
+  menu_image_content_bounds(&assets.black_magic_logo, &logo_src_x, &logo_src_y, &g_start_menu_logo_src_w,
+                            &g_start_menu_logo_src_h);
+  (void)logo_src_x;
+  (void)logo_src_y;
+  ok = cache_start_menu_background(&framebuffer, &assets, render_width, render_height, &cache, &cache_capacity);
+  if (ok) {
+    render_start_menu_frame(&framebuffer, &assets, cache, NULL, render_width, render_height, 0, true,
+                            GLOOM_VIOLENCE_MEATY_MESSY, NULL);
+    ok = write_argb_bmp_file(path, pixels, render_width, render_height, render_width);
+  }
+  free(cache);
+  free(pixels);
+  free_menu_assets(&assets);
+  if (!ok) {
+    fprintf(stderr, "Menu frame dump failed writing %s\n", path);
+    return 1;
+  }
+  printf("Wrote menu frame dump %s (%dx%d)\n", path, render_width, render_height);
+  return 0;
+#endif
 }
 
 static int verify_texture_source_flat_selftest(const char *kind, const char *tag, size_t expected_raw_size,
@@ -22419,6 +22854,55 @@ static SDL_Renderer *create_runtime_renderer(SDL_Window *window) {
   return SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
 }
 
+static void configure_runtime_sdl_dpi_hints(void) {
+#if defined(_WIN32) && !defined(GLOOM_DOS_SDL3)
+  (void)SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
+  (void)SDL_SetHint(SDL_HINT_WINDOWS_DPI_SCALING, "0");
+  (void)SDL_SetHint(SDL_HINT_VIDEO_HIGHDPI_DISABLED, "1");
+  runtime_logf("DPI config: SDL_WINDOWS_DPI_AWARENESS=%s SDL_WINDOWS_DPI_SCALING=%s SDL_VIDEO_HIGHDPI_DISABLED=%s",
+               SDL_GetHint(SDL_HINT_WINDOWS_DPI_AWARENESS) != NULL ? SDL_GetHint(SDL_HINT_WINDOWS_DPI_AWARENESS)
+                                                                   : "(unset)",
+               SDL_GetHint(SDL_HINT_WINDOWS_DPI_SCALING) != NULL ? SDL_GetHint(SDL_HINT_WINDOWS_DPI_SCALING)
+                                                                  : "(unset)",
+               SDL_GetHint(SDL_HINT_VIDEO_HIGHDPI_DISABLED) != NULL ? SDL_GetHint(SDL_HINT_VIDEO_HIGHDPI_DISABLED)
+                                                                    : "(unset)");
+#endif
+}
+
+static void log_runtime_sdl_window_metrics(SDL_Window *window, SDL_Renderer *renderer, int requested_window_width,
+                                           int requested_window_height, int render_width, int render_height) {
+#ifndef GLOOM_DOS_SDL3
+  int window_width = 0;
+  int window_height = 0;
+  int output_width = 0;
+  int output_height = 0;
+  int display_index = -1;
+  float ddpi = 0.0f;
+  float hdpi = 0.0f;
+  float vdpi = 0.0f;
+
+  if (window == NULL || renderer == NULL) {
+    return;
+  }
+  SDL_GetWindowSize(window, &window_width, &window_height);
+  (void)SDL_GetRendererOutputSize(renderer, &output_width, &output_height);
+  display_index = SDL_GetWindowDisplayIndex(window);
+  if (display_index >= 0) {
+    (void)SDL_GetDisplayDPI(display_index, &ddpi, &hdpi, &vdpi);
+  }
+  runtime_logf("Window metrics: requested_window=%dx%d actual_window=%dx%d render=%dx%d renderer_output=%dx%d display=%d dpi=%.1f/%.1f/%.1f",
+               requested_window_width, requested_window_height, window_width, window_height, render_width,
+               render_height, output_width, output_height, display_index, ddpi, hdpi, vdpi);
+#else
+  (void)window;
+  (void)renderer;
+  (void)requested_window_width;
+  (void)requested_window_height;
+  (void)render_width;
+  (void)render_height;
+#endif
+}
+
 static void report_runtime_renderer_backend(SDL_Renderer *renderer) {
 #ifdef GLOOM_DOS_SDL3
   const char *name = renderer != NULL ? SDL_GetRendererName(renderer) : NULL;
@@ -22570,6 +23054,10 @@ int main(int argc, char **argv) {
     return run_menu_selftest();
   }
 
+  if (argc > 1 && strcmp(argv[1], "--menu-frame-dump") == 0) {
+    return run_menu_frame_dump(argc, argv);
+  }
+
   if (argc > 1 && strcmp(argv[1], "--hd-art-selftest") == 0) {
     int result = 0;
 
@@ -22644,6 +23132,16 @@ int main(int argc, char **argv) {
           return 1;
         }
         render_scale = (int)parsed;
+      } else if (strncmp(argv[argi], "--render-scale=", 15) == 0) {
+        const char *value = argv[argi] + 15;
+        char *end = NULL;
+        long parsed = strtol(value, &end, 10);
+
+        if (end == value || *end != '\0' || parsed < 1 || parsed > 6) {
+          fprintf(stderr, "--render-scale requires an integer value from 1 to 6\n");
+          return 1;
+        }
+        render_scale = (int)parsed;
       } else if (strcmp(argv[argi], "--window-size") == 0 || strcmp(argv[argi], "--resolution") == 0 ||
                  strcmp(argv[argi], "--boot-resolution") == 0) {
         char *end = NULL;
@@ -22666,6 +23164,23 @@ int main(int argc, char **argv) {
         }
         window_width = (int)parsed_width;
         window_height = (int)parsed_height;
+        render_width = window_width;
+        render_height = window_height;
+        explicit_resolution = true;
+      } else if (strncmp(argv[argi], "--window-size=", 14) == 0 ||
+                 strncmp(argv[argi], "--resolution=", 13) == 0 ||
+                 strncmp(argv[argi], "--boot-resolution=", 18) == 0) {
+        const char *value = strchr(argv[argi], '=');
+        int parsed_width = 0;
+        int parsed_height = 0;
+
+        if (value == NULL || !parse_ini_resolution_value(value + 1, 320, 7680, 200, 4320, &parsed_width,
+                                                         &parsed_height)) {
+          fprintf(stderr, "%s requires WIDTHxHEIGHT, width 320..7680, height 200..4320\n", argv[argi]);
+          return 1;
+        }
+        window_width = parsed_width;
+        window_height = parsed_height;
         render_width = window_width;
         render_height = window_height;
         explicit_resolution = true;
@@ -22693,6 +23208,17 @@ int main(int argc, char **argv) {
         }
         profile_render_frames = (uint32_t)parsed;
         skip_menu = true;
+      } else if (strncmp(argv[argi], "--profile-render=", 17) == 0) {
+        const char *value = argv[argi] + 17;
+        char *end = NULL;
+        long parsed = strtol(value, &end, 10);
+
+        if (end == value || *end != '\0' || parsed < 1 || parsed > 10000) {
+          fprintf(stderr, "--profile-render requires a frame count from 1 to 10000\n");
+          return 1;
+        }
+        profile_render_frames = (uint32_t)parsed;
+        skip_menu = true;
       } else if (strcmp(argv[argi], "--hd-art") == 0 || strcmp(argv[argi], "--hd-art-path") == 0) {
         if (argi + 1 >= argc) {
           fprintf(stderr, "%s requires a path, for example --hd-art D:\\art-HD-v1\n", argv[argi]);
@@ -22701,6 +23227,30 @@ int main(int argc, char **argv) {
         if (!set_hd_art_root(argv[++argi])) {
           return 1;
         }
+      } else if (strncmp(argv[argi], "--hd-art=", 9) == 0) {
+        if (!set_hd_art_root(argv[argi] + 9)) {
+          return 1;
+        }
+      } else if (strncmp(argv[argi], "--hd-art-path=", 14) == 0) {
+        if (!set_hd_art_root(argv[argi] + 14)) {
+          return 1;
+        }
+      } else if (strcmp(argv[argi], "--dump-menu-frame") == 0) {
+        if (argi + 1 >= argc || argv[argi + 1][0] == '\0' || strlen(argv[argi + 1]) >= sizeof(g_live_menu_frame_dump_path)) {
+          fprintf(stderr, "%s requires a BMP output path\n", argv[argi]);
+          return 1;
+        }
+        (void)snprintf(g_live_menu_frame_dump_path, sizeof(g_live_menu_frame_dump_path), "%s", argv[++argi]);
+        g_live_menu_frame_dump_written = false;
+      } else if (strncmp(argv[argi], "--dump-menu-frame=", 18) == 0) {
+        const char *value = argv[argi] + 18;
+
+        if (value[0] == '\0' || strlen(value) >= sizeof(g_live_menu_frame_dump_path)) {
+          fprintf(stderr, "--dump-menu-frame requires a BMP output path\n");
+          return 1;
+        }
+        (void)snprintf(g_live_menu_frame_dump_path, sizeof(g_live_menu_frame_dump_path), "%s", value);
+        g_live_menu_frame_dump_written = false;
       } else if (strcmp(argv[argi], "--player-projectiles") == 0 ||
                  strcmp(argv[argi], "--legacy-projectiles") == 0) {
         barrel_projectile_origin = false;
@@ -22710,6 +23260,9 @@ int main(int argc, char **argv) {
         violence_mode = GLOOM_VIOLENCE_MESSY;
       } else if (strcmp(argv[argi], "--meaty-messy") == 0 || strcmp(argv[argi], "--gore") == 0) {
         violence_mode = GLOOM_VIOLENCE_MEATY_MESSY;
+      } else if (strncmp(argv[argi], "--", 2) == 0) {
+        fprintf(stderr, "Unknown option: %s\n", argv[argi]);
+        return 1;
       } else {
         map_path = argv[argi];
       }
@@ -22723,6 +23276,7 @@ int main(int argc, char **argv) {
 #if GLOOM_RUNTIME_IS_BINARY
   printf("%s\n", runtime_title());
 #endif
+  runtime_logf("Build stamp: %s %s", __DATE__, __TIME__);
   if (g_hd_art_enabled) {
     printf("HD art root: %s\n", g_hd_art_root);
   }
@@ -22877,6 +23431,7 @@ int main(int argc, char **argv) {
 
   memset(&g_audio, 0, sizeof(g_audio));
   dos_logf("DOS checkpoint: before SDL_Init");
+  configure_runtime_sdl_dpi_hints();
 #ifdef GLOOM_DOS_SDL3
   SDL_SetHint(SDL_HINT_AUDIO_DRIVER, "soundblaster");
   SDL_SetHint(SDL_HINT_DOS_ALLOW_DIRECT_FRAMEBUFFER, "1");
@@ -23003,6 +23558,7 @@ int main(int argc, char **argv) {
     return 1;
   }
   report_runtime_renderer_backend(renderer);
+  log_runtime_sdl_window_metrics(window, renderer, window_width, window_height, render_width, render_height);
 #ifdef GLOOM_DOS_SDL3
   dos_logf("DOS checkpoint: SDL_CreateRenderer ok");
   fprintf(stderr, "DOS checkpoint: SDL_CreateRenderer ok\n");
