@@ -57,19 +57,29 @@
        directory before command-line options are applied:
 
          resolution=320x200
+         renderer=auto
+         hardware_resolution=1920x1080
          viewport_size=160x100
          viewport_pixel_size=2x2
 
-       resolution accepts the same WIDTHxHEIGHT values as --resolution.
+       resolution accepts the same WIDTHxHEIGHT values as --resolution and
+       controls the software/DOS framebuffer size. renderer accepts auto,
+       opengl, or software; auto prefers OpenGL/WebGL on desktop/web and
+       uses software on DOS. hardware_resolution controls the OpenGL/WebGL
+       logical render target and defaults to 1920x1080.
+       The OpenGL/WebGL path renders SD and HD floors/walls, blood, gun,
+       HUD, menus, red flash, and pixelate transitions on the GPU. SD
+       sprites/effects use the GPU path on the validated low comparison
+       target. Large hardware targets and HD sprite presentation still use
+       the software overlay.
        viewport_size enables an Amiga-style centered gameplay window.
        viewport_pixel_size accepts 1x1 or 2x2.
 
        GLOOM.INI controls the source-derived software framebuffer size,
-       optional viewport, HD art, control-source, and keyboard settings.
-       Windows writes the loaded GLOOM.INI path and final framebuffer/window
-       size to GLOOM.LOG next to gloom_pc.exe.
-
-       There is no hardware renderer setting.
+       optional hardware render target, renderer backend, viewport, HD art,
+       control-source, and keyboard settings. Windows writes the loaded
+       GLOOM.INI path and final framebuffer/window size to GLOOM.LOG next
+       to gloom_pc.exe.
 
        Keyboard controls can be changed in the same file:
 

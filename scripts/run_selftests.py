@@ -22,6 +22,7 @@ SELFTESTS = [
     "--menu-selftest",
     "--completion-selftest",
     "--texture-source-selftest",
+    "--renderer-selftest",
     "--autosave-selftest",
     "--wall-selftest",
     "--switch-selftest",

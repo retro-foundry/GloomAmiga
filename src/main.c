@@ -11,6 +11,22 @@
 #define GLOOM_USE_SDL_MIXER 0
 #endif
 
+#ifndef GLOOM_DOS_SDL3
+#ifdef __EMSCRIPTEN__
+#include <GLES2/gl2.h>
+#else
+#include <SDL_opengl.h>
+#include <SDL_opengl_glext.h>
+#endif
+#ifndef APIENTRYP
+#ifdef GL_APIENTRYP
+#define APIENTRYP GL_APIENTRYP
+#else
+#define APIENTRYP *
+#endif
+#endif
+#endif
+
 #if defined(GLOOM_DOS_SDL3) && defined(GLOOM_DOS_MENU_MUSIC)
 #include <xmp.h>
 #define GLOOM_USE_DOS_MENU_MUSIC 1
@@ -138,6 +154,8 @@ enum {
   WIDESCREEN_WIDTH = 400,
   DEFAULT_WINDOW_WIDTH = 1280,
   DEFAULT_WINDOW_HEIGHT = 720,
+  DEFAULT_HARDWARE_RENDER_WIDTH = 1920,
+  DEFAULT_HARDWARE_RENDER_HEIGHT = 1080,
   GLOOM_AMIGA_GAME_TICK_HZ = 25,
 #ifdef GLOOM_DOS_SDL3
   FIXED_TICK_HZ = 25,
@@ -628,6 +646,9 @@ typedef struct {
   uint32_t *last_frame_pixels;
   float *depth_buffer;
   float *sprite_depth_buffer;
+#ifndef GLOOM_DOS_SDL3
+  float *gpu_sprite_depth_buffer;
+#endif
 #ifdef GLOOM_DOS_SDL3
   int32_t *depth_buffer_int;
   int32_t *sprite_depth_buffer_int;
@@ -685,17 +706,28 @@ typedef struct {
   GloomControlSource player2;
 } RuntimeControlConfig;
 
+typedef enum {
+  GLOOM_RENDERER_AUTO = 0,
+  GLOOM_RENDERER_SOFTWARE = 1,
+  GLOOM_RENDERER_OPENGL = 2
+} RuntimeRendererPreference;
+
 typedef struct {
   bool ini_loaded;
   char ini_path[1280];
   bool has_resolution;
   int resolution_width;
   int resolution_height;
+  bool has_hardware_resolution;
+  int hardware_resolution_width;
+  int hardware_resolution_height;
   bool has_gameplay_viewport;
   int gameplay_viewport_width;
   int gameplay_viewport_height;
   int gameplay_pixel_width;
   int gameplay_pixel_height;
+  bool has_renderer;
+  RuntimeRendererPreference renderer_preference;
 } RuntimeDisplayIniConfig;
 
 static RuntimeDisplayIniConfig g_runtime_display_ini;
@@ -742,6 +774,10 @@ typedef struct {
 typedef struct {
   uint32_t *argb_pixels;
   uint32_t *hd_argb_pixels;
+#ifndef GLOOM_DOS_SDL3
+  SDL_Texture *gpu_texture;
+  SDL_Texture *gpu_hd_texture;
+#endif
 #ifdef GLOOM_DOS_SDL3
   uint8_t *indexed_pixels;
   uint8_t *coverage;
@@ -767,6 +803,10 @@ typedef struct {
   bool loaded;
   uint32_t *pixels;
   uint32_t *hd_pixels;
+#ifndef GLOOM_DOS_SDL3
+  SDL_Texture *gpu_texture;
+  SDL_Texture *gpu_hd_texture;
+#endif
 #ifdef GLOOM_DOS_SDL3
   uint8_t *indices;
   uint32_t palette[256];
@@ -847,6 +887,14 @@ typedef struct {
   int hd_width;
   int hd_height;
   size_t texture_count;
+#ifndef GLOOM_DOS_SDL3
+  GLuint gpu_shaded_atlas_texture;
+  bool gpu_shaded_atlas_texture_valid;
+  GLuint gpu_hd_atlas_texture;
+  GLuint gpu_hd_mask_texture;
+  bool gpu_hd_atlas_texture_valid;
+  bool gpu_hd_mask_texture_valid;
+#endif
 } WallTextureScreen;
 
 typedef struct {
@@ -868,6 +916,12 @@ typedef struct {
   uint32_t *hd_argb_texels;
   int hd_width;
   int hd_height;
+#ifndef GLOOM_DOS_SDL3
+  GLuint gpu_shaded_texture;
+  bool gpu_shaded_texture_valid;
+  GLuint gpu_hd_texture;
+  bool gpu_hd_texture_valid;
+#endif
 } FlatTexture;
 
 typedef struct {
@@ -887,6 +941,12 @@ typedef struct {
   int hd_bitmap_width;
   int hd_bitmap_height;
   uint32_t *hd_argb_pixels;
+#ifndef GLOOM_DOS_SDL3
+  SDL_Texture *gpu_texture;
+  SDL_Texture *gpu_hd_texture;
+  GLuint gpu_gl_texture;
+  bool gpu_gl_texture_valid;
+#endif
 #ifdef GLOOM_DOS_SDL3
   uint8_t *indexed_pixels;
 #endif
@@ -1159,6 +1219,20 @@ static bool gamepad_menu_back_event(const SDL_Event *event);
 static void gamepad_handle_event(const SDL_Event *event);
 static int control_source_gamepad_index(GloomControlSource source);
 static const char *control_source_menu_name(GloomControlSource source);
+static const char *runtime_renderer_preference_name(RuntimeRendererPreference preference);
+static bool parse_renderer_preference_name(const char *value, RuntimeRendererPreference *out_preference);
+static void initialize_runtime_display_ini_config(RuntimeDisplayIniConfig *config);
+static bool runtime_renderer_preference_prefers_hardware(RuntimeRendererPreference preference);
+static bool select_configured_runtime_resolution(const RuntimeDisplayIniConfig *config,
+                                                 RuntimeRendererPreference renderer_preference,
+                                                 bool cli_has_resolution, int cli_width, int cli_height,
+                                                 int *out_width, int *out_height);
+#ifndef GLOOM_DOS_SDL3
+static void runtime_gpu_destroy_flat_texture(FlatTexture *texture);
+#endif
+static float projection_focal_for_viewport(int w, int h);
+static int32_t round_float_to_int32(float value);
+static uint32_t amiga_blood_argb(uint16_t color_mask, float depth);
 static void normalize_control_config(RuntimeControlConfig *config);
 static void cycle_control_config(RuntimeControlConfig *config, unsigned player_index);
 static bool player1_receives_keyboard_input(void);
@@ -1739,9 +1813,2085 @@ static bool g_hd_art_render_enabled = false;
 static char g_hd_art_root[1024];
 static char g_live_menu_frame_dump_path[1024];
 static bool g_live_menu_frame_dump_written = false;
+#ifndef GLOOM_DOS_SDL3
+static bool g_runtime_opengl_draw_backend = false;
+static SDL_Texture *g_runtime_gpu_start_logo_texture = NULL;
+static SDL_Texture *g_runtime_gpu_pause_background_texture = NULL;
+#endif
 
 static bool hd_art_render_enabled(void) {
   return g_hd_art_enabled && g_hd_art_render_enabled;
+}
+
+#ifndef GLOOM_DOS_SDL3
+static bool runtime_opengl_draw_backend_active(void) {
+  return g_runtime_opengl_draw_backend;
+}
+
+static bool runtime_gpu_sprite_target_supported(int render_width, int render_height) {
+  return render_width <= 800 && render_height <= 450;
+}
+
+static void runtime_gpu_destroy_texture(SDL_Texture **texture) {
+  if (texture != NULL && *texture != NULL) {
+    SDL_DestroyTexture(*texture);
+    *texture = NULL;
+  }
+}
+
+static void runtime_gpu_destroy_transient_textures(void) {
+  runtime_gpu_destroy_texture(&g_runtime_gpu_start_logo_texture);
+  runtime_gpu_destroy_texture(&g_runtime_gpu_pause_background_texture);
+}
+
+typedef void(APIENTRYP RuntimeGLActiveTextureProc)(GLenum texture);
+typedef void(APIENTRYP RuntimeGLAttachShaderProc)(GLuint program, GLuint shader);
+typedef void(APIENTRYP RuntimeGLBindAttribLocationProc)(GLuint program, GLuint index, const GLchar *name);
+typedef void(APIENTRYP RuntimeGLBindBufferProc)(GLenum target, GLuint buffer);
+typedef void(APIENTRYP RuntimeGLBindTextureProc)(GLenum target, GLuint texture);
+typedef void(APIENTRYP RuntimeGLBlendFuncProc)(GLenum sfactor, GLenum dfactor);
+typedef void(APIENTRYP RuntimeGLBufferDataProc)(GLenum target, GLsizeiptr size, const void *data, GLenum usage);
+typedef void(APIENTRYP RuntimeGLCompileShaderProc)(GLuint shader);
+typedef void(APIENTRYP RuntimeGLCopyTexSubImage2DProc)(GLenum target, GLint level, GLint xoffset, GLint yoffset,
+                                                       GLint x, GLint y, GLsizei width, GLsizei height);
+typedef GLuint(APIENTRYP RuntimeGLCreateProgramProc)(void);
+typedef GLuint(APIENTRYP RuntimeGLCreateShaderProc)(GLenum type);
+typedef void(APIENTRYP RuntimeGLDeleteBuffersProc)(GLsizei n, const GLuint *buffers);
+typedef void(APIENTRYP RuntimeGLDeleteProgramProc)(GLuint program);
+typedef void(APIENTRYP RuntimeGLDeleteShaderProc)(GLuint shader);
+typedef void(APIENTRYP RuntimeGLDeleteTexturesProc)(GLsizei n, const GLuint *textures);
+typedef void(APIENTRYP RuntimeGLDisableProc)(GLenum cap);
+typedef void(APIENTRYP RuntimeGLDisableVertexAttribArrayProc)(GLuint index);
+typedef void(APIENTRYP RuntimeGLDrawArraysProc)(GLenum mode, GLint first, GLsizei count);
+typedef void(APIENTRYP RuntimeGLEnableProc)(GLenum cap);
+typedef void(APIENTRYP RuntimeGLEnableVertexAttribArrayProc)(GLuint index);
+typedef void(APIENTRYP RuntimeGLGenBuffersProc)(GLsizei n, GLuint *buffers);
+typedef void(APIENTRYP RuntimeGLGenTexturesProc)(GLsizei n, GLuint *textures);
+typedef GLenum(APIENTRYP RuntimeGLGetErrorProc)(void);
+typedef void(APIENTRYP RuntimeGLGetProgramInfoLogProc)(GLuint program, GLsizei bufSize, GLsizei *length,
+                                                       GLchar *infoLog);
+typedef void(APIENTRYP RuntimeGLGetProgramivProc)(GLuint program, GLenum pname, GLint *params);
+typedef void(APIENTRYP RuntimeGLGetShaderInfoLogProc)(GLuint shader, GLsizei bufSize, GLsizei *length,
+                                                      GLchar *infoLog);
+typedef void(APIENTRYP RuntimeGLGetShaderivProc)(GLuint shader, GLenum pname, GLint *params);
+typedef GLint(APIENTRYP RuntimeGLGetUniformLocationProc)(GLuint program, const GLchar *name);
+typedef void(APIENTRYP RuntimeGLLinkProgramProc)(GLuint program);
+typedef void(APIENTRYP RuntimeGLShaderSourceProc)(GLuint shader, GLsizei count, const GLchar *const *string,
+                                                  const GLint *length);
+typedef void(APIENTRYP RuntimeGLTexImage2DProc)(GLenum target, GLint level, GLint internalformat, GLsizei width,
+                                                GLsizei height, GLint border, GLenum format, GLenum type,
+                                                const void *pixels);
+typedef void(APIENTRYP RuntimeGLTexParameteriProc)(GLenum target, GLenum pname, GLint param);
+typedef void(APIENTRYP RuntimeGLUniform1fProc)(GLint location, GLfloat v0);
+typedef void(APIENTRYP RuntimeGLUniform1iProc)(GLint location, GLint v0);
+typedef void(APIENTRYP RuntimeGLUniform2fProc)(GLint location, GLfloat v0, GLfloat v1);
+typedef void(APIENTRYP RuntimeGLUseProgramProc)(GLuint program);
+typedef void(APIENTRYP RuntimeGLVertexAttribPointerProc)(GLuint index, GLint size, GLenum type,
+                                                         GLboolean normalized, GLsizei stride,
+                                                         const void *pointer);
+typedef void(APIENTRYP RuntimeGLViewportProc)(GLint x, GLint y, GLsizei width, GLsizei height);
+
+typedef struct {
+  bool loaded;
+  bool failed;
+  RuntimeGLActiveTextureProc ActiveTexture;
+  RuntimeGLAttachShaderProc AttachShader;
+  RuntimeGLBindAttribLocationProc BindAttribLocation;
+  RuntimeGLBindBufferProc BindBuffer;
+  RuntimeGLBindTextureProc BindTexture;
+  RuntimeGLBlendFuncProc BlendFunc;
+  RuntimeGLBufferDataProc BufferData;
+  RuntimeGLCompileShaderProc CompileShader;
+  RuntimeGLCopyTexSubImage2DProc CopyTexSubImage2D;
+  RuntimeGLCreateProgramProc CreateProgram;
+  RuntimeGLCreateShaderProc CreateShader;
+  RuntimeGLDeleteBuffersProc DeleteBuffers;
+  RuntimeGLDeleteProgramProc DeleteProgram;
+  RuntimeGLDeleteShaderProc DeleteShader;
+  RuntimeGLDeleteTexturesProc DeleteTextures;
+  RuntimeGLDisableProc Disable;
+  RuntimeGLDisableVertexAttribArrayProc DisableVertexAttribArray;
+  RuntimeGLDrawArraysProc DrawArrays;
+  RuntimeGLEnableProc Enable;
+  RuntimeGLEnableVertexAttribArrayProc EnableVertexAttribArray;
+  RuntimeGLGenBuffersProc GenBuffers;
+  RuntimeGLGenTexturesProc GenTextures;
+  RuntimeGLGetErrorProc GetError;
+  RuntimeGLGetProgramInfoLogProc GetProgramInfoLog;
+  RuntimeGLGetProgramivProc GetProgramiv;
+  RuntimeGLGetShaderInfoLogProc GetShaderInfoLog;
+  RuntimeGLGetShaderivProc GetShaderiv;
+  RuntimeGLGetUniformLocationProc GetUniformLocation;
+  RuntimeGLLinkProgramProc LinkProgram;
+  RuntimeGLShaderSourceProc ShaderSource;
+  RuntimeGLTexImage2DProc TexImage2D;
+  RuntimeGLTexParameteriProc TexParameteri;
+  RuntimeGLUniform1fProc Uniform1f;
+  RuntimeGLUniform1iProc Uniform1i;
+  RuntimeGLUniform2fProc Uniform2f;
+  RuntimeGLUseProgramProc UseProgram;
+  RuntimeGLVertexAttribPointerProc VertexAttribPointer;
+  RuntimeGLViewportProc Viewport;
+} RuntimeGLApi;
+
+typedef struct {
+  bool initialized;
+  bool failed;
+  GLuint program;
+  GLuint vbo;
+  GLint uniform_floor_texture;
+  GLint uniform_roof_texture;
+  GLint uniform_floor_hd_texture;
+  GLint uniform_roof_hd_texture;
+  GLint uniform_view_size;
+  GLint uniform_camera_x;
+  GLint uniform_camera_z;
+  GLint uniform_camera_y;
+  GLint uniform_view_cos;
+  GLint uniform_view_sin;
+  GLint uniform_focal;
+  GLint uniform_far_depth;
+  GLint uniform_floor_hd_enabled;
+  GLint uniform_roof_hd_enabled;
+  GLint uniform_floor_hd_size;
+  GLint uniform_roof_hd_size;
+} RuntimeGpuFlatRenderer;
+
+typedef struct {
+  bool initialized;
+  bool failed;
+  GLuint program;
+  GLuint vbo;
+  GLint uniform_wall_texture;
+  GLint uniform_wall_hd_texture;
+  GLint uniform_wall_hd_mask_texture;
+  GLint uniform_hd_enabled;
+  GLint uniform_hd_size;
+} RuntimeGpuWallRenderer;
+
+typedef struct {
+  bool initialized;
+  bool failed;
+  GLuint program;
+  GLuint vbo;
+} RuntimeGpuBloodRenderer;
+
+typedef struct {
+  bool initialized;
+  bool failed;
+  GLuint program;
+  GLuint vbo;
+  GLint uniform_sprite_texture;
+  GLint uniform_texture_size;
+  GLint uniform_subtract;
+} RuntimeGpuSpriteRenderer;
+
+typedef struct {
+  bool initialized;
+  bool failed;
+  GLuint program;
+  GLuint vbo;
+  GLuint source_texture;
+  int texture_width;
+  int texture_height;
+  GLint uniform_source_texture;
+} RuntimeGpuRedRenderer;
+
+typedef struct {
+  bool initialized;
+  bool failed;
+  GLuint program;
+  GLuint vbo;
+  GLuint source_texture;
+  int texture_width;
+  int texture_height;
+  GLint uniform_source_texture;
+  GLint uniform_render_size;
+  GLint uniform_pixsize;
+} RuntimeGpuPixelateRenderer;
+
+static RuntimeGLApi g_runtime_gl;
+static RuntimeGpuFlatRenderer g_runtime_gpu_flat_renderer;
+static RuntimeGpuWallRenderer g_runtime_gpu_wall_renderer;
+static RuntimeGpuBloodRenderer g_runtime_gpu_blood_renderer;
+static RuntimeGpuSpriteRenderer g_runtime_gpu_sprite_renderer;
+static RuntimeGpuRedRenderer g_runtime_gpu_red_renderer;
+static RuntimeGpuPixelateRenderer g_runtime_gpu_pixelate_renderer;
+static DebugSprite g_runtime_debug_sprite_scratch[GLOOM_MAX_DEBUG_SPRITES];
+static DebugSprite g_runtime_gpu_sprites_left[GLOOM_MAX_DEBUG_SPRITES];
+static DebugSprite g_runtime_gpu_sprites_right[GLOOM_MAX_DEBUG_SPRITES];
+
+static bool runtime_gl_load_api(void) {
+  const char *missing = NULL;
+
+  if (g_runtime_gl.loaded) {
+    return true;
+  }
+  if (g_runtime_gl.failed) {
+    return false;
+  }
+
+#define GLOOM_LOAD_GL_PROC(field, type, name)            \
+  do {                                                   \
+    g_runtime_gl.field = (type)SDL_GL_GetProcAddress(name); \
+    if (g_runtime_gl.field == NULL && missing == NULL) { \
+      missing = name;                                    \
+    }                                                    \
+  } while (0)
+
+  GLOOM_LOAD_GL_PROC(ActiveTexture, RuntimeGLActiveTextureProc, "glActiveTexture");
+  GLOOM_LOAD_GL_PROC(AttachShader, RuntimeGLAttachShaderProc, "glAttachShader");
+  GLOOM_LOAD_GL_PROC(BindAttribLocation, RuntimeGLBindAttribLocationProc, "glBindAttribLocation");
+  GLOOM_LOAD_GL_PROC(BindBuffer, RuntimeGLBindBufferProc, "glBindBuffer");
+  GLOOM_LOAD_GL_PROC(BindTexture, RuntimeGLBindTextureProc, "glBindTexture");
+  GLOOM_LOAD_GL_PROC(BlendFunc, RuntimeGLBlendFuncProc, "glBlendFunc");
+  GLOOM_LOAD_GL_PROC(BufferData, RuntimeGLBufferDataProc, "glBufferData");
+  GLOOM_LOAD_GL_PROC(CompileShader, RuntimeGLCompileShaderProc, "glCompileShader");
+  GLOOM_LOAD_GL_PROC(CopyTexSubImage2D, RuntimeGLCopyTexSubImage2DProc, "glCopyTexSubImage2D");
+  GLOOM_LOAD_GL_PROC(CreateProgram, RuntimeGLCreateProgramProc, "glCreateProgram");
+  GLOOM_LOAD_GL_PROC(CreateShader, RuntimeGLCreateShaderProc, "glCreateShader");
+  GLOOM_LOAD_GL_PROC(DeleteBuffers, RuntimeGLDeleteBuffersProc, "glDeleteBuffers");
+  GLOOM_LOAD_GL_PROC(DeleteProgram, RuntimeGLDeleteProgramProc, "glDeleteProgram");
+  GLOOM_LOAD_GL_PROC(DeleteShader, RuntimeGLDeleteShaderProc, "glDeleteShader");
+  GLOOM_LOAD_GL_PROC(DeleteTextures, RuntimeGLDeleteTexturesProc, "glDeleteTextures");
+  GLOOM_LOAD_GL_PROC(Disable, RuntimeGLDisableProc, "glDisable");
+  GLOOM_LOAD_GL_PROC(DisableVertexAttribArray, RuntimeGLDisableVertexAttribArrayProc,
+                     "glDisableVertexAttribArray");
+  GLOOM_LOAD_GL_PROC(DrawArrays, RuntimeGLDrawArraysProc, "glDrawArrays");
+  GLOOM_LOAD_GL_PROC(Enable, RuntimeGLEnableProc, "glEnable");
+  GLOOM_LOAD_GL_PROC(EnableVertexAttribArray, RuntimeGLEnableVertexAttribArrayProc,
+                     "glEnableVertexAttribArray");
+  GLOOM_LOAD_GL_PROC(GenBuffers, RuntimeGLGenBuffersProc, "glGenBuffers");
+  GLOOM_LOAD_GL_PROC(GenTextures, RuntimeGLGenTexturesProc, "glGenTextures");
+  GLOOM_LOAD_GL_PROC(GetError, RuntimeGLGetErrorProc, "glGetError");
+  GLOOM_LOAD_GL_PROC(GetProgramInfoLog, RuntimeGLGetProgramInfoLogProc, "glGetProgramInfoLog");
+  GLOOM_LOAD_GL_PROC(GetProgramiv, RuntimeGLGetProgramivProc, "glGetProgramiv");
+  GLOOM_LOAD_GL_PROC(GetShaderInfoLog, RuntimeGLGetShaderInfoLogProc, "glGetShaderInfoLog");
+  GLOOM_LOAD_GL_PROC(GetShaderiv, RuntimeGLGetShaderivProc, "glGetShaderiv");
+  GLOOM_LOAD_GL_PROC(GetUniformLocation, RuntimeGLGetUniformLocationProc, "glGetUniformLocation");
+  GLOOM_LOAD_GL_PROC(LinkProgram, RuntimeGLLinkProgramProc, "glLinkProgram");
+  GLOOM_LOAD_GL_PROC(ShaderSource, RuntimeGLShaderSourceProc, "glShaderSource");
+  GLOOM_LOAD_GL_PROC(TexImage2D, RuntimeGLTexImage2DProc, "glTexImage2D");
+  GLOOM_LOAD_GL_PROC(TexParameteri, RuntimeGLTexParameteriProc, "glTexParameteri");
+  GLOOM_LOAD_GL_PROC(Uniform1f, RuntimeGLUniform1fProc, "glUniform1f");
+  GLOOM_LOAD_GL_PROC(Uniform1i, RuntimeGLUniform1iProc, "glUniform1i");
+  GLOOM_LOAD_GL_PROC(Uniform2f, RuntimeGLUniform2fProc, "glUniform2f");
+  GLOOM_LOAD_GL_PROC(UseProgram, RuntimeGLUseProgramProc, "glUseProgram");
+  GLOOM_LOAD_GL_PROC(VertexAttribPointer, RuntimeGLVertexAttribPointerProc, "glVertexAttribPointer");
+  GLOOM_LOAD_GL_PROC(Viewport, RuntimeGLViewportProc, "glViewport");
+
+#undef GLOOM_LOAD_GL_PROC
+
+  if (missing != NULL) {
+    runtime_logf("OpenGL flat renderer disabled: missing %s", missing);
+    memset(&g_runtime_gl, 0, sizeof(g_runtime_gl));
+    g_runtime_gl.failed = true;
+    return false;
+  }
+
+  g_runtime_gl.loaded = true;
+  return true;
+}
+
+static void runtime_gpu_destroy_flat_texture(FlatTexture *texture) {
+  if (texture == NULL || (texture->gpu_shaded_texture == 0u && texture->gpu_hd_texture == 0u)) {
+    return;
+  }
+  if (runtime_gl_load_api()) {
+    if (texture->gpu_shaded_texture != 0u) {
+      GLuint id = texture->gpu_shaded_texture;
+
+      g_runtime_gl.DeleteTextures(1, &id);
+    }
+    if (texture->gpu_hd_texture != 0u) {
+      GLuint id = texture->gpu_hd_texture;
+
+      g_runtime_gl.DeleteTextures(1, &id);
+    }
+  }
+  texture->gpu_shaded_texture = 0u;
+  texture->gpu_shaded_texture_valid = false;
+  texture->gpu_hd_texture = 0u;
+  texture->gpu_hd_texture_valid = false;
+}
+
+static void runtime_gpu_destroy_wall_texture_screen(WallTextureScreen *screen) {
+  if (screen == NULL || (screen->gpu_shaded_atlas_texture == 0u && screen->gpu_hd_atlas_texture == 0u &&
+                         screen->gpu_hd_mask_texture == 0u)) {
+    return;
+  }
+  if (g_runtime_gl.loaded && g_runtime_gl.DeleteTextures != NULL) {
+    if (screen->gpu_shaded_atlas_texture != 0u) {
+      GLuint id = screen->gpu_shaded_atlas_texture;
+
+      g_runtime_gl.DeleteTextures(1, &id);
+    }
+    if (screen->gpu_hd_atlas_texture != 0u) {
+      GLuint id = screen->gpu_hd_atlas_texture;
+
+      g_runtime_gl.DeleteTextures(1, &id);
+    }
+    if (screen->gpu_hd_mask_texture != 0u) {
+      GLuint id = screen->gpu_hd_mask_texture;
+
+      g_runtime_gl.DeleteTextures(1, &id);
+    }
+  }
+  screen->gpu_shaded_atlas_texture = 0u;
+  screen->gpu_shaded_atlas_texture_valid = false;
+  screen->gpu_hd_atlas_texture = 0u;
+  screen->gpu_hd_mask_texture = 0u;
+  screen->gpu_hd_atlas_texture_valid = false;
+  screen->gpu_hd_mask_texture_valid = false;
+}
+
+static void runtime_gpu_destroy_object_frame_gl_texture(ObjectFrame *frame) {
+  if (frame == NULL || frame->gpu_gl_texture == 0u) {
+    return;
+  }
+  if (g_runtime_gl.loaded && g_runtime_gl.DeleteTextures != NULL) {
+    GLuint id = frame->gpu_gl_texture;
+
+    g_runtime_gl.DeleteTextures(1, &id);
+  }
+  frame->gpu_gl_texture = 0u;
+  frame->gpu_gl_texture_valid = false;
+}
+
+static bool runtime_gpu_prepare_object_frame_gl_texture(ObjectFrame *frame) {
+  uint8_t *rgba = NULL;
+  size_t pixel_count = 0u;
+  size_t i = 0u;
+  GLuint texture_id = 0u;
+  GLenum error = GL_NO_ERROR;
+
+  if (frame == NULL || frame->argb_pixels == NULL || frame->width <= 0 || frame->height <= 0 ||
+      !runtime_gl_load_api()) {
+    return false;
+  }
+  if (frame->gpu_gl_texture_valid && frame->gpu_gl_texture != 0u) {
+    return true;
+  }
+
+  pixel_count = (size_t)frame->width * (size_t)frame->height;
+  rgba = (uint8_t *)malloc(pixel_count * 4u);
+  if (rgba == NULL) {
+    runtime_logf("OpenGL sprite texture upload failed: out of memory for %dx%d object frame", frame->width,
+                 frame->height);
+    return false;
+  }
+
+  for (i = 0u; i < pixel_count; ++i) {
+    uint32_t argb = frame->argb_pixels[i];
+    size_t dst = i * 4u;
+
+    rgba[dst + 0u] = (uint8_t)((argb >> 16u) & 0xffu);
+    rgba[dst + 1u] = (uint8_t)((argb >> 8u) & 0xffu);
+    rgba[dst + 2u] = (uint8_t)(argb & 0xffu);
+    rgba[dst + 3u] = (uint8_t)(argb >> 24u);
+  }
+
+  while (g_runtime_gl.GetError() != GL_NO_ERROR) {
+  }
+  g_runtime_gl.GenTextures(1, &texture_id);
+  g_runtime_gl.BindTexture(GL_TEXTURE_2D, texture_id);
+  g_runtime_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  g_runtime_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  g_runtime_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  g_runtime_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  g_runtime_gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, frame->width, frame->height, 0, GL_RGBA,
+                          GL_UNSIGNED_BYTE, rgba);
+  error = g_runtime_gl.GetError();
+  free(rgba);
+
+  if (texture_id == 0u || error != GL_NO_ERROR) {
+    runtime_logf("OpenGL sprite texture upload failed for object frame %dx%d (gl=0x%x)", frame->width,
+                 frame->height, (unsigned)error);
+    if (texture_id != 0u) {
+      g_runtime_gl.DeleteTextures(1, &texture_id);
+    }
+    return false;
+  }
+
+  frame->gpu_gl_texture = texture_id;
+  frame->gpu_gl_texture_valid = true;
+  return true;
+}
+
+static bool runtime_gpu_build_wall_screen_rgba_atlas(const WallTextureScreen *screen, uint8_t *rgba,
+                                                     size_t rgba_size) {
+  enum {
+    ATLAS_WIDTH = GLOOM_TEXTURES_PER_SCREEN * GLOOM_TEXTURE_WIDTH,
+    ATLAS_HEIGHT = 16 * GLOOM_TEXTURE_HEIGHT,
+    ATLAS_BYTES = ATLAS_WIDTH * ATLAS_HEIGHT * 4
+  };
+  int shade = 0;
+  size_t local_index = 0u;
+
+  if (screen == NULL || rgba == NULL || rgba_size < (size_t)ATLAS_BYTES || !screen->loaded ||
+      screen->texels == NULL || screen->texture_count == 0u) {
+    return false;
+  }
+
+  memset(rgba, 0, (size_t)ATLAS_BYTES);
+  for (shade = 0; shade < 16; ++shade) {
+    for (local_index = 0u; local_index < screen->texture_count &&
+                            local_index < (size_t)GLOOM_TEXTURES_PER_SCREEN;
+         ++local_index) {
+      int y = 0;
+
+      for (y = 0; y < GLOOM_TEXTURE_HEIGHT; ++y) {
+        int x = 0;
+
+        for (x = 0; x < GLOOM_TEXTURE_WIDTH; ++x) {
+          size_t src = local_index * ((size_t)GLOOM_TEXTURE_WIDTH * (size_t)GLOOM_TEXTURE_HEIGHT) +
+                       (size_t)y * (size_t)GLOOM_TEXTURE_WIDTH + (size_t)x;
+          size_t flag_offset = local_index * (size_t)GLOOM_TEXTURE_WIDTH + (size_t)x;
+          uint8_t palette_index = screen->texels[src];
+          bool transparent_column =
+              screen->column_flags != NULL && screen->column_flags[flag_offset] != 0u;
+          size_t atlas_x = local_index * (size_t)GLOOM_TEXTURE_WIDTH + (size_t)x;
+          size_t atlas_y = (size_t)shade * (size_t)GLOOM_TEXTURE_HEIGHT + (size_t)y;
+          size_t dst = (atlas_y * (size_t)ATLAS_WIDTH + atlas_x) * 4u;
+          uint32_t argb = screen->shaded_palette[shade][palette_index];
+
+          if (transparent_column && palette_index == 0u) {
+            rgba[dst + 3u] = 0u;
+            continue;
+          }
+          rgba[dst + 0u] = (uint8_t)((argb >> 16u) & 0xFFu);
+          rgba[dst + 1u] = (uint8_t)((argb >> 8u) & 0xFFu);
+          rgba[dst + 2u] = (uint8_t)(argb & 0xFFu);
+          rgba[dst + 3u] = 255u;
+        }
+      }
+    }
+  }
+
+  return true;
+}
+
+static void runtime_gpu_destroy_flat_renderer(void) {
+  if (!g_runtime_gpu_flat_renderer.initialized && g_runtime_gpu_flat_renderer.program == 0u &&
+      g_runtime_gpu_flat_renderer.vbo == 0u) {
+    memset(&g_runtime_gpu_flat_renderer, 0, sizeof(g_runtime_gpu_flat_renderer));
+    return;
+  }
+  if (!runtime_gl_load_api()) {
+    memset(&g_runtime_gpu_flat_renderer, 0, sizeof(g_runtime_gpu_flat_renderer));
+    return;
+  }
+  if (g_runtime_gpu_flat_renderer.vbo != 0u) {
+    GLuint vbo = g_runtime_gpu_flat_renderer.vbo;
+
+    g_runtime_gl.DeleteBuffers(1, &vbo);
+  }
+  if (g_runtime_gpu_flat_renderer.program != 0u) {
+    g_runtime_gl.DeleteProgram(g_runtime_gpu_flat_renderer.program);
+  }
+  memset(&g_runtime_gpu_flat_renderer, 0, sizeof(g_runtime_gpu_flat_renderer));
+}
+
+static void runtime_gpu_destroy_wall_renderer(void) {
+  if (!g_runtime_gpu_wall_renderer.initialized && g_runtime_gpu_wall_renderer.program == 0u &&
+      g_runtime_gpu_wall_renderer.vbo == 0u) {
+    memset(&g_runtime_gpu_wall_renderer, 0, sizeof(g_runtime_gpu_wall_renderer));
+    return;
+  }
+  if (!runtime_gl_load_api()) {
+    memset(&g_runtime_gpu_wall_renderer, 0, sizeof(g_runtime_gpu_wall_renderer));
+    return;
+  }
+  if (g_runtime_gpu_wall_renderer.vbo != 0u) {
+    GLuint vbo = g_runtime_gpu_wall_renderer.vbo;
+
+    g_runtime_gl.DeleteBuffers(1, &vbo);
+  }
+  if (g_runtime_gpu_wall_renderer.program != 0u) {
+    g_runtime_gl.DeleteProgram(g_runtime_gpu_wall_renderer.program);
+  }
+  memset(&g_runtime_gpu_wall_renderer, 0, sizeof(g_runtime_gpu_wall_renderer));
+}
+
+static void runtime_gpu_destroy_blood_renderer(void) {
+  if (!g_runtime_gpu_blood_renderer.initialized && g_runtime_gpu_blood_renderer.program == 0u &&
+      g_runtime_gpu_blood_renderer.vbo == 0u) {
+    memset(&g_runtime_gpu_blood_renderer, 0, sizeof(g_runtime_gpu_blood_renderer));
+    return;
+  }
+  if (!runtime_gl_load_api()) {
+    memset(&g_runtime_gpu_blood_renderer, 0, sizeof(g_runtime_gpu_blood_renderer));
+    return;
+  }
+  if (g_runtime_gpu_blood_renderer.vbo != 0u) {
+    GLuint vbo = g_runtime_gpu_blood_renderer.vbo;
+
+    g_runtime_gl.DeleteBuffers(1, &vbo);
+  }
+  if (g_runtime_gpu_blood_renderer.program != 0u) {
+    g_runtime_gl.DeleteProgram(g_runtime_gpu_blood_renderer.program);
+  }
+  memset(&g_runtime_gpu_blood_renderer, 0, sizeof(g_runtime_gpu_blood_renderer));
+}
+
+static void runtime_gpu_destroy_sprite_renderer(void) {
+  if (!g_runtime_gpu_sprite_renderer.initialized && g_runtime_gpu_sprite_renderer.program == 0u &&
+      g_runtime_gpu_sprite_renderer.vbo == 0u) {
+    memset(&g_runtime_gpu_sprite_renderer, 0, sizeof(g_runtime_gpu_sprite_renderer));
+    return;
+  }
+  if (!runtime_gl_load_api()) {
+    memset(&g_runtime_gpu_sprite_renderer, 0, sizeof(g_runtime_gpu_sprite_renderer));
+    return;
+  }
+  if (g_runtime_gpu_sprite_renderer.vbo != 0u) {
+    GLuint vbo = g_runtime_gpu_sprite_renderer.vbo;
+
+    g_runtime_gl.DeleteBuffers(1, &vbo);
+  }
+  if (g_runtime_gpu_sprite_renderer.program != 0u) {
+    g_runtime_gl.DeleteProgram(g_runtime_gpu_sprite_renderer.program);
+  }
+  memset(&g_runtime_gpu_sprite_renderer, 0, sizeof(g_runtime_gpu_sprite_renderer));
+}
+
+static void runtime_gpu_destroy_red_renderer(void) {
+  if (!g_runtime_gpu_red_renderer.initialized && g_runtime_gpu_red_renderer.program == 0u &&
+      g_runtime_gpu_red_renderer.vbo == 0u && g_runtime_gpu_red_renderer.source_texture == 0u) {
+    memset(&g_runtime_gpu_red_renderer, 0, sizeof(g_runtime_gpu_red_renderer));
+    return;
+  }
+  if (!runtime_gl_load_api()) {
+    memset(&g_runtime_gpu_red_renderer, 0, sizeof(g_runtime_gpu_red_renderer));
+    return;
+  }
+  if (g_runtime_gpu_red_renderer.source_texture != 0u) {
+    GLuint texture = g_runtime_gpu_red_renderer.source_texture;
+
+    g_runtime_gl.DeleteTextures(1, &texture);
+  }
+  if (g_runtime_gpu_red_renderer.vbo != 0u) {
+    GLuint vbo = g_runtime_gpu_red_renderer.vbo;
+
+    g_runtime_gl.DeleteBuffers(1, &vbo);
+  }
+  if (g_runtime_gpu_red_renderer.program != 0u) {
+    g_runtime_gl.DeleteProgram(g_runtime_gpu_red_renderer.program);
+  }
+  memset(&g_runtime_gpu_red_renderer, 0, sizeof(g_runtime_gpu_red_renderer));
+}
+
+static void runtime_gpu_destroy_pixelate_renderer(void) {
+  if (!g_runtime_gpu_pixelate_renderer.initialized && g_runtime_gpu_pixelate_renderer.program == 0u &&
+      g_runtime_gpu_pixelate_renderer.vbo == 0u && g_runtime_gpu_pixelate_renderer.source_texture == 0u) {
+    memset(&g_runtime_gpu_pixelate_renderer, 0, sizeof(g_runtime_gpu_pixelate_renderer));
+    return;
+  }
+  if (!runtime_gl_load_api()) {
+    memset(&g_runtime_gpu_pixelate_renderer, 0, sizeof(g_runtime_gpu_pixelate_renderer));
+    return;
+  }
+  if (g_runtime_gpu_pixelate_renderer.source_texture != 0u) {
+    GLuint texture = g_runtime_gpu_pixelate_renderer.source_texture;
+
+    g_runtime_gl.DeleteTextures(1, &texture);
+  }
+  if (g_runtime_gpu_pixelate_renderer.vbo != 0u) {
+    GLuint vbo = g_runtime_gpu_pixelate_renderer.vbo;
+
+    g_runtime_gl.DeleteBuffers(1, &vbo);
+  }
+  if (g_runtime_gpu_pixelate_renderer.program != 0u) {
+    g_runtime_gl.DeleteProgram(g_runtime_gpu_pixelate_renderer.program);
+  }
+  memset(&g_runtime_gpu_pixelate_renderer, 0, sizeof(g_runtime_gpu_pixelate_renderer));
+}
+
+static bool runtime_gpu_compile_shader(GLenum type, const GLchar *source, GLuint *out_shader) {
+  GLuint shader = 0u;
+  GLint ok = 0;
+  GLchar log[512];
+
+  if (source == NULL || out_shader == NULL || !runtime_gl_load_api()) {
+    return false;
+  }
+
+  shader = g_runtime_gl.CreateShader(type);
+  if (shader == 0u) {
+    runtime_logf("OpenGL shader compile disabled: glCreateShader failed");
+    return false;
+  }
+  g_runtime_gl.ShaderSource(shader, 1, &source, NULL);
+  g_runtime_gl.CompileShader(shader);
+  g_runtime_gl.GetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+  if (!ok) {
+    GLsizei log_length = 0;
+
+    memset(log, 0, sizeof(log));
+    g_runtime_gl.GetShaderInfoLog(shader, (GLsizei)sizeof(log), &log_length, log);
+    runtime_logf("OpenGL shader compile failed: %s", log[0] != '\0' ? log : "(no log)");
+    g_runtime_gl.DeleteShader(shader);
+    return false;
+  }
+
+  *out_shader = shader;
+  return true;
+}
+
+static bool runtime_gpu_init_flat_renderer(void) {
+  static const GLchar *vertex_shader_source =
+      "attribute vec2 a_pos;\n"
+      "attribute vec2 a_local;\n"
+      "varying vec2 v_local;\n"
+      "void main(void) {\n"
+      "  gl_Position = vec4(a_pos, 0.0, 1.0);\n"
+      "  v_local = a_local;\n"
+      "}\n";
+  static const GLchar *fragment_shader_source =
+      "#ifdef GL_ES\n"
+      "precision mediump float;\n"
+      "#endif\n"
+      "uniform sampler2D u_floor_tex;\n"
+      "uniform sampler2D u_roof_tex;\n"
+      "uniform sampler2D u_floor_hd_tex;\n"
+      "uniform sampler2D u_roof_hd_tex;\n"
+      "uniform vec2 u_view_size;\n"
+      "uniform float u_camera_x;\n"
+      "uniform float u_camera_z;\n"
+      "uniform float u_camera_y;\n"
+      "uniform float u_view_cos;\n"
+      "uniform float u_view_sin;\n"
+      "uniform float u_focal;\n"
+      "uniform float u_far_depth;\n"
+      "uniform float u_floor_hd_enabled;\n"
+      "uniform float u_roof_hd_enabled;\n"
+      "uniform vec2 u_floor_hd_size;\n"
+      "uniform vec2 u_roof_hd_size;\n"
+      "varying vec2 v_local;\n"
+      "float gloom_shade_index(float depth) {\n"
+      "  float z = clamp(floor(depth), 0.0, u_far_depth - 1.0);\n"
+      "  float source_z = (u_far_depth - 1.0) - z;\n"
+      "  float bucket = floor(sqrt(max(source_z * 8.0, 0.0)) / 8.0);\n"
+      "  return clamp(15.0 - bucket, 0.0, 15.0);\n"
+      "}\n"
+      "vec2 gloom_hd_flat_uv(float world_x, float world_z, vec2 hd_size) {\n"
+      "  float hx = mod(floor((world_x * hd_size.x) / 128.0), hd_size.x);\n"
+      "  float hz = mod(floor((world_z * hd_size.y) / 128.0), hd_size.y);\n"
+      "  return vec2((hx + 0.5) / hd_size.x, (hz + 0.5) / hd_size.y);\n"
+      "}\n"
+      "void main(void) {\n"
+      "  float row = floor(v_local.y);\n"
+      "  float col = floor(v_local.x);\n"
+      "  float centered_y = row - floor(u_view_size.y * 0.5);\n"
+      "  float abs_y = abs(centered_y);\n"
+      "  bool is_floor = centered_y > 0.0;\n"
+      "  float plane = is_floor ? max(-u_camera_y, 1.0) : max(255.0 + u_camera_y, 1.0);\n"
+      "  if (abs_y < 0.5) {\n"
+      "    gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);\n"
+      "    return;\n"
+      "  }\n"
+      "  float depth = (plane * u_focal) / abs_y;\n"
+      "  if (depth < 1.0 || depth >= u_far_depth) {\n"
+      "    gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);\n"
+      "    return;\n"
+      "  }\n"
+      "  float view_x = ((col - floor(u_view_size.x * 0.5)) * depth) / u_focal;\n"
+      "  float world_x = u_camera_x + (view_x * u_view_cos) + (depth * u_view_sin);\n"
+      "  float world_z = u_camera_z - (view_x * u_view_sin) + (depth * u_view_cos);\n"
+      "  float shade = gloom_shade_index(depth);\n"
+      "  vec2 uv = vec2((mod(floor(world_x), 128.0) + 0.5) / 128.0,\n"
+      "                ((shade * 128.0) + mod(floor(world_z), 128.0) + 0.5) / 2048.0);\n"
+      "  vec4 color = vec4(0.0, 0.0, 0.0, 1.0);\n"
+      "  if (is_floor && u_floor_hd_enabled > 0.5) {\n"
+      "    color = texture2D(u_floor_hd_tex, gloom_hd_flat_uv(world_x, world_z, u_floor_hd_size));\n"
+      "    color.rgb = max(color.rgb - vec3((shade * 17.0) / 255.0), vec3(0.0));\n"
+      "  } else if (!is_floor && u_roof_hd_enabled > 0.5) {\n"
+      "    color = texture2D(u_roof_hd_tex, gloom_hd_flat_uv(world_x, world_z, u_roof_hd_size));\n"
+      "    color.rgb = max(color.rgb - vec3((shade * 17.0) / 255.0), vec3(0.0));\n"
+      "  } else {\n"
+      "    color = is_floor ? texture2D(u_floor_tex, uv) : texture2D(u_roof_tex, uv);\n"
+      "  }\n"
+      "  gl_FragColor = vec4(color.rgb, 1.0);\n"
+      "}\n";
+  GLuint vertex_shader = 0u;
+  GLuint fragment_shader = 0u;
+  GLuint program = 0u;
+  GLint ok = 0;
+  GLchar log[512];
+
+  if (g_runtime_gpu_flat_renderer.initialized) {
+    return true;
+  }
+  if (g_runtime_gpu_flat_renderer.failed || !runtime_gl_load_api()) {
+    return false;
+  }
+
+  if (!runtime_gpu_compile_shader(GL_VERTEX_SHADER, vertex_shader_source, &vertex_shader) ||
+      !runtime_gpu_compile_shader(GL_FRAGMENT_SHADER, fragment_shader_source, &fragment_shader)) {
+    if (vertex_shader != 0u) {
+      g_runtime_gl.DeleteShader(vertex_shader);
+    }
+    g_runtime_gpu_flat_renderer.failed = true;
+    return false;
+  }
+
+  program = g_runtime_gl.CreateProgram();
+  if (program == 0u) {
+    runtime_logf("OpenGL flat renderer disabled: glCreateProgram failed");
+    g_runtime_gl.DeleteShader(vertex_shader);
+    g_runtime_gl.DeleteShader(fragment_shader);
+    g_runtime_gpu_flat_renderer.failed = true;
+    return false;
+  }
+
+  g_runtime_gl.AttachShader(program, vertex_shader);
+  g_runtime_gl.AttachShader(program, fragment_shader);
+  g_runtime_gl.BindAttribLocation(program, 0u, "a_pos");
+  g_runtime_gl.BindAttribLocation(program, 1u, "a_local");
+  g_runtime_gl.LinkProgram(program);
+  g_runtime_gl.GetProgramiv(program, GL_LINK_STATUS, &ok);
+  g_runtime_gl.DeleteShader(vertex_shader);
+  g_runtime_gl.DeleteShader(fragment_shader);
+  if (!ok) {
+    GLsizei log_length = 0;
+
+    memset(log, 0, sizeof(log));
+    g_runtime_gl.GetProgramInfoLog(program, (GLsizei)sizeof(log), &log_length, log);
+    runtime_logf("OpenGL flat renderer link failed: %s", log[0] != '\0' ? log : "(no log)");
+    g_runtime_gl.DeleteProgram(program);
+    g_runtime_gpu_flat_renderer.failed = true;
+    return false;
+  }
+
+  g_runtime_gl.GenBuffers(1, &g_runtime_gpu_flat_renderer.vbo);
+  if (g_runtime_gpu_flat_renderer.vbo == 0u) {
+    runtime_logf("OpenGL flat renderer disabled: glGenBuffers failed");
+    g_runtime_gl.DeleteProgram(program);
+    g_runtime_gpu_flat_renderer.failed = true;
+    return false;
+  }
+
+  g_runtime_gpu_flat_renderer.program = program;
+  g_runtime_gpu_flat_renderer.uniform_floor_texture = g_runtime_gl.GetUniformLocation(program, "u_floor_tex");
+  g_runtime_gpu_flat_renderer.uniform_roof_texture = g_runtime_gl.GetUniformLocation(program, "u_roof_tex");
+  g_runtime_gpu_flat_renderer.uniform_floor_hd_texture = g_runtime_gl.GetUniformLocation(program, "u_floor_hd_tex");
+  g_runtime_gpu_flat_renderer.uniform_roof_hd_texture = g_runtime_gl.GetUniformLocation(program, "u_roof_hd_tex");
+  g_runtime_gpu_flat_renderer.uniform_view_size = g_runtime_gl.GetUniformLocation(program, "u_view_size");
+  g_runtime_gpu_flat_renderer.uniform_camera_x = g_runtime_gl.GetUniformLocation(program, "u_camera_x");
+  g_runtime_gpu_flat_renderer.uniform_camera_z = g_runtime_gl.GetUniformLocation(program, "u_camera_z");
+  g_runtime_gpu_flat_renderer.uniform_camera_y = g_runtime_gl.GetUniformLocation(program, "u_camera_y");
+  g_runtime_gpu_flat_renderer.uniform_view_cos = g_runtime_gl.GetUniformLocation(program, "u_view_cos");
+  g_runtime_gpu_flat_renderer.uniform_view_sin = g_runtime_gl.GetUniformLocation(program, "u_view_sin");
+  g_runtime_gpu_flat_renderer.uniform_focal = g_runtime_gl.GetUniformLocation(program, "u_focal");
+  g_runtime_gpu_flat_renderer.uniform_far_depth = g_runtime_gl.GetUniformLocation(program, "u_far_depth");
+  g_runtime_gpu_flat_renderer.uniform_floor_hd_enabled = g_runtime_gl.GetUniformLocation(program, "u_floor_hd_enabled");
+  g_runtime_gpu_flat_renderer.uniform_roof_hd_enabled = g_runtime_gl.GetUniformLocation(program, "u_roof_hd_enabled");
+  g_runtime_gpu_flat_renderer.uniform_floor_hd_size = g_runtime_gl.GetUniformLocation(program, "u_floor_hd_size");
+  g_runtime_gpu_flat_renderer.uniform_roof_hd_size = g_runtime_gl.GetUniformLocation(program, "u_roof_hd_size");
+  g_runtime_gpu_flat_renderer.initialized = true;
+  runtime_logf("OpenGL flat renderer: initialized shader path for amiga/gloom2.s flat");
+  return true;
+}
+
+static bool runtime_gpu_init_wall_renderer(void) {
+  static const GLchar *vertex_shader_source =
+      "attribute vec2 a_pos;\n"
+      "attribute float a_tex_x;\n"
+      "attribute float a_wall_v;\n"
+      "attribute float a_atlas_y_base;\n"
+      "attribute float a_hd_tex_x;\n"
+      "attribute float a_hd_slot_u;\n"
+      "attribute float a_subtract;\n"
+      "varying float v_tex_x;\n"
+      "varying float v_wall_v;\n"
+      "varying float v_atlas_y_base;\n"
+      "varying float v_hd_tex_x;\n"
+      "varying float v_hd_slot_u;\n"
+      "varying float v_subtract;\n"
+      "void main(void) {\n"
+      "  gl_Position = vec4(a_pos, 0.0, 1.0);\n"
+      "  v_tex_x = a_tex_x;\n"
+      "  v_wall_v = a_wall_v;\n"
+      "  v_atlas_y_base = a_atlas_y_base;\n"
+      "  v_hd_tex_x = a_hd_tex_x;\n"
+      "  v_hd_slot_u = a_hd_slot_u;\n"
+      "  v_subtract = a_subtract;\n"
+      "}\n";
+  static const GLchar *fragment_shader_source =
+      "#ifdef GL_ES\n"
+      "precision mediump float;\n"
+      "#endif\n"
+      "uniform sampler2D u_wall_tex;\n"
+      "uniform sampler2D u_wall_hd_tex;\n"
+      "uniform sampler2D u_wall_hd_mask_tex;\n"
+      "uniform float u_hd_enabled;\n"
+      "uniform vec2 u_hd_size;\n"
+      "varying float v_tex_x;\n"
+      "varying float v_wall_v;\n"
+      "varying float v_atlas_y_base;\n"
+      "varying float v_hd_tex_x;\n"
+      "varying float v_hd_slot_u;\n"
+      "varying float v_subtract;\n"
+      "void main(void) {\n"
+      "  float wall_v = clamp(v_wall_v, 0.0, 1.0);\n"
+      "  float ty = clamp(floor(wall_v * 64.0), 0.0, 63.0);\n"
+      "  vec2 uv = vec2(v_tex_x, (v_atlas_y_base + ty + 0.5) / 1024.0);\n"
+      "  vec4 color = texture2D(u_wall_tex, uv);\n"
+      "  if (color.a < 0.5) {\n"
+      "    discard;\n"
+      "  }\n"
+      "  if (u_hd_enabled > 0.5 && texture2D(u_wall_hd_mask_tex, vec2(v_hd_slot_u, 0.5)).r > 0.5) {\n"
+      "    float hd_ty = clamp(floor(wall_v * u_hd_size.y), 0.0, u_hd_size.y - 1.0);\n"
+      "    color = texture2D(u_wall_hd_tex, vec2(v_hd_tex_x, (hd_ty + 0.5) / u_hd_size.y));\n"
+      "    if (color.a < 0.5) {\n"
+      "      discard;\n"
+      "    }\n"
+      "    color.rgb = max(color.rgb - vec3(v_subtract), vec3(0.0));\n"
+      "  }\n"
+      "  gl_FragColor = vec4(color.rgb, 1.0);\n"
+      "}\n";
+  GLuint vertex_shader = 0u;
+  GLuint fragment_shader = 0u;
+  GLuint program = 0u;
+  GLint ok = 0;
+  GLchar log[512];
+
+  if (g_runtime_gpu_wall_renderer.initialized) {
+    return true;
+  }
+  if (g_runtime_gpu_wall_renderer.failed || !runtime_gl_load_api()) {
+    return false;
+  }
+
+  if (!runtime_gpu_compile_shader(GL_VERTEX_SHADER, vertex_shader_source, &vertex_shader) ||
+      !runtime_gpu_compile_shader(GL_FRAGMENT_SHADER, fragment_shader_source, &fragment_shader)) {
+    if (vertex_shader != 0u) {
+      g_runtime_gl.DeleteShader(vertex_shader);
+    }
+    g_runtime_gpu_wall_renderer.failed = true;
+    return false;
+  }
+
+  program = g_runtime_gl.CreateProgram();
+  if (program == 0u) {
+    runtime_logf("OpenGL wall renderer disabled: glCreateProgram failed");
+    g_runtime_gl.DeleteShader(vertex_shader);
+    g_runtime_gl.DeleteShader(fragment_shader);
+    g_runtime_gpu_wall_renderer.failed = true;
+    return false;
+  }
+
+  g_runtime_gl.AttachShader(program, vertex_shader);
+  g_runtime_gl.AttachShader(program, fragment_shader);
+  g_runtime_gl.BindAttribLocation(program, 0u, "a_pos");
+  g_runtime_gl.BindAttribLocation(program, 1u, "a_tex_x");
+  g_runtime_gl.BindAttribLocation(program, 2u, "a_wall_v");
+  g_runtime_gl.BindAttribLocation(program, 3u, "a_atlas_y_base");
+  g_runtime_gl.BindAttribLocation(program, 4u, "a_hd_tex_x");
+  g_runtime_gl.BindAttribLocation(program, 5u, "a_hd_slot_u");
+  g_runtime_gl.BindAttribLocation(program, 6u, "a_subtract");
+  g_runtime_gl.LinkProgram(program);
+  g_runtime_gl.GetProgramiv(program, GL_LINK_STATUS, &ok);
+  g_runtime_gl.DeleteShader(vertex_shader);
+  g_runtime_gl.DeleteShader(fragment_shader);
+  if (!ok) {
+    GLsizei log_length = 0;
+
+    memset(log, 0, sizeof(log));
+    g_runtime_gl.GetProgramInfoLog(program, (GLsizei)sizeof(log), &log_length, log);
+    runtime_logf("OpenGL wall renderer link failed: %s", log[0] != '\0' ? log : "(no log)");
+    g_runtime_gl.DeleteProgram(program);
+    g_runtime_gpu_wall_renderer.failed = true;
+    return false;
+  }
+
+  g_runtime_gl.GenBuffers(1, &g_runtime_gpu_wall_renderer.vbo);
+  if (g_runtime_gpu_wall_renderer.vbo == 0u) {
+    runtime_logf("OpenGL wall renderer disabled: glGenBuffers failed");
+    g_runtime_gl.DeleteProgram(program);
+    g_runtime_gpu_wall_renderer.failed = true;
+    return false;
+  }
+
+  g_runtime_gpu_wall_renderer.program = program;
+  g_runtime_gpu_wall_renderer.uniform_wall_texture = g_runtime_gl.GetUniformLocation(program, "u_wall_tex");
+  g_runtime_gpu_wall_renderer.uniform_wall_hd_texture = g_runtime_gl.GetUniformLocation(program, "u_wall_hd_tex");
+  g_runtime_gpu_wall_renderer.uniform_wall_hd_mask_texture =
+      g_runtime_gl.GetUniformLocation(program, "u_wall_hd_mask_tex");
+  g_runtime_gpu_wall_renderer.uniform_hd_enabled = g_runtime_gl.GetUniformLocation(program, "u_hd_enabled");
+  g_runtime_gpu_wall_renderer.uniform_hd_size = g_runtime_gl.GetUniformLocation(program, "u_hd_size");
+  g_runtime_gpu_wall_renderer.initialized = true;
+  runtime_logf("OpenGL wall renderer: initialized shader path for amiga/gloom2.s castwalls/renderwalls");
+  return true;
+}
+
+static bool runtime_gpu_init_blood_renderer(void) {
+  static const GLchar *vertex_shader_source =
+      "attribute vec2 a_pos;\n"
+      "attribute vec4 a_color;\n"
+      "varying vec4 v_color;\n"
+      "void main(void) {\n"
+      "  gl_Position = vec4(a_pos, 0.0, 1.0);\n"
+      "  v_color = a_color;\n"
+      "}\n";
+  static const GLchar *fragment_shader_source =
+      "#ifdef GL_ES\n"
+      "precision mediump float;\n"
+      "#endif\n"
+      "varying vec4 v_color;\n"
+      "void main(void) {\n"
+      "  gl_FragColor = v_color;\n"
+      "}\n";
+  GLuint vertex_shader = 0u;
+  GLuint fragment_shader = 0u;
+  GLuint program = 0u;
+  GLint ok = 0;
+  GLchar log[512];
+
+  if (g_runtime_gpu_blood_renderer.initialized) {
+    return true;
+  }
+  if (g_runtime_gpu_blood_renderer.failed || !runtime_gl_load_api()) {
+    return false;
+  }
+
+  if (!runtime_gpu_compile_shader(GL_VERTEX_SHADER, vertex_shader_source, &vertex_shader) ||
+      !runtime_gpu_compile_shader(GL_FRAGMENT_SHADER, fragment_shader_source, &fragment_shader)) {
+    if (vertex_shader != 0u) {
+      g_runtime_gl.DeleteShader(vertex_shader);
+    }
+    g_runtime_gpu_blood_renderer.failed = true;
+    return false;
+  }
+
+  program = g_runtime_gl.CreateProgram();
+  if (program == 0u) {
+    runtime_logf("OpenGL blood renderer disabled: glCreateProgram failed");
+    g_runtime_gl.DeleteShader(vertex_shader);
+    g_runtime_gl.DeleteShader(fragment_shader);
+    g_runtime_gpu_blood_renderer.failed = true;
+    return false;
+  }
+
+  g_runtime_gl.AttachShader(program, vertex_shader);
+  g_runtime_gl.AttachShader(program, fragment_shader);
+  g_runtime_gl.BindAttribLocation(program, 0u, "a_pos");
+  g_runtime_gl.BindAttribLocation(program, 1u, "a_color");
+  g_runtime_gl.LinkProgram(program);
+  g_runtime_gl.GetProgramiv(program, GL_LINK_STATUS, &ok);
+  g_runtime_gl.DeleteShader(vertex_shader);
+  g_runtime_gl.DeleteShader(fragment_shader);
+  if (!ok) {
+    GLsizei log_length = 0;
+
+    memset(log, 0, sizeof(log));
+    g_runtime_gl.GetProgramInfoLog(program, (GLsizei)sizeof(log), &log_length, log);
+    runtime_logf("OpenGL blood renderer link failed: %s", log[0] != '\0' ? log : "(no log)");
+    g_runtime_gl.DeleteProgram(program);
+    g_runtime_gpu_blood_renderer.failed = true;
+    return false;
+  }
+
+  g_runtime_gl.GenBuffers(1, &g_runtime_gpu_blood_renderer.vbo);
+  if (g_runtime_gpu_blood_renderer.vbo == 0u) {
+    runtime_logf("OpenGL blood renderer disabled: glGenBuffers failed");
+    g_runtime_gl.DeleteProgram(program);
+    g_runtime_gpu_blood_renderer.failed = true;
+    return false;
+  }
+
+  g_runtime_gpu_blood_renderer.program = program;
+  g_runtime_gpu_blood_renderer.initialized = true;
+  runtime_logf("OpenGL blood renderer: initialized shader path for amiga/gloom2.s drawblood");
+  return true;
+}
+
+static bool runtime_gpu_init_sprite_renderer(void) {
+  static const GLchar *vertex_shader_source =
+      "attribute vec2 a_pos;\n"
+      "attribute vec2 a_src;\n"
+      "varying vec2 v_src;\n"
+      "void main(void) {\n"
+      "  gl_Position = vec4(a_pos, 0.0, 1.0);\n"
+      "  v_src = a_src;\n"
+      "}\n";
+  static const GLchar *fragment_shader_source =
+      "#ifdef GL_ES\n"
+      "precision mediump float;\n"
+      "#endif\n"
+      "uniform sampler2D u_sprite_tex;\n"
+      "uniform vec2 u_texture_size;\n"
+      "uniform float u_subtract;\n"
+      "varying vec2 v_src;\n"
+      "void main(void) {\n"
+      "  vec2 texel = floor(v_src);\n"
+      "  if (texel.x < 0.0 || texel.y < 0.0 || texel.x >= u_texture_size.x || texel.y >= u_texture_size.y) {\n"
+      "    discard;\n"
+      "  }\n"
+      "  vec2 uv = (texel + vec2(0.5, 0.5)) / u_texture_size;\n"
+      "  vec4 color = texture2D(u_sprite_tex, uv);\n"
+      "  if (color.a < 0.5) {\n"
+      "    discard;\n"
+      "  }\n"
+      "  gl_FragColor = vec4(max(color.rgb - vec3(u_subtract), vec3(0.0)), 1.0);\n"
+      "}\n";
+  GLuint vertex_shader = 0u;
+  GLuint fragment_shader = 0u;
+  GLuint program = 0u;
+  GLint ok = 0;
+  GLchar log[512];
+
+  if (g_runtime_gpu_sprite_renderer.initialized) {
+    return true;
+  }
+  if (g_runtime_gpu_sprite_renderer.failed || !runtime_gl_load_api()) {
+    return false;
+  }
+
+  if (!runtime_gpu_compile_shader(GL_VERTEX_SHADER, vertex_shader_source, &vertex_shader) ||
+      !runtime_gpu_compile_shader(GL_FRAGMENT_SHADER, fragment_shader_source, &fragment_shader)) {
+    if (vertex_shader != 0u) {
+      g_runtime_gl.DeleteShader(vertex_shader);
+    }
+    g_runtime_gpu_sprite_renderer.failed = true;
+    return false;
+  }
+
+  program = g_runtime_gl.CreateProgram();
+  if (program == 0u) {
+    runtime_logf("OpenGL sprite renderer disabled: glCreateProgram failed");
+    g_runtime_gl.DeleteShader(vertex_shader);
+    g_runtime_gl.DeleteShader(fragment_shader);
+    g_runtime_gpu_sprite_renderer.failed = true;
+    return false;
+  }
+
+  g_runtime_gl.AttachShader(program, vertex_shader);
+  g_runtime_gl.AttachShader(program, fragment_shader);
+  g_runtime_gl.BindAttribLocation(program, 0u, "a_pos");
+  g_runtime_gl.BindAttribLocation(program, 1u, "a_src");
+  g_runtime_gl.LinkProgram(program);
+  g_runtime_gl.GetProgramiv(program, GL_LINK_STATUS, &ok);
+  g_runtime_gl.DeleteShader(vertex_shader);
+  g_runtime_gl.DeleteShader(fragment_shader);
+  if (!ok) {
+    GLsizei log_length = 0;
+
+    memset(log, 0, sizeof(log));
+    g_runtime_gl.GetProgramInfoLog(program, (GLsizei)sizeof(log), &log_length, log);
+    runtime_logf("OpenGL sprite renderer link failed: %s", log[0] != '\0' ? log : "(no log)");
+    g_runtime_gl.DeleteProgram(program);
+    g_runtime_gpu_sprite_renderer.failed = true;
+    return false;
+  }
+
+  g_runtime_gl.GenBuffers(1, &g_runtime_gpu_sprite_renderer.vbo);
+  if (g_runtime_gpu_sprite_renderer.vbo == 0u) {
+    runtime_logf("OpenGL sprite renderer disabled: glGenBuffers failed");
+    g_runtime_gl.DeleteProgram(program);
+    g_runtime_gpu_sprite_renderer.failed = true;
+    return false;
+  }
+
+  g_runtime_gpu_sprite_renderer.program = program;
+  g_runtime_gpu_sprite_renderer.uniform_sprite_texture = g_runtime_gl.GetUniformLocation(program, "u_sprite_tex");
+  g_runtime_gpu_sprite_renderer.uniform_texture_size = g_runtime_gl.GetUniformLocation(program, "u_texture_size");
+  g_runtime_gpu_sprite_renderer.uniform_subtract = g_runtime_gl.GetUniformLocation(program, "u_subtract");
+  g_runtime_gpu_sprite_renderer.initialized = true;
+  runtime_logf("OpenGL sprite renderer: initialized shader path for amiga/gloom2.s drawshapes");
+  return true;
+}
+
+static void runtime_gpu_append_blood_vertex(GLfloat *vertices, size_t *write_index, GLfloat x, GLfloat y,
+                                            uint32_t argb) {
+  vertices[(*write_index)++] = x;
+  vertices[(*write_index)++] = y;
+  vertices[(*write_index)++] = (GLfloat)((argb >> 16u) & 0xffu) / 255.0f;
+  vertices[(*write_index)++] = (GLfloat)((argb >> 8u) & 0xffu) / 255.0f;
+  vertices[(*write_index)++] = (GLfloat)(argb & 0xffu) / 255.0f;
+  vertices[(*write_index)++] = 1.0f;
+}
+
+static bool runtime_gpu_render_blood_view(SDL_Renderer *renderer, const AppState *state, int x, int y, int w, int h,
+                                          int render_width, int render_height) {
+  enum {
+    FLOATS_PER_VERTEX = 6,
+    VERTICES_PER_BLOOD = 6,
+    MAX_FLOATS = GLOOM_MAX_RUNTIME_BLOOD * VERTICES_PER_BLOOD * FLOATS_PER_VERTEX
+  };
+  GLfloat vertices[MAX_FLOATS];
+  size_t vertex_float_count = 0u;
+  size_t i = 0u;
+  float view_cos = 0.0f;
+  float view_sin = 0.0f;
+  float focal = 0.0f;
+  float far_depth = (float)GLOOM_AMIGA_MAX_Z;
+  int horizon_y = y + (h / 2);
+
+  if (renderer == NULL || state == NULL || w <= 0 || h <= 0 || render_width <= 0 || render_height <= 0 ||
+      !runtime_opengl_draw_backend_active()) {
+    return false;
+  }
+
+  view_cos = SDL_cosf(state->camera_angle);
+  view_sin = SDL_sinf(state->camera_angle);
+  focal = projection_focal_for_viewport(w, h);
+
+  for (i = 0u; i < GLOOM_MAX_RUNTIME_BLOOD; ++i) {
+    const RuntimeBlood *blood = &state->blood[i];
+    float dx = 0.0f;
+    float dz = 0.0f;
+    float svx = 0.0f;
+    float svz = 0.0f;
+    float by = 0.0f;
+    int screen_x = 0;
+    int screen_y = 0;
+    GLfloat left = 0.0f;
+    GLfloat right = 0.0f;
+    GLfloat top = 0.0f;
+    GLfloat bottom = 0.0f;
+    uint32_t argb = 0u;
+
+    if (!blood->active || blood->color_mask == 0u) {
+      continue;
+    }
+
+    dx = blood->x - state->camera_x;
+    dz = blood->z - state->camera_z;
+    svx = dx * view_cos - dz * view_sin;
+    svz = dx * view_sin + dz * view_cos;
+    if (svz <= 0.0f || svz >= far_depth) {
+      continue;
+    }
+
+    by = blood->y;
+    if (by > 0.0f) {
+      by = -by;
+    }
+    by -= state->camera_y;
+
+    screen_x = round_float_to_int32((float)x + (float)w * 0.5f + (svx / svz) * focal);
+    screen_y = round_float_to_int32((float)horizon_y + (by / svz) * focal);
+    if (screen_x < x || screen_x >= x + w || screen_y < y || screen_y >= y + h) {
+      continue;
+    }
+
+    argb = amiga_blood_argb(blood->color_mask, svz);
+    left = ((GLfloat)screen_x / (GLfloat)render_width) * 2.0f - 1.0f;
+    right = ((GLfloat)(screen_x + 1) / (GLfloat)render_width) * 2.0f - 1.0f;
+    top = 1.0f - (((GLfloat)screen_y / (GLfloat)render_height) * 2.0f);
+    bottom = 1.0f - (((GLfloat)(screen_y + 1) / (GLfloat)render_height) * 2.0f);
+
+    runtime_gpu_append_blood_vertex(vertices, &vertex_float_count, left, top, argb);
+    runtime_gpu_append_blood_vertex(vertices, &vertex_float_count, right, top, argb);
+    runtime_gpu_append_blood_vertex(vertices, &vertex_float_count, left, bottom, argb);
+    runtime_gpu_append_blood_vertex(vertices, &vertex_float_count, right, top, argb);
+    runtime_gpu_append_blood_vertex(vertices, &vertex_float_count, right, bottom, argb);
+    runtime_gpu_append_blood_vertex(vertices, &vertex_float_count, left, bottom, argb);
+  }
+
+  if (vertex_float_count == 0u) {
+    return true;
+  }
+  if (!runtime_gpu_init_blood_renderer()) {
+    return false;
+  }
+  if (SDL_RenderFlush(renderer) != 0) {
+    runtime_logf("OpenGL blood renderer: SDL_RenderFlush failed: %s", SDL_GetError());
+    return false;
+  }
+
+  g_runtime_gl.Viewport(0, 0, (GLsizei)render_width, (GLsizei)render_height);
+  g_runtime_gl.Disable(GL_BLEND);
+  g_runtime_gl.UseProgram(g_runtime_gpu_blood_renderer.program);
+  g_runtime_gl.BindBuffer(GL_ARRAY_BUFFER, g_runtime_gpu_blood_renderer.vbo);
+  g_runtime_gl.BufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vertex_float_count * sizeof(GLfloat)), vertices,
+                          GL_STREAM_DRAW);
+  g_runtime_gl.EnableVertexAttribArray(0u);
+  g_runtime_gl.EnableVertexAttribArray(1u);
+  g_runtime_gl.VertexAttribPointer(0u, 2, GL_FLOAT, GL_FALSE, (GLsizei)(FLOATS_PER_VERTEX * sizeof(GLfloat)),
+                                   (const void *)0);
+  g_runtime_gl.VertexAttribPointer(1u, 4, GL_FLOAT, GL_FALSE, (GLsizei)(FLOATS_PER_VERTEX * sizeof(GLfloat)),
+                                   (const void *)(2u * sizeof(GLfloat)));
+  g_runtime_gl.DrawArrays(GL_TRIANGLES, 0, (GLsizei)(vertex_float_count / FLOATS_PER_VERTEX));
+  g_runtime_gl.DisableVertexAttribArray(0u);
+  g_runtime_gl.DisableVertexAttribArray(1u);
+  g_runtime_gl.BindBuffer(GL_ARRAY_BUFFER, 0u);
+  g_runtime_gl.UseProgram(0u);
+  return true;
+}
+
+static bool runtime_gpu_init_red_renderer(void) {
+  static const GLchar *vertex_shader_source =
+      "attribute vec2 a_pos;\n"
+      "attribute vec2 a_uv;\n"
+      "varying vec2 v_uv;\n"
+      "void main(void) {\n"
+      "  gl_Position = vec4(a_pos, 0.0, 1.0);\n"
+      "  v_uv = a_uv;\n"
+      "}\n";
+  static const GLchar *fragment_shader_source =
+      "#ifdef GL_ES\n"
+      "precision mediump float;\n"
+      "#endif\n"
+      "uniform sampler2D u_source_tex;\n"
+      "varying vec2 v_uv;\n"
+      "void main(void) {\n"
+      "  vec4 color = texture2D(u_source_tex, v_uv);\n"
+      "  float red = min((color.r + color.g + color.b + (272.0 / 255.0)) / 3.0, 1.0);\n"
+      "  gl_FragColor = vec4(red, 0.0, 0.0, 1.0);\n"
+      "}\n";
+  GLuint vertex_shader = 0u;
+  GLuint fragment_shader = 0u;
+  GLuint program = 0u;
+  GLint ok = 0;
+  GLchar log[512];
+
+  if (g_runtime_gpu_red_renderer.initialized) {
+    return true;
+  }
+  if (g_runtime_gpu_red_renderer.failed || !runtime_gl_load_api()) {
+    return false;
+  }
+
+  if (!runtime_gpu_compile_shader(GL_VERTEX_SHADER, vertex_shader_source, &vertex_shader) ||
+      !runtime_gpu_compile_shader(GL_FRAGMENT_SHADER, fragment_shader_source, &fragment_shader)) {
+    if (vertex_shader != 0u) {
+      g_runtime_gl.DeleteShader(vertex_shader);
+    }
+    g_runtime_gpu_red_renderer.failed = true;
+    return false;
+  }
+
+  program = g_runtime_gl.CreateProgram();
+  if (program == 0u) {
+    runtime_logf("OpenGL red palette renderer disabled: glCreateProgram failed");
+    g_runtime_gl.DeleteShader(vertex_shader);
+    g_runtime_gl.DeleteShader(fragment_shader);
+    g_runtime_gpu_red_renderer.failed = true;
+    return false;
+  }
+
+  g_runtime_gl.AttachShader(program, vertex_shader);
+  g_runtime_gl.AttachShader(program, fragment_shader);
+  g_runtime_gl.BindAttribLocation(program, 0u, "a_pos");
+  g_runtime_gl.BindAttribLocation(program, 1u, "a_uv");
+  g_runtime_gl.LinkProgram(program);
+  g_runtime_gl.GetProgramiv(program, GL_LINK_STATUS, &ok);
+  g_runtime_gl.DeleteShader(vertex_shader);
+  g_runtime_gl.DeleteShader(fragment_shader);
+  if (!ok) {
+    GLsizei log_length = 0;
+
+    memset(log, 0, sizeof(log));
+    g_runtime_gl.GetProgramInfoLog(program, (GLsizei)sizeof(log), &log_length, log);
+    runtime_logf("OpenGL red palette renderer link failed: %s", log[0] != '\0' ? log : "(no log)");
+    g_runtime_gl.DeleteProgram(program);
+    g_runtime_gpu_red_renderer.failed = true;
+    return false;
+  }
+
+  g_runtime_gl.GenBuffers(1, &g_runtime_gpu_red_renderer.vbo);
+  if (g_runtime_gpu_red_renderer.vbo == 0u) {
+    runtime_logf("OpenGL red palette renderer disabled: glGenBuffers failed");
+    g_runtime_gl.DeleteProgram(program);
+    g_runtime_gpu_red_renderer.failed = true;
+    return false;
+  }
+
+  g_runtime_gpu_red_renderer.program = program;
+  g_runtime_gpu_red_renderer.uniform_source_texture = g_runtime_gl.GetUniformLocation(program, "u_source_tex");
+  g_runtime_gpu_red_renderer.initialized = true;
+  runtime_logf("OpenGL red palette renderer: initialized shader path for amiga/gloom2.s redpal/palettesr");
+  return true;
+}
+
+static bool runtime_gpu_red_prepare_source_texture(int render_width, int render_height) {
+  GLenum error = GL_NO_ERROR;
+
+  if (render_width <= 0 || render_height <= 0 || !runtime_gl_load_api()) {
+    return false;
+  }
+  if (g_runtime_gpu_red_renderer.source_texture != 0u &&
+      g_runtime_gpu_red_renderer.texture_width == render_width &&
+      g_runtime_gpu_red_renderer.texture_height == render_height) {
+    return true;
+  }
+
+  if (g_runtime_gpu_red_renderer.source_texture == 0u) {
+    g_runtime_gl.GenTextures(1, &g_runtime_gpu_red_renderer.source_texture);
+    if (g_runtime_gpu_red_renderer.source_texture == 0u) {
+      runtime_logf("OpenGL red palette renderer disabled: glGenTextures failed");
+      return false;
+    }
+  }
+
+  while (g_runtime_gl.GetError() != GL_NO_ERROR) {
+  }
+  g_runtime_gl.BindTexture(GL_TEXTURE_2D, g_runtime_gpu_red_renderer.source_texture);
+  g_runtime_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  g_runtime_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  g_runtime_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  g_runtime_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  g_runtime_gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, render_width, render_height, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                          NULL);
+  error = g_runtime_gl.GetError();
+  if (error != GL_NO_ERROR) {
+    runtime_logf("OpenGL red palette renderer disabled: source texture allocation failed (gl=0x%x)",
+                 (unsigned)error);
+    return false;
+  }
+
+  g_runtime_gpu_red_renderer.texture_width = render_width;
+  g_runtime_gpu_red_renderer.texture_height = render_height;
+  return true;
+}
+
+static bool runtime_gpu_apply_red_palette_rect(SDL_Renderer *renderer, int x, int y, int w, int h,
+                                               int render_width, int render_height) {
+  enum { FLOATS_PER_VERTEX = 4 };
+  GLfloat vertices[6 * FLOATS_PER_VERTEX];
+  GLfloat left = 0.0f;
+  GLfloat right = 0.0f;
+  GLfloat top = 0.0f;
+  GLfloat bottom = 0.0f;
+  GLfloat u0 = 0.0f;
+  GLfloat u1 = 0.0f;
+  GLfloat v_top = 0.0f;
+  GLfloat v_bottom = 0.0f;
+
+  if (renderer == NULL || w <= 0 || h <= 0 || render_width <= 0 || render_height <= 0 ||
+      !runtime_opengl_draw_backend_active()) {
+    return false;
+  }
+  if (x < 0) {
+    w += x;
+    x = 0;
+  }
+  if (y < 0) {
+    h += y;
+    y = 0;
+  }
+  if (x + w > render_width) {
+    w = render_width - x;
+  }
+  if (y + h > render_height) {
+    h = render_height - y;
+  }
+  if (w <= 0 || h <= 0) {
+    return true;
+  }
+  if (!runtime_gpu_init_red_renderer() || !runtime_gpu_red_prepare_source_texture(render_width, render_height)) {
+    return false;
+  }
+  if (SDL_RenderFlush(renderer) != 0) {
+    runtime_logf("OpenGL red palette renderer: SDL_RenderFlush failed: %s", SDL_GetError());
+    return false;
+  }
+
+  g_runtime_gl.Viewport(0, 0, (GLsizei)render_width, (GLsizei)render_height);
+  g_runtime_gl.ActiveTexture(GL_TEXTURE0);
+  g_runtime_gl.BindTexture(GL_TEXTURE_2D, g_runtime_gpu_red_renderer.source_texture);
+  g_runtime_gl.CopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, render_width, render_height);
+
+  left = ((GLfloat)x / (GLfloat)render_width) * 2.0f - 1.0f;
+  right = ((GLfloat)(x + w) / (GLfloat)render_width) * 2.0f - 1.0f;
+  top = 1.0f - (((GLfloat)y / (GLfloat)render_height) * 2.0f);
+  bottom = 1.0f - (((GLfloat)(y + h) / (GLfloat)render_height) * 2.0f);
+  u0 = (GLfloat)x / (GLfloat)render_width;
+  u1 = (GLfloat)(x + w) / (GLfloat)render_width;
+  v_top = 1.0f - ((GLfloat)y / (GLfloat)render_height);
+  v_bottom = 1.0f - ((GLfloat)(y + h) / (GLfloat)render_height);
+
+  vertices[0] = left;
+  vertices[1] = top;
+  vertices[2] = u0;
+  vertices[3] = v_top;
+  vertices[4] = right;
+  vertices[5] = top;
+  vertices[6] = u1;
+  vertices[7] = v_top;
+  vertices[8] = left;
+  vertices[9] = bottom;
+  vertices[10] = u0;
+  vertices[11] = v_bottom;
+  vertices[12] = right;
+  vertices[13] = top;
+  vertices[14] = u1;
+  vertices[15] = v_top;
+  vertices[16] = right;
+  vertices[17] = bottom;
+  vertices[18] = u1;
+  vertices[19] = v_bottom;
+  vertices[20] = left;
+  vertices[21] = bottom;
+  vertices[22] = u0;
+  vertices[23] = v_bottom;
+
+  g_runtime_gl.Disable(GL_BLEND);
+  g_runtime_gl.UseProgram(g_runtime_gpu_red_renderer.program);
+  g_runtime_gl.Uniform1i(g_runtime_gpu_red_renderer.uniform_source_texture, 0);
+  g_runtime_gl.BindBuffer(GL_ARRAY_BUFFER, g_runtime_gpu_red_renderer.vbo);
+  g_runtime_gl.BufferData(GL_ARRAY_BUFFER, (GLsizeiptr)sizeof(vertices), vertices, GL_STREAM_DRAW);
+  g_runtime_gl.EnableVertexAttribArray(0u);
+  g_runtime_gl.EnableVertexAttribArray(1u);
+  g_runtime_gl.VertexAttribPointer(0u, 2, GL_FLOAT, GL_FALSE, (GLsizei)(FLOATS_PER_VERTEX * sizeof(GLfloat)),
+                                   (const void *)0);
+  g_runtime_gl.VertexAttribPointer(1u, 2, GL_FLOAT, GL_FALSE, (GLsizei)(FLOATS_PER_VERTEX * sizeof(GLfloat)),
+                                   (const void *)(2u * sizeof(GLfloat)));
+  g_runtime_gl.DrawArrays(GL_TRIANGLES, 0, 6);
+  g_runtime_gl.DisableVertexAttribArray(0u);
+  g_runtime_gl.DisableVertexAttribArray(1u);
+  g_runtime_gl.BindBuffer(GL_ARRAY_BUFFER, 0u);
+  g_runtime_gl.BindTexture(GL_TEXTURE_2D, 0u);
+  g_runtime_gl.UseProgram(0u);
+  return true;
+}
+
+static bool runtime_gpu_init_pixelate_renderer(void) {
+  static const GLchar *vertex_shader_source =
+      "attribute vec2 a_pos;\n"
+      "attribute vec2 a_local;\n"
+      "varying vec2 v_local;\n"
+      "void main(void) {\n"
+      "  gl_Position = vec4(a_pos, 0.0, 1.0);\n"
+      "  v_local = a_local;\n"
+      "}\n";
+  static const GLchar *fragment_shader_source =
+      "#ifdef GL_ES\n"
+      "precision mediump float;\n"
+      "#endif\n"
+      "uniform sampler2D u_source_tex;\n"
+      "uniform vec2 u_render_size;\n"
+      "uniform float u_pixsize;\n"
+      "varying vec2 v_local;\n"
+      "void main(void) {\n"
+      "  vec2 coord = floor(v_local);\n"
+      "  vec2 block = max(vec2(u_pixsize), vec2(1.0));\n"
+      "  vec2 origin = floor(coord / block) * block;\n"
+      "  vec2 block_size = min(block, u_render_size - origin);\n"
+      "  vec2 sample_pos = origin + floor(block_size * 0.5) + vec2(0.5);\n"
+      "  vec2 uv = vec2(sample_pos.x / u_render_size.x, 1.0 - (sample_pos.y / u_render_size.y));\n"
+      "  gl_FragColor = texture2D(u_source_tex, uv);\n"
+      "}\n";
+  GLuint vertex_shader = 0u;
+  GLuint fragment_shader = 0u;
+  GLuint program = 0u;
+  GLint ok = 0;
+  GLchar log[512];
+
+  if (g_runtime_gpu_pixelate_renderer.initialized) {
+    return true;
+  }
+  if (g_runtime_gpu_pixelate_renderer.failed || !runtime_gl_load_api()) {
+    return false;
+  }
+
+  if (!runtime_gpu_compile_shader(GL_VERTEX_SHADER, vertex_shader_source, &vertex_shader) ||
+      !runtime_gpu_compile_shader(GL_FRAGMENT_SHADER, fragment_shader_source, &fragment_shader)) {
+    if (vertex_shader != 0u) {
+      g_runtime_gl.DeleteShader(vertex_shader);
+    }
+    g_runtime_gpu_pixelate_renderer.failed = true;
+    return false;
+  }
+
+  program = g_runtime_gl.CreateProgram();
+  if (program == 0u) {
+    runtime_logf("OpenGL pixelate renderer disabled: glCreateProgram failed");
+    g_runtime_gl.DeleteShader(vertex_shader);
+    g_runtime_gl.DeleteShader(fragment_shader);
+    g_runtime_gpu_pixelate_renderer.failed = true;
+    return false;
+  }
+
+  g_runtime_gl.AttachShader(program, vertex_shader);
+  g_runtime_gl.AttachShader(program, fragment_shader);
+  g_runtime_gl.BindAttribLocation(program, 0u, "a_pos");
+  g_runtime_gl.BindAttribLocation(program, 1u, "a_local");
+  g_runtime_gl.LinkProgram(program);
+  g_runtime_gl.GetProgramiv(program, GL_LINK_STATUS, &ok);
+  g_runtime_gl.DeleteShader(vertex_shader);
+  g_runtime_gl.DeleteShader(fragment_shader);
+  if (!ok) {
+    GLsizei log_length = 0;
+
+    memset(log, 0, sizeof(log));
+    g_runtime_gl.GetProgramInfoLog(program, (GLsizei)sizeof(log), &log_length, log);
+    runtime_logf("OpenGL pixelate renderer link failed: %s", log[0] != '\0' ? log : "(no log)");
+    g_runtime_gl.DeleteProgram(program);
+    g_runtime_gpu_pixelate_renderer.failed = true;
+    return false;
+  }
+
+  g_runtime_gl.GenBuffers(1, &g_runtime_gpu_pixelate_renderer.vbo);
+  if (g_runtime_gpu_pixelate_renderer.vbo == 0u) {
+    runtime_logf("OpenGL pixelate renderer disabled: glGenBuffers failed");
+    g_runtime_gl.DeleteProgram(program);
+    g_runtime_gpu_pixelate_renderer.failed = true;
+    return false;
+  }
+
+  g_runtime_gpu_pixelate_renderer.program = program;
+  g_runtime_gpu_pixelate_renderer.uniform_source_texture = g_runtime_gl.GetUniformLocation(program, "u_source_tex");
+  g_runtime_gpu_pixelate_renderer.uniform_render_size = g_runtime_gl.GetUniformLocation(program, "u_render_size");
+  g_runtime_gpu_pixelate_renderer.uniform_pixsize = g_runtime_gl.GetUniformLocation(program, "u_pixsize");
+  g_runtime_gpu_pixelate_renderer.initialized = true;
+  runtime_logf("OpenGL pixelate renderer: initialized shader path for amiga/gloom2.s pixelate transition");
+  return true;
+}
+
+static bool runtime_gpu_pixelate_prepare_source_texture(int render_width, int render_height) {
+  GLenum error = GL_NO_ERROR;
+
+  if (render_width <= 0 || render_height <= 0 || !runtime_gl_load_api()) {
+    return false;
+  }
+  if (g_runtime_gpu_pixelate_renderer.source_texture != 0u &&
+      g_runtime_gpu_pixelate_renderer.texture_width == render_width &&
+      g_runtime_gpu_pixelate_renderer.texture_height == render_height) {
+    return true;
+  }
+
+  if (g_runtime_gpu_pixelate_renderer.source_texture == 0u) {
+    g_runtime_gl.GenTextures(1, &g_runtime_gpu_pixelate_renderer.source_texture);
+    if (g_runtime_gpu_pixelate_renderer.source_texture == 0u) {
+      runtime_logf("OpenGL pixelate renderer disabled: glGenTextures failed");
+      return false;
+    }
+  }
+
+  while (g_runtime_gl.GetError() != GL_NO_ERROR) {
+  }
+  g_runtime_gl.BindTexture(GL_TEXTURE_2D, g_runtime_gpu_pixelate_renderer.source_texture);
+  g_runtime_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  g_runtime_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  g_runtime_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  g_runtime_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  g_runtime_gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, render_width, render_height, 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                          NULL);
+  error = g_runtime_gl.GetError();
+  if (error != GL_NO_ERROR) {
+    runtime_logf("OpenGL pixelate renderer disabled: source texture allocation failed (gl=0x%x)",
+                 (unsigned)error);
+    return false;
+  }
+
+  g_runtime_gpu_pixelate_renderer.texture_width = render_width;
+  g_runtime_gpu_pixelate_renderer.texture_height = render_height;
+  return true;
+}
+
+static bool runtime_gpu_apply_pixelate(SDL_Renderer *renderer, int render_width, int render_height, int pixsize) {
+  GLfloat vertices[16];
+
+  if (renderer == NULL || render_width <= 0 || render_height <= 0 || pixsize <= 1 ||
+      !runtime_opengl_draw_backend_active()) {
+    return false;
+  }
+  if (!runtime_gpu_init_pixelate_renderer() ||
+      !runtime_gpu_pixelate_prepare_source_texture(render_width, render_height)) {
+    return false;
+  }
+  if (SDL_RenderFlush(renderer) != 0) {
+    runtime_logf("OpenGL pixelate renderer: SDL_RenderFlush failed: %s", SDL_GetError());
+    return false;
+  }
+
+  g_runtime_gl.Viewport(0, 0, (GLsizei)render_width, (GLsizei)render_height);
+  g_runtime_gl.ActiveTexture(GL_TEXTURE0);
+  g_runtime_gl.BindTexture(GL_TEXTURE_2D, g_runtime_gpu_pixelate_renderer.source_texture);
+  g_runtime_gl.CopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, render_width, render_height);
+
+  vertices[0] = -1.0f;
+  vertices[1] = 1.0f;
+  vertices[2] = 0.0f;
+  vertices[3] = 0.0f;
+  vertices[4] = 1.0f;
+  vertices[5] = 1.0f;
+  vertices[6] = (GLfloat)render_width;
+  vertices[7] = 0.0f;
+  vertices[8] = -1.0f;
+  vertices[9] = -1.0f;
+  vertices[10] = 0.0f;
+  vertices[11] = (GLfloat)render_height;
+  vertices[12] = 1.0f;
+  vertices[13] = -1.0f;
+  vertices[14] = (GLfloat)render_width;
+  vertices[15] = (GLfloat)render_height;
+
+  g_runtime_gl.Disable(GL_BLEND);
+  g_runtime_gl.UseProgram(g_runtime_gpu_pixelate_renderer.program);
+  g_runtime_gl.Uniform1i(g_runtime_gpu_pixelate_renderer.uniform_source_texture, 0);
+  g_runtime_gl.Uniform2f(g_runtime_gpu_pixelate_renderer.uniform_render_size, (GLfloat)render_width,
+                         (GLfloat)render_height);
+  g_runtime_gl.Uniform1f(g_runtime_gpu_pixelate_renderer.uniform_pixsize, (GLfloat)pixsize);
+  g_runtime_gl.BindBuffer(GL_ARRAY_BUFFER, g_runtime_gpu_pixelate_renderer.vbo);
+  g_runtime_gl.BufferData(GL_ARRAY_BUFFER, (GLsizeiptr)sizeof(vertices), vertices, GL_STREAM_DRAW);
+  g_runtime_gl.EnableVertexAttribArray(0u);
+  g_runtime_gl.EnableVertexAttribArray(1u);
+  g_runtime_gl.VertexAttribPointer(0u, 2, GL_FLOAT, GL_FALSE, (GLsizei)(4u * sizeof(GLfloat)), (const void *)0);
+  g_runtime_gl.VertexAttribPointer(1u, 2, GL_FLOAT, GL_FALSE, (GLsizei)(4u * sizeof(GLfloat)),
+                                   (const void *)(2u * sizeof(GLfloat)));
+  g_runtime_gl.DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+  g_runtime_gl.DisableVertexAttribArray(0u);
+  g_runtime_gl.DisableVertexAttribArray(1u);
+  g_runtime_gl.BindBuffer(GL_ARRAY_BUFFER, 0u);
+  g_runtime_gl.BindTexture(GL_TEXTURE_2D, 0u);
+  g_runtime_gl.UseProgram(0u);
+  return true;
+}
+
+static bool runtime_gpu_prepare_flat_texture(FlatTexture *texture) {
+  enum {
+    ATLAS_WIDTH = GLOOM_FLAT_TEXTURE_SIZE,
+    ATLAS_HEIGHT = GLOOM_FLAT_TEXTURE_SIZE * 16,
+    ATLAS_BYTES = ATLAS_WIDTH * ATLAS_HEIGHT * 4
+  };
+  uint8_t *rgba = NULL;
+  int shade = 0;
+  GLuint texture_id = 0u;
+  GLenum error = GL_NO_ERROR;
+
+  if (texture == NULL || !texture->loaded || texture->texels == NULL || !runtime_gl_load_api()) {
+    return false;
+  }
+  if (texture->gpu_shaded_texture_valid && texture->gpu_shaded_texture != 0u) {
+    return true;
+  }
+
+  rgba = (uint8_t *)malloc((size_t)ATLAS_BYTES);
+  if (rgba == NULL) {
+    runtime_logf("OpenGL flat renderer disabled: out of memory building flat atlas");
+    return false;
+  }
+
+  for (shade = 0; shade < 16; ++shade) {
+    int tz = 0;
+
+    for (tz = 0; tz < GLOOM_FLAT_TEXTURE_SIZE; ++tz) {
+      int tx = 0;
+
+      for (tx = 0; tx < GLOOM_FLAT_TEXTURE_SIZE; ++tx) {
+        uint8_t palette_index = texture->texels[(tx * GLOOM_FLAT_TEXTURE_SIZE) + tz];
+        uint32_t argb = texture->shaded_palette[shade][palette_index];
+        size_t dst = ((size_t)(shade * GLOOM_FLAT_TEXTURE_SIZE + tz) * (size_t)ATLAS_WIDTH + (size_t)tx) * 4u;
+
+        rgba[dst + 0u] = (uint8_t)((argb >> 16u) & 0xFFu);
+        rgba[dst + 1u] = (uint8_t)((argb >> 8u) & 0xFFu);
+        rgba[dst + 2u] = (uint8_t)(argb & 0xFFu);
+        rgba[dst + 3u] = 255u;
+      }
+    }
+  }
+
+  while (g_runtime_gl.GetError() != GL_NO_ERROR) {
+  }
+  g_runtime_gl.GenTextures(1, &texture_id);
+  g_runtime_gl.BindTexture(GL_TEXTURE_2D, texture_id);
+  g_runtime_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  g_runtime_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  g_runtime_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  g_runtime_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  g_runtime_gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ATLAS_WIDTH, ATLAS_HEIGHT, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+  error = g_runtime_gl.GetError();
+  free(rgba);
+
+  if (texture_id == 0u || error != GL_NO_ERROR) {
+    runtime_logf("OpenGL flat renderer disabled: flat atlas upload failed for %s (gl=0x%x)",
+                 texture->source_name[0] != '\0' ? texture->source_name : "(unnamed)", (unsigned)error);
+    if (texture_id != 0u) {
+      g_runtime_gl.DeleteTextures(1, &texture_id);
+    }
+    return false;
+  }
+
+  texture->gpu_shaded_texture = texture_id;
+  texture->gpu_shaded_texture_valid = true;
+  return true;
+}
+
+static bool runtime_gpu_upload_argb_texture(GLuint *io_texture, bool *io_valid, const uint32_t *pixels,
+                                            int width, int height, const char *label) {
+  uint8_t *rgba = NULL;
+  size_t pixel_count = 0u;
+  size_t i = 0u;
+  GLuint texture_id = 0u;
+  GLenum error = GL_NO_ERROR;
+
+  if (io_texture == NULL || io_valid == NULL || pixels == NULL || width <= 0 || height <= 0 ||
+      !runtime_gl_load_api()) {
+    return false;
+  }
+  if (*io_valid && *io_texture != 0u) {
+    return true;
+  }
+
+  pixel_count = (size_t)width * (size_t)height;
+  rgba = (uint8_t *)malloc(pixel_count * 4u);
+  if (rgba == NULL) {
+    runtime_logf("OpenGL HD texture upload failed: out of memory for %s %dx%d",
+                 label != NULL ? label : "(unnamed)", width, height);
+    return false;
+  }
+  for (i = 0u; i < pixel_count; ++i) {
+    uint32_t argb = pixels[i];
+    size_t dst = i * 4u;
+
+    rgba[dst + 0u] = (uint8_t)((argb >> 16u) & 0xffu);
+    rgba[dst + 1u] = (uint8_t)((argb >> 8u) & 0xffu);
+    rgba[dst + 2u] = (uint8_t)(argb & 0xffu);
+    rgba[dst + 3u] = (uint8_t)(argb >> 24u);
+  }
+
+  while (g_runtime_gl.GetError() != GL_NO_ERROR) {
+  }
+  g_runtime_gl.GenTextures(1, &texture_id);
+  g_runtime_gl.BindTexture(GL_TEXTURE_2D, texture_id);
+  g_runtime_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  g_runtime_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  g_runtime_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  g_runtime_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  g_runtime_gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+  error = g_runtime_gl.GetError();
+  free(rgba);
+
+  if (texture_id == 0u || error != GL_NO_ERROR) {
+    runtime_logf("OpenGL HD texture upload failed for %s %dx%d (gl=0x%x)",
+                 label != NULL ? label : "(unnamed)", width, height, (unsigned)error);
+    if (texture_id != 0u) {
+      g_runtime_gl.DeleteTextures(1, &texture_id);
+    }
+    return false;
+  }
+
+  *io_texture = texture_id;
+  *io_valid = true;
+  return true;
+}
+
+static bool runtime_gpu_prepare_flat_hd_texture(FlatTexture *texture) {
+  if (texture == NULL || texture->hd_argb_texels == NULL || texture->hd_width <= 0 ||
+      texture->hd_height <= 0) {
+    return false;
+  }
+  return runtime_gpu_upload_argb_texture(&texture->gpu_hd_texture, &texture->gpu_hd_texture_valid,
+                                         texture->hd_argb_texels, texture->hd_width, texture->hd_height,
+                                         texture->source_name[0] != '\0' ? texture->source_name : "flat HD");
+}
+
+static bool runtime_gpu_prepare_wall_hd_texture_screen(WallTextureScreen *screen) {
+  enum { ATLAS_TEXTURES = GLOOM_TEXTURES_PER_SCREEN };
+  uint32_t *atlas = NULL;
+  uint32_t mask[ATLAS_TEXTURES];
+  int atlas_width = 0;
+  size_t texture_index = 0u;
+  bool ok = false;
+
+  if (screen == NULL || screen->hd_argb_texels == NULL || screen->hd_width <= 0 ||
+      screen->hd_height <= 0 || screen->texture_count == 0u) {
+    return false;
+  }
+  if (screen->gpu_hd_atlas_texture_valid && screen->gpu_hd_atlas_texture != 0u &&
+      screen->gpu_hd_mask_texture_valid && screen->gpu_hd_mask_texture != 0u) {
+    return true;
+  }
+
+  atlas_width = ATLAS_TEXTURES * screen->hd_width;
+  atlas = (uint32_t *)calloc((size_t)atlas_width * (size_t)screen->hd_height, sizeof(*atlas));
+  if (atlas == NULL) {
+    runtime_logf("OpenGL wall HD texture upload failed: out of memory building atlas for %s",
+                 screen->source_name[0] != '\0' ? screen->source_name : "(unnamed)");
+    return false;
+  }
+  for (texture_index = 0u; texture_index < (size_t)ATLAS_TEXTURES; ++texture_index) {
+    bool loaded = texture_index < screen->texture_count &&
+                  (screen->hd_texture_loaded == NULL || screen->hd_texture_loaded[texture_index] != 0u);
+    int row = 0;
+
+    mask[texture_index] = loaded ? 0xffffffffu : 0xff000000u;
+    if (!loaded) {
+      continue;
+    }
+    for (row = 0; row < screen->hd_height; ++row) {
+      const uint32_t *src =
+          screen->hd_argb_texels + texture_index * (size_t)screen->hd_width * (size_t)screen->hd_height +
+          (size_t)row * (size_t)screen->hd_width;
+      uint32_t *dst = atlas + (size_t)row * (size_t)atlas_width + texture_index * (size_t)screen->hd_width;
+
+      memcpy(dst, src, (size_t)screen->hd_width * sizeof(*dst));
+    }
+  }
+
+  ok = runtime_gpu_upload_argb_texture(&screen->gpu_hd_atlas_texture, &screen->gpu_hd_atlas_texture_valid,
+                                       atlas, atlas_width, screen->hd_height,
+                                       screen->source_name[0] != '\0' ? screen->source_name : "wall HD atlas") &&
+       runtime_gpu_upload_argb_texture(&screen->gpu_hd_mask_texture, &screen->gpu_hd_mask_texture_valid,
+                                       mask, ATLAS_TEXTURES, 1,
+                                       screen->source_name[0] != '\0' ? screen->source_name : "wall HD mask");
+  free(atlas);
+  if (!ok) {
+    runtime_gpu_destroy_wall_texture_screen(screen);
+  } else {
+    screen->gpu_hd_atlas_texture_valid = true;
+    screen->gpu_hd_mask_texture_valid = true;
+  }
+  return ok;
+}
+
+static bool runtime_gpu_prepare_wall_texture_screen(WallTextureScreen *screen) {
+  enum {
+    ATLAS_WIDTH = GLOOM_TEXTURES_PER_SCREEN * GLOOM_TEXTURE_WIDTH,
+    ATLAS_HEIGHT = 16 * GLOOM_TEXTURE_HEIGHT,
+    ATLAS_BYTES = ATLAS_WIDTH * ATLAS_HEIGHT * 4
+  };
+  uint8_t *rgba = NULL;
+  GLuint texture_id = 0u;
+  GLenum error = GL_NO_ERROR;
+
+  if (screen == NULL || !screen->loaded || screen->texels == NULL || !runtime_gl_load_api()) {
+    return false;
+  }
+  if (screen->gpu_shaded_atlas_texture_valid && screen->gpu_shaded_atlas_texture != 0u) {
+    return true;
+  }
+
+  rgba = (uint8_t *)malloc((size_t)ATLAS_BYTES);
+  if (rgba == NULL) {
+    runtime_logf("OpenGL wall texture upload disabled: out of memory building wall atlas");
+    return false;
+  }
+  if (!runtime_gpu_build_wall_screen_rgba_atlas(screen, rgba, (size_t)ATLAS_BYTES)) {
+    runtime_logf("OpenGL wall texture upload disabled: could not build atlas for %s",
+                 screen->source_name[0] != '\0' ? screen->source_name : "(unnamed)");
+    free(rgba);
+    return false;
+  }
+
+  while (g_runtime_gl.GetError() != GL_NO_ERROR) {
+  }
+  g_runtime_gl.GenTextures(1, &texture_id);
+  g_runtime_gl.BindTexture(GL_TEXTURE_2D, texture_id);
+  g_runtime_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+  g_runtime_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+  g_runtime_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  g_runtime_gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+  g_runtime_gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, ATLAS_WIDTH, ATLAS_HEIGHT, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba);
+  error = g_runtime_gl.GetError();
+  free(rgba);
+
+  if (texture_id == 0u || error != GL_NO_ERROR) {
+    runtime_logf("OpenGL wall texture atlas upload failed for %s (gl=0x%x)",
+                 screen->source_name[0] != '\0' ? screen->source_name : "(unnamed)", (unsigned)error);
+    if (texture_id != 0u) {
+      g_runtime_gl.DeleteTextures(1, &texture_id);
+    }
+    return false;
+  }
+
+  screen->gpu_shaded_atlas_texture = texture_id;
+  screen->gpu_shaded_atlas_texture_valid = true;
+  return true;
+}
+
+static bool runtime_gpu_prepare_wall_texture_set(SDL_Renderer *renderer, const WallTextureSet *wall_textures) {
+  WallTextureSet *mutable_set = (WallTextureSet *)wall_textures;
+  size_t i = 0u;
+  size_t uploaded = 0u;
+
+  if (renderer == NULL || wall_textures == NULL || !runtime_opengl_draw_backend_active()) {
+    return false;
+  }
+  if (!runtime_gl_load_api()) {
+    return false;
+  }
+
+  for (i = 0u; i < (size_t)GLOOM_TEXTURE_SCREENS; ++i) {
+    WallTextureScreen *screen = &mutable_set->screens[i];
+
+    if (!screen->loaded) {
+      continue;
+    }
+    if (!runtime_gpu_prepare_wall_texture_screen(screen)) {
+      return false;
+    }
+    if (hd_art_render_enabled() && screen->hd_argb_texels != NULL && screen->hd_width > 0 &&
+        screen->hd_height > 0 && !runtime_gpu_prepare_wall_hd_texture_screen(screen)) {
+      return false;
+    }
+    uploaded += 1u;
+  }
+  if (uploaded > 0u) {
+    static size_t logged_loaded_count = 0u;
+
+    if (logged_loaded_count != uploaded) {
+      runtime_logf("OpenGL wall textures: uploaded %zu source screens as 16-shade atlases", uploaded);
+      logged_loaded_count = uploaded;
+    }
+  }
+  return uploaded > 0u;
+}
+
+static bool runtime_gpu_prepare_flat_set(SDL_Renderer *renderer, const FlatTextureSet *flats) {
+  FlatTextureSet *mutable_flats = (FlatTextureSet *)flats;
+  bool ok = false;
+
+  if (renderer == NULL || flats == NULL || !runtime_opengl_draw_backend_active()) {
+    return false;
+  }
+  if (!flats->floor.loaded || !flats->roof.loaded || !runtime_gpu_init_flat_renderer()) {
+    return false;
+  }
+  ok = runtime_gpu_prepare_flat_texture(&mutable_flats->floor) &&
+       runtime_gpu_prepare_flat_texture(&mutable_flats->roof);
+  if (!ok) {
+    return false;
+  }
+  if (hd_art_render_enabled()) {
+    if (mutable_flats->floor.hd_argb_texels != NULL && mutable_flats->floor.hd_width > 0 &&
+        mutable_flats->floor.hd_height > 0 && !runtime_gpu_prepare_flat_hd_texture(&mutable_flats->floor)) {
+      return false;
+    }
+    if (mutable_flats->roof.hd_argb_texels != NULL && mutable_flats->roof.hd_width > 0 &&
+        mutable_flats->roof.hd_height > 0 && !runtime_gpu_prepare_flat_hd_texture(&mutable_flats->roof)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static bool runtime_gpu_render_flat_view(SDL_Renderer *renderer, const AppState *state, const FlatTextureSet *flats,
+                                         int x, int y, int w, int h, int render_width, int render_height) {
+  float view_cos = 0.0f;
+  float view_sin = 0.0f;
+  float focal = 0.0f;
+  GLfloat vertices[16];
+  GLfloat left = 0.0f;
+  GLfloat right = 0.0f;
+  GLfloat top = 0.0f;
+  GLfloat bottom = 0.0f;
+
+  if (renderer == NULL || state == NULL || flats == NULL || w <= 0 || h <= 0 || render_width <= 0 ||
+      render_height <= 0 || !runtime_gpu_prepare_flat_set(renderer, flats)) {
+    return false;
+  }
+
+  view_cos = SDL_cosf(state->camera_angle);
+  view_sin = SDL_sinf(state->camera_angle);
+  focal = projection_focal_for_viewport(w, h);
+
+  left = ((GLfloat)x / (GLfloat)render_width) * 2.0f - 1.0f;
+  right = ((GLfloat)(x + w) / (GLfloat)render_width) * 2.0f - 1.0f;
+  top = 1.0f - (((GLfloat)y / (GLfloat)render_height) * 2.0f);
+  bottom = 1.0f - (((GLfloat)(y + h) / (GLfloat)render_height) * 2.0f);
+
+  vertices[0] = left;
+  vertices[1] = top;
+  vertices[2] = 0.0f;
+  vertices[3] = 0.0f;
+  vertices[4] = right;
+  vertices[5] = top;
+  vertices[6] = (GLfloat)w;
+  vertices[7] = 0.0f;
+  vertices[8] = left;
+  vertices[9] = bottom;
+  vertices[10] = 0.0f;
+  vertices[11] = (GLfloat)h;
+  vertices[12] = right;
+  vertices[13] = bottom;
+  vertices[14] = (GLfloat)w;
+  vertices[15] = (GLfloat)h;
+
+  if (SDL_RenderFlush(renderer) != 0) {
+    runtime_logf("OpenGL flat renderer: SDL_RenderFlush failed: %s", SDL_GetError());
+    return false;
+  }
+
+  g_runtime_gl.Viewport(0, 0, (GLsizei)render_width, (GLsizei)render_height);
+  g_runtime_gl.Disable(GL_BLEND);
+  g_runtime_gl.UseProgram(g_runtime_gpu_flat_renderer.program);
+  g_runtime_gl.ActiveTexture(GL_TEXTURE0);
+  g_runtime_gl.BindTexture(GL_TEXTURE_2D, flats->floor.gpu_shaded_texture);
+  g_runtime_gl.Uniform1i(g_runtime_gpu_flat_renderer.uniform_floor_texture, 0);
+  g_runtime_gl.ActiveTexture(GL_TEXTURE1);
+  g_runtime_gl.BindTexture(GL_TEXTURE_2D, flats->roof.gpu_shaded_texture);
+  g_runtime_gl.Uniform1i(g_runtime_gpu_flat_renderer.uniform_roof_texture, 1);
+  g_runtime_gl.ActiveTexture(GL_TEXTURE2);
+  g_runtime_gl.BindTexture(GL_TEXTURE_2D,
+                           flats->floor.gpu_hd_texture_valid && flats->floor.gpu_hd_texture != 0u
+                               ? flats->floor.gpu_hd_texture
+                               : flats->floor.gpu_shaded_texture);
+  g_runtime_gl.Uniform1i(g_runtime_gpu_flat_renderer.uniform_floor_hd_texture, 2);
+  g_runtime_gl.ActiveTexture(GL_TEXTURE3);
+  g_runtime_gl.BindTexture(GL_TEXTURE_2D,
+                           flats->roof.gpu_hd_texture_valid && flats->roof.gpu_hd_texture != 0u
+                               ? flats->roof.gpu_hd_texture
+                               : flats->roof.gpu_shaded_texture);
+  g_runtime_gl.Uniform1i(g_runtime_gpu_flat_renderer.uniform_roof_hd_texture, 3);
+  g_runtime_gl.Uniform2f(g_runtime_gpu_flat_renderer.uniform_view_size, (GLfloat)w, (GLfloat)h);
+  g_runtime_gl.Uniform1f(g_runtime_gpu_flat_renderer.uniform_camera_x, (GLfloat)state->camera_x);
+  g_runtime_gl.Uniform1f(g_runtime_gpu_flat_renderer.uniform_camera_z, (GLfloat)state->camera_z);
+  g_runtime_gl.Uniform1f(g_runtime_gpu_flat_renderer.uniform_camera_y, (GLfloat)state->camera_y);
+  g_runtime_gl.Uniform1f(g_runtime_gpu_flat_renderer.uniform_view_cos, (GLfloat)view_cos);
+  g_runtime_gl.Uniform1f(g_runtime_gpu_flat_renderer.uniform_view_sin, (GLfloat)view_sin);
+  g_runtime_gl.Uniform1f(g_runtime_gpu_flat_renderer.uniform_focal, (GLfloat)focal);
+  g_runtime_gl.Uniform1f(g_runtime_gpu_flat_renderer.uniform_far_depth, (GLfloat)GLOOM_AMIGA_MAX_Z);
+  g_runtime_gl.Uniform1f(g_runtime_gpu_flat_renderer.uniform_floor_hd_enabled,
+                         hd_art_render_enabled() && flats->floor.gpu_hd_texture_valid &&
+                                 flats->floor.gpu_hd_texture != 0u
+                             ? 1.0f
+                             : 0.0f);
+  g_runtime_gl.Uniform1f(g_runtime_gpu_flat_renderer.uniform_roof_hd_enabled,
+                         hd_art_render_enabled() && flats->roof.gpu_hd_texture_valid &&
+                                 flats->roof.gpu_hd_texture != 0u
+                             ? 1.0f
+                             : 0.0f);
+  g_runtime_gl.Uniform2f(g_runtime_gpu_flat_renderer.uniform_floor_hd_size,
+                         flats->floor.hd_width > 0 ? (GLfloat)flats->floor.hd_width : 1.0f,
+                         flats->floor.hd_height > 0 ? (GLfloat)flats->floor.hd_height : 1.0f);
+  g_runtime_gl.Uniform2f(g_runtime_gpu_flat_renderer.uniform_roof_hd_size,
+                         flats->roof.hd_width > 0 ? (GLfloat)flats->roof.hd_width : 1.0f,
+                         flats->roof.hd_height > 0 ? (GLfloat)flats->roof.hd_height : 1.0f);
+  g_runtime_gl.BindBuffer(GL_ARRAY_BUFFER, g_runtime_gpu_flat_renderer.vbo);
+  g_runtime_gl.BufferData(GL_ARRAY_BUFFER, (GLsizeiptr)sizeof(vertices), vertices, GL_STREAM_DRAW);
+  g_runtime_gl.EnableVertexAttribArray(0u);
+  g_runtime_gl.EnableVertexAttribArray(1u);
+  g_runtime_gl.VertexAttribPointer(0u, 2, GL_FLOAT, GL_FALSE, (GLsizei)(4u * sizeof(GLfloat)), (const void *)0);
+  g_runtime_gl.VertexAttribPointer(1u, 2, GL_FLOAT, GL_FALSE, (GLsizei)(4u * sizeof(GLfloat)),
+                                   (const void *)(2u * sizeof(GLfloat)));
+  g_runtime_gl.DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+  g_runtime_gl.DisableVertexAttribArray(0u);
+  g_runtime_gl.DisableVertexAttribArray(1u);
+  g_runtime_gl.BindBuffer(GL_ARRAY_BUFFER, 0u);
+  g_runtime_gl.ActiveTexture(GL_TEXTURE1);
+  g_runtime_gl.BindTexture(GL_TEXTURE_2D, 0u);
+  g_runtime_gl.ActiveTexture(GL_TEXTURE2);
+  g_runtime_gl.BindTexture(GL_TEXTURE_2D, 0u);
+  g_runtime_gl.ActiveTexture(GL_TEXTURE3);
+  g_runtime_gl.BindTexture(GL_TEXTURE_2D, 0u);
+  g_runtime_gl.ActiveTexture(GL_TEXTURE0);
+  g_runtime_gl.BindTexture(GL_TEXTURE_2D, 0u);
+  g_runtime_gl.UseProgram(0u);
+  return true;
+}
+#endif
+
+static void runtime_destroy_sdl_renderer(SDL_Renderer **renderer) {
+  if (renderer == NULL || *renderer == NULL) {
+    return;
+  }
+#ifndef GLOOM_DOS_SDL3
+  runtime_gpu_destroy_transient_textures();
+  runtime_gpu_destroy_flat_renderer();
+  runtime_gpu_destroy_wall_renderer();
+  runtime_gpu_destroy_blood_renderer();
+  runtime_gpu_destroy_sprite_renderer();
+  runtime_gpu_destroy_red_renderer();
+  runtime_gpu_destroy_pixelate_renderer();
+  g_runtime_opengl_draw_backend = false;
+#endif
+  SDL_DestroyRenderer(*renderer);
+  *renderer = NULL;
 }
 
 static bool toggle_hd_art_render_enabled(void) {
@@ -3570,6 +5720,9 @@ static void free_wall_texture_set(WallTextureSet *set) {
   }
 
   for (i = 0; i < GLOOM_TEXTURE_SCREENS; ++i) {
+#ifndef GLOOM_DOS_SDL3
+    runtime_gpu_destroy_wall_texture_screen(&set->screens[i]);
+#endif
     free(set->screens[i].texels);
     free(set->screens[i].column_flags);
     free(set->screens[i].hd_argb_texels);
@@ -3592,6 +5745,9 @@ static bool clone_wall_texture_screen(const WallTextureScreen *source, WallTextu
     return false;
   }
 
+#ifndef GLOOM_DOS_SDL3
+  runtime_gpu_destroy_wall_texture_screen(destination);
+#endif
   free(destination->texels);
   free(destination->column_flags);
   free(destination->hd_argb_texels);
@@ -3605,6 +5761,14 @@ static bool clone_wall_texture_screen(const WallTextureScreen *source, WallTextu
   destination->column_flags = NULL;
   destination->hd_argb_texels = NULL;
   destination->hd_texture_loaded = NULL;
+#ifndef GLOOM_DOS_SDL3
+  destination->gpu_shaded_atlas_texture = 0u;
+  destination->gpu_shaded_atlas_texture_valid = false;
+  destination->gpu_hd_atlas_texture = 0u;
+  destination->gpu_hd_mask_texture = 0u;
+  destination->gpu_hd_atlas_texture_valid = false;
+  destination->gpu_hd_mask_texture_valid = false;
+#endif
 #ifdef GLOOM_DOS_SDL3
   destination->column_texels = NULL;
   destination->column_shaded_texels = NULL;
@@ -4958,6 +7122,10 @@ static void free_hud_font(HudFont *font) {
   }
 
   for (i = 0u; i < font->glyph_count; ++i) {
+#ifndef GLOOM_DOS_SDL3
+    runtime_gpu_destroy_texture(&font->glyphs[i].gpu_texture);
+    runtime_gpu_destroy_texture(&font->glyphs[i].gpu_hd_texture);
+#endif
     free(font->glyphs[i].argb_pixels);
     free(font->glyphs[i].hd_argb_pixels);
 #ifdef GLOOM_DOS_SDL3
@@ -5778,6 +7946,9 @@ static void free_flat_texture(FlatTexture *texture) {
     return;
   }
 
+#ifndef GLOOM_DOS_SDL3
+  runtime_gpu_destroy_flat_texture(texture);
+#endif
   free(texture->texels);
   free(texture->hd_argb_texels);
 #ifdef GLOOM_DOS_SDL3
@@ -5807,6 +7978,12 @@ static bool clone_flat_texture(const FlatTexture *source, FlatTexture *destinati
   *destination = *source;
   destination->texels = NULL;
   destination->hd_argb_texels = NULL;
+#ifndef GLOOM_DOS_SDL3
+  destination->gpu_shaded_texture = 0u;
+  destination->gpu_shaded_texture_valid = false;
+  destination->gpu_hd_texture = 0u;
+  destination->gpu_hd_texture_valid = false;
+#endif
 #ifdef GLOOM_DOS_SDL3
   destination->shaded_texels = NULL;
 #endif
@@ -7264,6 +9441,11 @@ static void free_object_visual(ObjectVisual *visual) {
   }
 
   for (i = 0u; i < visual->frame_count; ++i) {
+#ifndef GLOOM_DOS_SDL3
+    runtime_gpu_destroy_texture(&visual->frames[i].gpu_texture);
+    runtime_gpu_destroy_texture(&visual->frames[i].gpu_hd_texture);
+    runtime_gpu_destroy_object_frame_gl_texture(&visual->frames[i]);
+#endif
     free(visual->frames[i].argb_pixels);
     free(visual->frames[i].hd_argb_pixels);
 #ifdef GLOOM_DOS_SDL3
@@ -7303,6 +9485,12 @@ static bool clone_object_visual(const ObjectVisual *source, ObjectVisual *destin
     *dst_frame = *src_frame;
     dst_frame->argb_pixels = NULL;
     dst_frame->hd_argb_pixels = NULL;
+#ifndef GLOOM_DOS_SDL3
+    dst_frame->gpu_texture = NULL;
+    dst_frame->gpu_hd_texture = NULL;
+    dst_frame->gpu_gl_texture = 0u;
+    dst_frame->gpu_gl_texture_valid = false;
+#endif
 #ifdef GLOOM_DOS_SDL3
     dst_frame->indexed_pixels = NULL;
 #endif
@@ -7984,7 +10172,7 @@ static int run_iff_preview(const char *path) {
 cleanup:
   free(argb_pixels);
   if (texture != NULL) SDL_DestroyTexture(texture);
-  if (renderer != NULL) SDL_DestroyRenderer(renderer);
+  runtime_destroy_sdl_renderer(&renderer);
   if (window != NULL) SDL_DestroyWindow(window);
   SDL_Quit();
   gloom_iff_free(&image);
@@ -11671,6 +13859,31 @@ static bool sample_fast_wall_column_argb(const uint8_t *wall_texels, const uint3
   return true;
 }
 
+static bool wall_column_span_has_visible_sd_texel(const uint8_t *wall_texels, size_t wall_texel_base,
+                                                  bool transparent_wall_column, float wall_top,
+                                                  float wall_height, int y0, int y1) {
+  int draw_y = 0;
+
+  if (wall_texels == NULL || wall_height <= 0.0f || y0 > y1) {
+    return false;
+  }
+  if (!transparent_wall_column) {
+    return true;
+  }
+
+  for (draw_y = y0; draw_y <= y1; ++draw_y) {
+    float wall_v = ((float)draw_y + 0.5f - wall_top) / wall_height;
+    size_t ty = wall_texture_coord_from_unit(wall_v, (size_t)GLOOM_TEXTURE_HEIGHT);
+    uint8_t palette_index = wall_texels[wall_texel_base + (ty * (size_t)GLOOM_TEXTURE_WIDTH)];
+
+    if (palette_index != 0u) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
 static uint32_t amiga_blood_argb(uint16_t color_mask, float depth) {
   static const uint16_t blcols[16] = {0x0cccu, 0x0bbbu, 0x0aaau, 0x0999u, 0x0888u, 0x0777u, 0x0666u, 0x0555u,
                                      0x0444u, 0x0333u, 0x0222u, 0x0111u, 0x0111u, 0x0111u, 0x0111u, 0x0111u};
@@ -12647,6 +14860,9 @@ static void free_render_framebuffer(RenderFramebuffer *framebuffer) {
   free(framebuffer->last_frame_pixels);
   free(framebuffer->depth_buffer);
   free(framebuffer->sprite_depth_buffer);
+#ifndef GLOOM_DOS_SDL3
+  free(framebuffer->gpu_sprite_depth_buffer);
+#endif
 #ifdef GLOOM_DOS_SDL3
   free(framebuffer->depth_buffer_int);
   free(framebuffer->sprite_depth_buffer_int);
@@ -12658,6 +14874,9 @@ static void free_render_framebuffer(RenderFramebuffer *framebuffer) {
 static bool ensure_render_framebuffer(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, int width, int height) {
   float *depth_buffer = NULL;
   float *sprite_depth_buffer = NULL;
+#ifndef GLOOM_DOS_SDL3
+  float *gpu_sprite_depth_buffer = NULL;
+#endif
 #ifdef GLOOM_DOS_SDL3
   int32_t *depth_buffer_int = NULL;
   int32_t *sprite_depth_buffer_int = NULL;
@@ -12682,6 +14901,7 @@ static bool ensure_render_framebuffer(SDL_Renderer *renderer, RenderFramebuffer 
 #ifndef GLOOM_DOS_SDL3
   depth_buffer = (float *)malloc((size_t)width * sizeof(*depth_buffer));
   sprite_depth_buffer = (float *)malloc((size_t)width * sizeof(*sprite_depth_buffer));
+  gpu_sprite_depth_buffer = (float *)malloc((size_t)width * sizeof(*gpu_sprite_depth_buffer));
 #else
   depth_buffer_int = (int32_t *)malloc((size_t)width * sizeof(*depth_buffer_int));
   sprite_depth_buffer_int = (int32_t *)malloc((size_t)width * sizeof(*sprite_depth_buffer_int));
@@ -12696,11 +14916,15 @@ static bool ensure_render_framebuffer(SDL_Renderer *renderer, RenderFramebuffer 
   if (depth_buffer_int == NULL || sprite_depth_buffer_int == NULL || filled_stamps == NULL ||
       last_frame_indices == NULL) {
 #else
-  if (depth_buffer == NULL || sprite_depth_buffer == NULL || filled_stamps == NULL || last_frame_pixels == NULL) {
+  if (depth_buffer == NULL || sprite_depth_buffer == NULL || gpu_sprite_depth_buffer == NULL ||
+      filled_stamps == NULL || last_frame_pixels == NULL) {
 #endif
     fprintf(stderr, "Cannot allocate PC renderer scratch buffers %dx%d\n", width, height);
     free(depth_buffer);
     free(sprite_depth_buffer);
+#ifndef GLOOM_DOS_SDL3
+    free(gpu_sprite_depth_buffer);
+#endif
 #ifdef GLOOM_DOS_SDL3
     free(depth_buffer_int);
     free(sprite_depth_buffer_int);
@@ -12721,6 +14945,9 @@ static bool ensure_render_framebuffer(SDL_Renderer *renderer, RenderFramebuffer 
     fprintf(stderr, "Cannot create PC renderer framebuffer texture %dx%d: %s\n", width, height, SDL_GetError());
     free(depth_buffer);
     free(sprite_depth_buffer);
+#ifndef GLOOM_DOS_SDL3
+    free(gpu_sprite_depth_buffer);
+#endif
 #ifdef GLOOM_DOS_SDL3
     free(depth_buffer_int);
     free(sprite_depth_buffer_int);
@@ -12758,6 +14985,9 @@ static bool ensure_render_framebuffer(SDL_Renderer *renderer, RenderFramebuffer 
   framebuffer->last_frame_pixels = last_frame_pixels;
   framebuffer->depth_buffer = depth_buffer;
   framebuffer->sprite_depth_buffer = sprite_depth_buffer;
+#ifndef GLOOM_DOS_SDL3
+  framebuffer->gpu_sprite_depth_buffer = gpu_sprite_depth_buffer;
+#endif
 #ifdef GLOOM_DOS_SDL3
   framebuffer->depth_buffer_int = depth_buffer_int;
   framebuffer->sprite_depth_buffer_int = sprite_depth_buffer_int;
@@ -13392,6 +15622,465 @@ static void render_flat_textures(RenderFramebuffer *framebuffer, const AppState 
   }
 }
 
+#ifndef GLOOM_DOS_SDL3
+typedef struct {
+  GLuint texture_id;
+  GLuint hd_texture_id;
+  GLuint hd_mask_texture_id;
+  bool hd_enabled;
+  int hd_width;
+  int hd_height;
+  GLsizei vertex_count;
+  GLfloat vertices[2048u * 6u * 8u];
+} RuntimeGpuWallBatch;
+
+static bool runtime_gpu_wall_flush_batch(RuntimeGpuWallBatch *batch) {
+  enum { FLOATS_PER_VERTEX = 8 };
+  GLsizei stride = (GLsizei)(FLOATS_PER_VERTEX * (int)sizeof(GLfloat));
+
+  if (batch == NULL || batch->vertex_count <= 0) {
+    return true;
+  }
+  if (batch->texture_id == 0u || !g_runtime_gpu_wall_renderer.initialized) {
+    batch->vertex_count = 0;
+    return false;
+  }
+
+  g_runtime_gl.ActiveTexture(GL_TEXTURE0);
+  g_runtime_gl.BindTexture(GL_TEXTURE_2D, batch->texture_id);
+  g_runtime_gl.Uniform1i(g_runtime_gpu_wall_renderer.uniform_wall_texture, 0);
+  g_runtime_gl.ActiveTexture(GL_TEXTURE1);
+  g_runtime_gl.BindTexture(GL_TEXTURE_2D, batch->hd_enabled ? batch->hd_texture_id : 0u);
+  g_runtime_gl.Uniform1i(g_runtime_gpu_wall_renderer.uniform_wall_hd_texture, 1);
+  g_runtime_gl.ActiveTexture(GL_TEXTURE2);
+  g_runtime_gl.BindTexture(GL_TEXTURE_2D, batch->hd_enabled ? batch->hd_mask_texture_id : 0u);
+  g_runtime_gl.Uniform1i(g_runtime_gpu_wall_renderer.uniform_wall_hd_mask_texture, 2);
+  g_runtime_gl.Uniform1f(g_runtime_gpu_wall_renderer.uniform_hd_enabled, batch->hd_enabled ? 1.0f : 0.0f);
+  g_runtime_gl.Uniform2f(g_runtime_gpu_wall_renderer.uniform_hd_size,
+                         batch->hd_width > 0 ? (GLfloat)batch->hd_width : 1.0f,
+                         batch->hd_height > 0 ? (GLfloat)batch->hd_height : 1.0f);
+  g_runtime_gl.BindBuffer(GL_ARRAY_BUFFER, g_runtime_gpu_wall_renderer.vbo);
+  g_runtime_gl.BufferData(GL_ARRAY_BUFFER,
+                          (GLsizeiptr)((size_t)batch->vertex_count * (size_t)FLOATS_PER_VERTEX *
+                                       sizeof(batch->vertices[0])),
+                          batch->vertices, GL_STREAM_DRAW);
+  g_runtime_gl.EnableVertexAttribArray(0u);
+  g_runtime_gl.EnableVertexAttribArray(1u);
+  g_runtime_gl.EnableVertexAttribArray(2u);
+  g_runtime_gl.EnableVertexAttribArray(3u);
+  g_runtime_gl.EnableVertexAttribArray(4u);
+  g_runtime_gl.EnableVertexAttribArray(5u);
+  g_runtime_gl.EnableVertexAttribArray(6u);
+  g_runtime_gl.VertexAttribPointer(0u, 2, GL_FLOAT, GL_FALSE, stride, (const void *)0);
+  g_runtime_gl.VertexAttribPointer(1u, 1, GL_FLOAT, GL_FALSE, stride,
+                                   (const void *)(2u * sizeof(GLfloat)));
+  g_runtime_gl.VertexAttribPointer(2u, 1, GL_FLOAT, GL_FALSE, stride,
+                                   (const void *)(3u * sizeof(GLfloat)));
+  g_runtime_gl.VertexAttribPointer(3u, 1, GL_FLOAT, GL_FALSE, stride,
+                                   (const void *)(4u * sizeof(GLfloat)));
+  g_runtime_gl.VertexAttribPointer(4u, 1, GL_FLOAT, GL_FALSE, stride,
+                                   (const void *)(5u * sizeof(GLfloat)));
+  g_runtime_gl.VertexAttribPointer(5u, 1, GL_FLOAT, GL_FALSE, stride,
+                                   (const void *)(6u * sizeof(GLfloat)));
+  g_runtime_gl.VertexAttribPointer(6u, 1, GL_FLOAT, GL_FALSE, stride,
+                                   (const void *)(7u * sizeof(GLfloat)));
+  g_runtime_gl.DrawArrays(GL_TRIANGLES, 0, batch->vertex_count);
+  batch->vertex_count = 0;
+  return true;
+}
+
+static bool runtime_gpu_wall_add_quad(RuntimeGpuWallBatch *batch, GLuint texture_id, int screen_x, int y0, int y1,
+                                      float wall_top, float wall_height, size_t local_index, size_t texture_x,
+                                      int dark_index, float local_u, GLuint hd_texture_id, GLuint hd_mask_texture_id,
+                                      bool hd_enabled, int hd_width, int hd_height, int render_width,
+                                      int render_height) {
+  enum {
+    FLOATS_PER_VERTEX = 8,
+    VERTICES_PER_QUAD = 6,
+    BATCH_VERTEX_CAPACITY = 2048 * VERTICES_PER_QUAD,
+    WALL_ATLAS_WIDTH = GLOOM_TEXTURES_PER_SCREEN * GLOOM_TEXTURE_WIDTH
+  };
+  GLfloat left = 0.0f;
+  GLfloat right = 0.0f;
+  GLfloat top = 0.0f;
+  GLfloat bottom = 0.0f;
+  GLfloat tex_x = 0.0f;
+  GLfloat wall_v_top = 0.0f;
+  GLfloat wall_v_bottom = 0.0f;
+  GLfloat atlas_y_base = 0.0f;
+  GLfloat hd_tex_x = 0.0f;
+  GLfloat hd_slot_u = 0.0f;
+  GLfloat subtract = 0.0f;
+  GLfloat quad[VERTICES_PER_QUAD][FLOATS_PER_VERTEX];
+  int v = 0;
+
+  if (batch == NULL || texture_id == 0u || screen_x < 0 || render_width <= 0 || render_height <= 0 ||
+      y0 > y1 || wall_height <= 0.0f || local_index >= (size_t)GLOOM_TEXTURES_PER_SCREEN ||
+      texture_x >= (size_t)GLOOM_TEXTURE_WIDTH || dark_index < 0 || dark_index >= 16) {
+    return false;
+  }
+
+  if (batch->texture_id != texture_id || batch->hd_texture_id != hd_texture_id ||
+      batch->hd_mask_texture_id != hd_mask_texture_id || batch->hd_enabled != hd_enabled ||
+      batch->hd_width != hd_width || batch->hd_height != hd_height) {
+    if (!runtime_gpu_wall_flush_batch(batch)) {
+      return false;
+    }
+    batch->texture_id = texture_id;
+    batch->hd_texture_id = hd_texture_id;
+    batch->hd_mask_texture_id = hd_mask_texture_id;
+    batch->hd_enabled = hd_enabled;
+    batch->hd_width = hd_width;
+    batch->hd_height = hd_height;
+  } else if (batch->vertex_count + (GLsizei)VERTICES_PER_QUAD > (GLsizei)BATCH_VERTEX_CAPACITY) {
+    if (!runtime_gpu_wall_flush_batch(batch)) {
+      return false;
+    }
+    batch->texture_id = texture_id;
+    batch->hd_texture_id = hd_texture_id;
+    batch->hd_mask_texture_id = hd_mask_texture_id;
+    batch->hd_enabled = hd_enabled;
+    batch->hd_width = hd_width;
+    batch->hd_height = hd_height;
+  }
+
+  left = ((GLfloat)screen_x / (GLfloat)render_width) * 2.0f - 1.0f;
+  right = ((GLfloat)(screen_x + 1) / (GLfloat)render_width) * 2.0f - 1.0f;
+  top = 1.0f - (((GLfloat)y0 / (GLfloat)render_height) * 2.0f);
+  bottom = 1.0f - (((GLfloat)(y1 + 1) / (GLfloat)render_height) * 2.0f);
+  tex_x = (GLfloat)(((local_index * (size_t)GLOOM_TEXTURE_WIDTH) + texture_x) + 0.5f) /
+          (GLfloat)WALL_ATLAS_WIDTH;
+  wall_v_top = (GLfloat)(((float)y0 - wall_top) / wall_height);
+  wall_v_bottom = (GLfloat)(((float)(y1 + 1) - wall_top) / wall_height);
+  atlas_y_base = (GLfloat)(dark_index * GLOOM_TEXTURE_HEIGHT);
+  if (hd_enabled && hd_width > 0) {
+    size_t hd_tx = wall_texture_coord_from_unit(local_u, (size_t)hd_width);
+
+    hd_tex_x = (GLfloat)((local_index * (size_t)hd_width) + hd_tx + 0.5f) /
+               (GLfloat)(GLOOM_TEXTURES_PER_SCREEN * hd_width);
+  }
+  hd_slot_u = (GLfloat)(local_index + 0.5f) / (GLfloat)GLOOM_TEXTURES_PER_SCREEN;
+  subtract = (GLfloat)(dark_index * 17) / 255.0f;
+
+  quad[0][0] = left;
+  quad[0][1] = top;
+  quad[0][2] = tex_x;
+  quad[0][3] = wall_v_top;
+  quad[0][4] = atlas_y_base;
+  quad[0][5] = hd_tex_x;
+  quad[0][6] = hd_slot_u;
+  quad[0][7] = subtract;
+  quad[1][0] = right;
+  quad[1][1] = top;
+  quad[1][2] = tex_x;
+  quad[1][3] = wall_v_top;
+  quad[1][4] = atlas_y_base;
+  quad[1][5] = hd_tex_x;
+  quad[1][6] = hd_slot_u;
+  quad[1][7] = subtract;
+  quad[2][0] = left;
+  quad[2][1] = bottom;
+  quad[2][2] = tex_x;
+  quad[2][3] = wall_v_bottom;
+  quad[2][4] = atlas_y_base;
+  quad[2][5] = hd_tex_x;
+  quad[2][6] = hd_slot_u;
+  quad[2][7] = subtract;
+  quad[3][0] = right;
+  quad[3][1] = top;
+  quad[3][2] = tex_x;
+  quad[3][3] = wall_v_top;
+  quad[3][4] = atlas_y_base;
+  quad[3][5] = hd_tex_x;
+  quad[3][6] = hd_slot_u;
+  quad[3][7] = subtract;
+  quad[4][0] = right;
+  quad[4][1] = bottom;
+  quad[4][2] = tex_x;
+  quad[4][3] = wall_v_bottom;
+  quad[4][4] = atlas_y_base;
+  quad[4][5] = hd_tex_x;
+  quad[4][6] = hd_slot_u;
+  quad[4][7] = subtract;
+  quad[5][0] = left;
+  quad[5][1] = bottom;
+  quad[5][2] = tex_x;
+  quad[5][3] = wall_v_bottom;
+  quad[5][4] = atlas_y_base;
+  quad[5][5] = hd_tex_x;
+  quad[5][6] = hd_slot_u;
+  quad[5][7] = subtract;
+
+  for (v = 0; v < VERTICES_PER_QUAD; ++v) {
+    memcpy(batch->vertices + ((size_t)batch->vertex_count * (size_t)FLOATS_PER_VERTEX), quad[v],
+           sizeof(quad[v]));
+    batch->vertex_count += 1;
+  }
+
+  return true;
+}
+
+static bool runtime_gpu_render_wall_view(SDL_Renderer *renderer, const AppState *state,
+                                         const GridOffsetSet *grid_offsets,
+                                         const WallTextureSet *wall_textures, int x, int y, int w, int h,
+                                         int render_width, int render_height) {
+  float near_plane = 1.0f;
+  float cam_x = 0.0f;
+  float cam_z = 0.0f;
+  float view_cos = 0.0f;
+  float view_sin = 0.0f;
+  float focal = 0.0f;
+  float far_depth = (float)GLOOM_AMIGA_MAX_Z;
+  int horizon_y = y + (h / 2);
+  WallCandidate wall_candidates[GLOOM_MAX_WALL_CANDIDATES];
+  SceneWall scene_walls[GLOOM_MAX_WALL_CANDIDATES];
+  size_t wall_candidate_count = 0u;
+  size_t scene_wall_count = 0u;
+  size_t i = 0u;
+  RuntimeGpuWallBatch batch;
+  double profile_start_ms = 0.0;
+  double profile_phase_start_ms = 0.0;
+  bool ok = true;
+
+  if (renderer == NULL || state == NULL || grid_offsets == NULL || wall_textures == NULL ||
+      wall_textures->loaded_count == 0u || w <= 0 || h <= 0 || render_width <= 0 || render_height <= 0 ||
+      !runtime_opengl_draw_backend_active()) {
+    return false;
+  }
+  if (!runtime_gpu_prepare_wall_texture_set(renderer, wall_textures) || !runtime_gpu_init_wall_renderer()) {
+    return false;
+  }
+  if (SDL_RenderFlush(renderer) != 0) {
+    runtime_logf("OpenGL wall renderer: SDL_RenderFlush failed: %s", SDL_GetError());
+    return false;
+  }
+
+  profile_start_ms = profile_now_ms();
+  cam_x = state->camera_x;
+  cam_z = state->camera_z;
+  view_cos = SDL_cosf(state->camera_angle);
+  view_sin = SDL_sinf(state->camera_angle);
+  focal = projection_focal_for_viewport(w, h);
+
+  profile_phase_start_ms = profile_now_ms();
+  wall_candidate_count =
+      collect_wall_candidates_from_grid(&state->map, grid_offsets, cam_x, cam_z, wall_candidates,
+                                        sizeof(wall_candidates) / sizeof(wall_candidates[0]));
+  append_runtime_rotpoly_wall_candidates(state, wall_candidates, &wall_candidate_count,
+                                         sizeof(wall_candidates) / sizeof(wall_candidates[0]), cam_x, cam_z);
+  sort_wall_candidates(wall_candidates, wall_candidate_count);
+
+  for (i = 0; i < wall_candidate_count; ++i) {
+    const GloomZone *z = &state->map.zones[wall_candidates[i].zone_index];
+    float x1 = (float)z->x1 - cam_x;
+    float z1 = (float)z->z1 - cam_z;
+    float x2 = (float)z->x2 - cam_x;
+    float z2 = (float)z->z2 - cam_z;
+    float vx1 = x1 * view_cos - z1 * view_sin;
+    float vz1 = x1 * view_sin + z1 * view_cos;
+    float vx2 = x2 * view_cos - z2 * view_sin;
+    float vz2 = x2 * view_sin + z2 * view_cos;
+    float face_a = vz1 - vz2;
+    float face_b = vx2 - vx1;
+    float face_c = vx1 * face_a + vz1 * face_b;
+    SceneWall *scene_wall = NULL;
+
+    if (vz1 <= 0.0f && vz2 <= 0.0f) {
+      continue;
+    }
+    if (vz1 >= far_depth && vz2 >= far_depth) {
+      continue;
+    }
+    if (face_c < 0.0f) {
+      continue;
+    }
+    if (scene_wall_count >= sizeof(scene_walls) / sizeof(scene_walls[0])) {
+      break;
+    }
+
+    scene_wall = &scene_walls[scene_wall_count++];
+    scene_wall->zone = z;
+    scene_wall->vx1 = vx1;
+    scene_wall->vz1 = vz1;
+    scene_wall->vx2 = vx2;
+    scene_wall->vz2 = vz2;
+    scene_wall->sort_depth = wall_candidates[i].sort_depth;
+    scene_wall->column_min = 0;
+    scene_wall->column_max = w - 1;
+    if (vz1 > near_plane && vz2 > near_plane) {
+      float ratio1 = vx1 / vz1;
+      float ratio2 = vx2 / vz2;
+      float min_ratio = ratio1 < ratio2 ? ratio1 : ratio2;
+      float max_ratio = ratio1 > ratio2 ? ratio1 : ratio2;
+
+      scene_wall->column_min = (int)((float)(w / 2) + (min_ratio * focal)) - 2;
+      scene_wall->column_max = (int)((float)(w / 2) + (max_ratio * focal)) + 2;
+      if (scene_wall->column_min < 0) scene_wall->column_min = 0;
+      if (scene_wall->column_max > w - 1) scene_wall->column_max = w - 1;
+    }
+    if (scene_wall->column_min > scene_wall->column_max) {
+      scene_wall_count -= 1u;
+    }
+  }
+  profile_add_elapsed(&g_profiler.render_wall_search_ms, profile_phase_start_ms);
+
+  memset(&batch, 0, sizeof(batch));
+  g_runtime_gl.Viewport(0, 0, (GLsizei)render_width, (GLsizei)render_height);
+  g_runtime_gl.Disable(GL_BLEND);
+  g_runtime_gl.UseProgram(g_runtime_gpu_wall_renderer.program);
+
+  profile_phase_start_ms = profile_now_ms();
+  for (i = 0u; ok && i < (size_t)w; ++i) {
+    int screen_x = x + (int)i;
+    float ray_x = ((float)((int)i - (w / 2))) / focal;
+    RayWallHit hits[GLOOM_MAX_COLUMN_WALL_HITS];
+    size_t hit_count = 0u;
+    size_t wall_index = 0u;
+    size_t hit_cursor = 0u;
+
+    for (wall_index = 0u; wall_index < scene_wall_count; ++wall_index) {
+      const SceneWall *wall = &scene_walls[wall_index];
+      float sx = wall->vx2 - wall->vx1;
+      float sz = wall->vz2 - wall->vz1;
+      float denom = ray_x * sz - sx;
+      float depth = 0.0f;
+      float wall_u = 0.0f;
+
+      if ((int)i < wall->column_min || (int)i > wall->column_max) {
+        continue;
+      }
+      if (SDL_fabsf(denom) < 0.0001f) {
+        continue;
+      }
+
+      depth = (wall->vx1 * sz - wall->vz1 * sx) / denom;
+      if (depth < near_plane || depth >= far_depth) {
+        continue;
+      }
+
+      wall_u = (wall->vx1 - wall->vz1 * ray_x) / denom;
+      if (wall_u < -0.0005f || wall_u > 1.0005f) {
+        continue;
+      }
+
+      if (wall->zone->event_id > 0) {
+        float open_threshold = (float)(uint16_t)wall->zone->event_id / 32768.0f;
+
+        if (wall_u < open_threshold) {
+          continue;
+        }
+      }
+
+      {
+        RayWallHit hit;
+        size_t insert_at = hit_count;
+
+        hit.wall = wall;
+        hit.depth = depth;
+        hit.wall_u = clampf(wall_u, 0.0f, 1.0f);
+
+        while (insert_at > 0u && hits[insert_at - 1u].depth > hit.depth) {
+          if (insert_at < (size_t)GLOOM_MAX_COLUMN_WALL_HITS) {
+            hits[insert_at] = hits[insert_at - 1u];
+          }
+          insert_at -= 1u;
+        }
+        if (insert_at < (size_t)GLOOM_MAX_COLUMN_WALL_HITS) {
+          hits[insert_at] = hit;
+          if (hit_count < (size_t)GLOOM_MAX_COLUMN_WALL_HITS) {
+            hit_count += 1u;
+          }
+        }
+      }
+    }
+
+    for (hit_cursor = hit_count; ok && hit_cursor > 0u; --hit_cursor) {
+      const RayWallHit *hit = &hits[hit_cursor - 1u];
+      const GloomZone *zone = hit->wall->zone;
+      float wall_top =
+          (float)horizon_y + (((float)GLOOM_WALL_TOP_Y - state->camera_y) * focal) / hit->depth;
+      float wall_bottom =
+          (float)horizon_y + (((float)GLOOM_WALL_BOTTOM_Y - state->camera_y) * focal) / hit->depth;
+      float wall_height = wall_bottom - wall_top;
+      int y0 = (int)wall_top;
+      int y1 = (int)wall_bottom;
+      int dark_index = (int)amiga_depth_dark_index(hit->depth);
+      int tile_index = 0;
+      uint8_t texture_index = 0u;
+      size_t screen_index = 0u;
+      size_t local_index = 0u;
+      size_t texture_x = 0u;
+      float local_u = 0.0f;
+      bool screen_hd_ready = false;
+      const WallTextureScreen *screen = NULL;
+
+      if (wall_height < 1.0f) {
+        float center_y = (wall_top + wall_bottom) * 0.5f;
+
+        wall_top = center_y - 0.5f;
+        wall_bottom = center_y + 0.5f;
+        wall_height = wall_bottom - wall_top;
+        y0 = (int)wall_top;
+        y1 = (int)wall_bottom;
+      }
+      if (y0 < y) y0 = y;
+      if (y1 > y + h - 1) y1 = y + h - 1;
+      if (y0 > y1 || wall_height <= 0.0f || zone == NULL) {
+        continue;
+      }
+
+      zone_wall_texture_coordinates(zone, hit->wall_u, &tile_index, &local_u, &texture_x);
+      texture_index = remap_wall_texture_index(state, zone->textures[tile_index]);
+      screen_index = texture_index / (uint8_t)GLOOM_TEXTURES_PER_SCREEN;
+      local_index = texture_index % (uint8_t)GLOOM_TEXTURES_PER_SCREEN;
+      if (screen_index >= (size_t)GLOOM_TEXTURE_SCREENS) {
+        continue;
+      }
+      screen = &wall_textures->screens[screen_index];
+      if (!screen->loaded || !screen->gpu_shaded_atlas_texture_valid ||
+          screen->gpu_shaded_atlas_texture == 0u || local_index >= screen->texture_count) {
+        continue;
+      }
+      screen_hd_ready = hd_art_render_enabled() && screen->gpu_hd_atlas_texture_valid &&
+                        screen->gpu_hd_atlas_texture != 0u && screen->gpu_hd_mask_texture_valid &&
+                        screen->gpu_hd_mask_texture != 0u && screen->hd_width > 0 && screen->hd_height > 0;
+
+      ok = runtime_gpu_wall_add_quad(&batch, screen->gpu_shaded_atlas_texture, screen_x, y0, y1, wall_top,
+                                     wall_height, local_index, texture_x, dark_index, local_u,
+                                     screen->gpu_hd_atlas_texture, screen->gpu_hd_mask_texture, screen_hd_ready,
+                                     screen->hd_width, screen->hd_height, render_width, render_height);
+    }
+  }
+
+  if (ok) {
+    ok = runtime_gpu_wall_flush_batch(&batch);
+  }
+  profile_add_elapsed(&g_profiler.render_wall_draw_ms, profile_phase_start_ms);
+  profile_add_elapsed(&g_profiler.render_wall_ms, profile_start_ms);
+
+  g_runtime_gl.DisableVertexAttribArray(0u);
+  g_runtime_gl.DisableVertexAttribArray(1u);
+  g_runtime_gl.DisableVertexAttribArray(2u);
+  g_runtime_gl.DisableVertexAttribArray(3u);
+  g_runtime_gl.DisableVertexAttribArray(4u);
+  g_runtime_gl.DisableVertexAttribArray(5u);
+  g_runtime_gl.DisableVertexAttribArray(6u);
+  g_runtime_gl.BindBuffer(GL_ARRAY_BUFFER, 0u);
+  g_runtime_gl.ActiveTexture(GL_TEXTURE2);
+  g_runtime_gl.BindTexture(GL_TEXTURE_2D, 0u);
+  g_runtime_gl.ActiveTexture(GL_TEXTURE1);
+  g_runtime_gl.BindTexture(GL_TEXTURE_2D, 0u);
+  g_runtime_gl.ActiveTexture(GL_TEXTURE0);
+  g_runtime_gl.BindTexture(GL_TEXTURE_2D, 0u);
+  g_runtime_gl.UseProgram(0u);
+
+  if (!ok) {
+    runtime_logf("OpenGL wall renderer: draw batch failed");
+  }
+  return ok;
+}
+#endif
+
 #ifdef GLOOM_DOS_SDL3
 static int32_t dos_mul_shift15(int32_t a, int32_t b) {
   return (a * b) >> 15;
@@ -13936,7 +16625,9 @@ static int projectile_sprite_source_pad(uint8_t weapon_index) {
 static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *state, const GridOffsetSet *grid_offsets,
                               const WallTextureSet *wall_textures, const FlatTextureSet *flats,
                               const ObjectVisualSet *object_visuals, const WeaponVisualSet *weapon_visuals, int x,
-                              int y, int w, int h) {
+                              int y, int w, int h, bool draw_flats, bool draw_walls, bool draw_blood,
+                              DebugSprite *out_sprites, size_t out_sprite_capacity, size_t *out_sprite_count,
+                              bool draw_sprites) {
   float near_plane = 1.0f;
   float view_angle = state->camera_angle;
   float cam_x = state->camera_x;
@@ -13954,7 +16645,7 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
   float *sprite_depth_buffer = NULL;
 #endif
   uint32_t *filled_stamps = NULL;
-  DebugSprite debug_sprites[GLOOM_MAX_DEBUG_SPRITES];
+  DebugSprite *debug_sprites = g_runtime_debug_sprite_scratch;
   WallCandidate wall_candidates[GLOOM_MAX_WALL_CANDIDATES];
 #ifndef GLOOM_DOS_SDL3
   SceneWall scene_walls[GLOOM_MAX_WALL_CANDIDATES];
@@ -13970,6 +16661,10 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
 #ifndef GLOOM_DOS_SDL3
   double profile_wall_phase_start_ms = 0.0;
 #endif
+
+  if (out_sprite_count != NULL) {
+    *out_sprite_count = 0u;
+  }
 
   if (w <= 0 || h <= 0) {
     return;
@@ -13995,7 +16690,7 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
 #endif
     return;
   }
-  memset(debug_sprites, 0, sizeof(debug_sprites));
+  memset(debug_sprites, 0, (size_t)GLOOM_MAX_DEBUG_SPRITES * sizeof(*debug_sprites));
 
   wall_candidate_count =
       collect_wall_candidates_from_grid(&state->map, grid_offsets, cam_x, cam_z, wall_candidates,
@@ -14020,20 +16715,26 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
   }
 
 #ifdef GLOOM_DOS_SDL3
-  profile_start_ms = profile_now_ms();
-  render_flat_textures(framebuffer, state, flats, x, y, w, h, focal, far_depth, view_cos, view_sin, false);
-  profile_add_elapsed(&g_profiler.render_flat_ms, profile_start_ms);
-  audio_dos_pump(&g_audio);
+  if (draw_flats) {
+    profile_start_ms = profile_now_ms();
+    render_flat_textures(framebuffer, state, flats, x, y, w, h, focal, far_depth, view_cos, view_sin, false);
+    profile_add_elapsed(&g_profiler.render_flat_ms, profile_start_ms);
+    audio_dos_pump(&g_audio);
+  }
 
-  profile_start_ms = profile_now_ms();
-  render_wall_columns_dos_fixed(framebuffer, state, wall_textures, wall_candidates, wall_candidate_count, x, y, w, h,
-                                horizon_y, view_cos, view_sin, focal);
-  profile_add_elapsed(&g_profiler.render_wall_ms, profile_start_ms);
-  audio_dos_pump(&g_audio);
+  if (draw_walls) {
+    profile_start_ms = profile_now_ms();
+    render_wall_columns_dos_fixed(framebuffer, state, wall_textures, wall_candidates, wall_candidate_count, x, y, w, h,
+                                  horizon_y, view_cos, view_sin, focal);
+    profile_add_elapsed(&g_profiler.render_wall_ms, profile_start_ms);
+    audio_dos_pump(&g_audio);
+  }
 #else
-  profile_start_ms = profile_now_ms();
-  render_flat_textures(framebuffer, state, flats, x, y, w, h, focal, far_depth, view_cos, view_sin);
-  profile_add_elapsed(&g_profiler.render_flat_ms, profile_start_ms);
+  if (draw_flats) {
+    profile_start_ms = profile_now_ms();
+    render_flat_textures(framebuffer, state, flats, x, y, w, h, focal, far_depth, view_cos, view_sin);
+    profile_add_elapsed(&g_profiler.render_flat_ms, profile_start_ms);
+  }
 
   profile_start_ms = profile_now_ms();
   if (g_profiler.enabled) {
@@ -14259,6 +16960,48 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
           }
         }
       }
+#ifndef GLOOM_DOS_SDL3
+      if (!draw_walls) {
+        bool column_visible = false;
+
+        if (fast_wall_column) {
+          if (wall_hd_texels == NULL) {
+            column_visible =
+                wall_column_span_has_visible_sd_texel(wall_texels, wall_texel_base, transparent_wall_column,
+                                                      wall_top, wall_height, y0, y1);
+          } else {
+            for (draw_y = y0; draw_y <= y1; ++draw_y) {
+              float wall_v = ((float)draw_y + 0.5f - wall_top) / wall_height;
+              uint32_t argb = 0u;
+
+              if (sample_fast_wall_column_argb(wall_texels, wall_palette, wall_texel_base,
+                                               transparent_wall_column, wall_hd_texels, wall_hd_width,
+                                               wall_hd_height, wall_hd_texel_base, wall_v, subtract, &argb) &&
+                  (argb >> 24u) != 0u) {
+                column_visible = true;
+                break;
+              }
+            }
+          }
+        } else {
+          for (draw_y = y0; draw_y <= y1; ++draw_y) {
+            float wall_v = ((float)draw_y + 0.5f - wall_top) / wall_height;
+            uint32_t argb = sample_zone_wall_texture_argb(wall_textures, state, hit->wall->zone,
+                                                          hit->wall_u, wall_v);
+
+            argb = shade_argb_subtract(argb, subtract);
+            if ((argb >> 24u) != 0u) {
+              column_visible = true;
+              break;
+            }
+          }
+        }
+        if (column_visible && hit->depth < depth_buffer[i]) {
+          depth_buffer[i] = hit->depth;
+        }
+        continue;
+      }
+#endif
 #ifdef GLOOM_DOS_SDL3
       {
         int32_t wall_v_fixed = dos_float_to_fixed16(((float)y0 + 0.5f - wall_top) / wall_height);
@@ -14671,49 +17414,51 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
     }
   }
 
-  for (i = 0u; i < GLOOM_MAX_RUNTIME_BLOOD; ++i) {
-    const RuntimeBlood *blood = &state->blood[i];
-    float dx = 0.0f;
-    float dz = 0.0f;
-    float svx = 0.0f;
-    float svz = 0.0f;
-    float by = 0.0f;
-    int screen_x = 0;
-    int screen_y = 0;
-    uint32_t argb = 0;
+  if (draw_blood) {
+    for (i = 0u; i < GLOOM_MAX_RUNTIME_BLOOD; ++i) {
+      const RuntimeBlood *blood = &state->blood[i];
+      float dx = 0.0f;
+      float dz = 0.0f;
+      float svx = 0.0f;
+      float svz = 0.0f;
+      float by = 0.0f;
+      int screen_x = 0;
+      int screen_y = 0;
+      uint32_t argb = 0;
 
-    if (!blood->active || blood->color_mask == 0u) {
-      continue;
-    }
+      if (!blood->active || blood->color_mask == 0u) {
+        continue;
+      }
 
-    dx = blood->x - cam_x;
-    dz = blood->z - cam_z;
-    svx = dx * view_cos - dz * view_sin;
-    svz = dx * view_sin + dz * view_cos;
-    if (svz <= 0.0f || svz >= far_depth) {
-      continue;
-    }
+      dx = blood->x - cam_x;
+      dz = blood->z - cam_z;
+      svx = dx * view_cos - dz * view_sin;
+      svz = dx * view_sin + dz * view_cos;
+      if (svz <= 0.0f || svz >= far_depth) {
+        continue;
+      }
 
-    by = blood->y;
-    if (by > 0.0f) {
-      by = -by;
-    }
-    by -= state->camera_y;
+      by = blood->y;
+      if (by > 0.0f) {
+        by = -by;
+      }
+      by -= state->camera_y;
 
-    screen_x = round_float_to_int32((float)x + (float)w * 0.5f + (svx / svz) * focal);
-    screen_y = round_float_to_int32((float)horizon_y + (by / svz) * focal);
-    if (screen_x < x || screen_x >= x + w || screen_y < y || screen_y >= y + h) {
-      continue;
-    }
+      screen_x = round_float_to_int32((float)x + (float)w * 0.5f + (svx / svz) * focal);
+      screen_y = round_float_to_int32((float)horizon_y + (by / svz) * focal);
+      if (screen_x < x || screen_x >= x + w || screen_y < y || screen_y >= y + h) {
+        continue;
+      }
 
-    argb = amiga_blood_argb(blood->color_mask, svz);
+      argb = amiga_blood_argb(blood->color_mask, svz);
 #ifdef GLOOM_DOS_SDL3
-    framebuffer->index_pixels[(size_t)screen_y * (size_t)framebuffer->index_pitch_pixels + (size_t)screen_x] =
-        dos_argb_to_opaque_index(argb);
+      framebuffer->index_pixels[(size_t)screen_y * (size_t)framebuffer->index_pitch_pixels + (size_t)screen_x] =
+          dos_argb_to_opaque_index(argb);
 #else
-    framebuffer->pixels[(size_t)screen_y * (size_t)framebuffer->pitch_pixels + (size_t)screen_x] =
-        0xFF000000u | (argb & 0x00FFFFFFu);
+      framebuffer->pixels[(size_t)screen_y * (size_t)framebuffer->pitch_pixels + (size_t)screen_x] =
+          0xFF000000u | (argb & 0x00FFFFFFu);
 #endif
+    }
   }
 
   for (i = 0; i < (size_t)w; ++i) {
@@ -14751,6 +17496,26 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
       }
     }
 #endif
+  }
+
+  if (out_sprites != NULL && out_sprite_count != NULL && out_sprite_capacity > 0u) {
+    size_t copy_count = sprite_write < out_sprite_capacity ? sprite_write : out_sprite_capacity;
+
+    if (copy_count > 0u) {
+      memcpy(out_sprites, debug_sprites, copy_count * sizeof(*out_sprites));
+    }
+    *out_sprite_count = copy_count;
+  }
+
+  if (!draw_sprites) {
+    if (g_profiler.enabled) {
+      g_profiler.sprites += (uint64_t)sprite_write;
+    }
+    profile_add_elapsed(&g_profiler.render_sprites_ms, profile_start_ms);
+#ifdef GLOOM_DOS_SDL3
+    audio_dos_pump(&g_audio);
+#endif
+    return;
   }
 
   for (i = 0; i < sprite_write; ++i) {
@@ -14940,6 +17705,314 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
   audio_dos_pump(&g_audio);
 #endif
 }
+
+#ifndef GLOOM_DOS_SDL3
+static bool debug_sprite_source_x_coord(const DebugSprite *sprite, const ObjectFrame *frame, int screen_x,
+                                        float *out_src_x) {
+  float tu = 0.0f;
+
+  if (sprite == NULL || frame == NULL || out_src_x == NULL || frame->width <= 0 || sprite->screen_w <= 0.0f) {
+    return false;
+  }
+
+  tu = ((float)screen_x + 0.5f - sprite->screen_x) / sprite->screen_w;
+  if (tu < 0.0f || tu > 1.0f) {
+    return false;
+  }
+
+  if (sprite->source_pad > 0) {
+    float padded_width = (float)(frame->width + (sprite->source_pad * 2));
+    float source_x = (tu * padded_width) - (float)sprite->source_pad;
+
+    if (source_x < 0.0f || source_x >= (float)frame->width) {
+      return false;
+    }
+    *out_src_x = frame->width > 1 ? (source_x / (float)frame->width) * (float)(frame->width - 1) : 0.0f;
+  } else {
+    *out_src_x = frame->width > 1 ? tu * (float)(frame->width - 1) : 0.0f;
+  }
+  return true;
+}
+
+static bool debug_sprite_source_y_coord_for_pixel(const DebugSprite *sprite, const ObjectFrame *frame, int screen_y,
+                                                  float *out_src_y) {
+  float tv = 0.0f;
+
+  if (sprite == NULL || frame == NULL || out_src_y == NULL || frame->height <= 0 || sprite->screen_h <= 0.0f) {
+    return false;
+  }
+
+  tv = ((float)screen_y + 0.5f - sprite->screen_y) / sprite->screen_h;
+  if (tv < 0.0f || tv > 1.0f) {
+    return false;
+  }
+
+  if (sprite->source_pad > 0) {
+    float padded_height = (float)(frame->height + (sprite->source_pad * 2));
+    float source_y = (tv * padded_height) - (float)sprite->source_pad;
+
+    if (source_y < 0.0f || source_y >= (float)frame->height) {
+      return false;
+    }
+    *out_src_y = frame->height > 1 ? (source_y / (float)frame->height) * (float)(frame->height - 1) : 0.0f;
+  } else {
+    *out_src_y = frame->height > 1 ? tv * (float)(frame->height - 1) : 0.0f;
+  }
+  return true;
+}
+
+static float debug_sprite_source_y_coord_for_screen_position(const DebugSprite *sprite, const ObjectFrame *frame,
+                                                             float screen_y) {
+  float tv = 0.0f;
+
+  if (sprite == NULL || frame == NULL || frame->height <= 1 || sprite->screen_h <= 0.0f) {
+    return 0.0f;
+  }
+
+  tv = (screen_y - sprite->screen_y) / sprite->screen_h;
+  if (sprite->source_pad > 0) {
+    float padded_height = (float)(frame->height + (sprite->source_pad * 2));
+    float source_y = (tv * padded_height) - (float)sprite->source_pad;
+
+    return (source_y / (float)frame->height) * (float)(frame->height - 1);
+  }
+  return tv * (float)(frame->height - 1);
+}
+
+typedef struct {
+  GLsizei vertex_count;
+  GLfloat vertices[512u * 6u * 4u];
+} RuntimeGpuSpriteBatch;
+
+static RuntimeGpuSpriteBatch g_runtime_gpu_sprite_batch;
+
+static bool runtime_gpu_sprite_flush_batch(RuntimeGpuSpriteBatch *batch) {
+  enum { FLOATS_PER_VERTEX = 4 };
+  GLsizei stride = (GLsizei)(FLOATS_PER_VERTEX * (int)sizeof(GLfloat));
+
+  if (batch == NULL || batch->vertex_count <= 0) {
+    return true;
+  }
+  if (!g_runtime_gpu_sprite_renderer.initialized) {
+    batch->vertex_count = 0;
+    return false;
+  }
+
+  g_runtime_gl.BindBuffer(GL_ARRAY_BUFFER, g_runtime_gpu_sprite_renderer.vbo);
+  g_runtime_gl.BufferData(GL_ARRAY_BUFFER,
+                          (GLsizeiptr)((size_t)batch->vertex_count * (size_t)FLOATS_PER_VERTEX *
+                                       sizeof(batch->vertices[0])),
+                          batch->vertices, GL_STREAM_DRAW);
+  g_runtime_gl.EnableVertexAttribArray(0u);
+  g_runtime_gl.EnableVertexAttribArray(1u);
+  g_runtime_gl.VertexAttribPointer(0u, 2, GL_FLOAT, GL_FALSE, stride, (const void *)0);
+  g_runtime_gl.VertexAttribPointer(1u, 2, GL_FLOAT, GL_FALSE, stride,
+                                   (const void *)(2u * sizeof(GLfloat)));
+  g_runtime_gl.DrawArrays(GL_TRIANGLES, 0, batch->vertex_count);
+  {
+    GLenum error = g_runtime_gl.GetError();
+
+    if (error != GL_NO_ERROR) {
+      runtime_logf("OpenGL sprite renderer: draw failed (gl=0x%x)", (unsigned)error);
+      batch->vertex_count = 0;
+      return false;
+    }
+  }
+  batch->vertex_count = 0;
+  return true;
+}
+
+static bool runtime_gpu_sprite_add_column_quad(RuntimeGpuSpriteBatch *batch, int screen_x, int y0, int y1,
+                                               float src_x, float src_y0, float src_y1, int render_width,
+                                               int render_height) {
+  enum {
+    FLOATS_PER_VERTEX = 4,
+    VERTICES_PER_QUAD = 6,
+    BATCH_VERTEX_CAPACITY = 512 * VERTICES_PER_QUAD
+  };
+  GLfloat left = 0.0f;
+  GLfloat right = 0.0f;
+  GLfloat top = 0.0f;
+  GLfloat bottom = 0.0f;
+  GLfloat quad[VERTICES_PER_QUAD][FLOATS_PER_VERTEX];
+  int v = 0;
+
+  if (batch == NULL || screen_x < 0 || y0 > y1 || render_width <= 0 || render_height <= 0) {
+    return false;
+  }
+  if (batch->vertex_count + (GLsizei)VERTICES_PER_QUAD > (GLsizei)BATCH_VERTEX_CAPACITY &&
+      !runtime_gpu_sprite_flush_batch(batch)) {
+    return false;
+  }
+
+  left = ((GLfloat)screen_x / (GLfloat)render_width) * 2.0f - 1.0f;
+  right = ((GLfloat)(screen_x + 1) / (GLfloat)render_width) * 2.0f - 1.0f;
+  top = 1.0f - (((GLfloat)y0 / (GLfloat)render_height) * 2.0f);
+  bottom = 1.0f - (((GLfloat)(y1 + 1) / (GLfloat)render_height) * 2.0f);
+
+  quad[0][0] = left;
+  quad[0][1] = top;
+  quad[0][2] = src_x;
+  quad[0][3] = src_y0;
+  quad[1][0] = right;
+  quad[1][1] = top;
+  quad[1][2] = src_x;
+  quad[1][3] = src_y0;
+  quad[2][0] = left;
+  quad[2][1] = bottom;
+  quad[2][2] = src_x;
+  quad[2][3] = src_y1;
+  quad[3][0] = right;
+  quad[3][1] = top;
+  quad[3][2] = src_x;
+  quad[3][3] = src_y0;
+  quad[4][0] = right;
+  quad[4][1] = bottom;
+  quad[4][2] = src_x;
+  quad[4][3] = src_y1;
+  quad[5][0] = left;
+  quad[5][1] = bottom;
+  quad[5][2] = src_x;
+  quad[5][3] = src_y1;
+
+  for (v = 0; v < VERTICES_PER_QUAD; ++v) {
+    memcpy(batch->vertices + ((size_t)batch->vertex_count * (size_t)FLOATS_PER_VERTEX), quad[v],
+           sizeof(quad[v]));
+    batch->vertex_count += 1;
+  }
+  return true;
+}
+
+static bool runtime_gpu_render_debug_sprites(SDL_Renderer *renderer, const DebugSprite *sprites, size_t sprite_count,
+                                             float *sprite_depth_buffer, int x, int y, int w, int h,
+                                             int render_width, int render_height) {
+  size_t i = 0u;
+  double profile_start_ms = 0.0;
+  bool ok = true;
+
+  if (renderer == NULL || sprites == NULL || sprite_depth_buffer == NULL || sprite_count == 0u || w <= 0 ||
+      h <= 0 || render_width <= 0 || render_height <= 0 || hd_art_render_enabled() ||
+      !runtime_opengl_draw_backend_active()) {
+    return false;
+  }
+  if (!runtime_gpu_init_sprite_renderer()) {
+    return false;
+  }
+  profile_start_ms = profile_now_ms();
+  g_runtime_gl.Viewport(0, 0, (GLsizei)render_width, (GLsizei)render_height);
+  g_runtime_gl.Disable(GL_BLEND);
+  g_runtime_gl.UseProgram(g_runtime_gpu_sprite_renderer.program);
+  g_runtime_gl.ActiveTexture(GL_TEXTURE0);
+  g_runtime_gl.Uniform1i(g_runtime_gpu_sprite_renderer.uniform_sprite_texture, 0);
+
+  for (i = 0u; i < sprite_count && ok; ++i) {
+    const DebugSprite *sp = &sprites[i];
+    const ObjectFrame *frame = sp->frame;
+    ObjectFrame *mutable_frame = (ObjectFrame *)frame;
+    RuntimeGpuSpriteBatch *batch = &g_runtime_gpu_sprite_batch;
+    int x0 = 0;
+    int x1 = 0;
+    int y0 = 0;
+    int y1 = 0;
+    int screen_x = 0;
+    int subtract = 0;
+
+    memset(batch, 0, sizeof(*batch));
+    if (frame == NULL || mutable_frame == NULL || frame->argb_pixels == NULL || frame->width <= 0 ||
+        frame->height <= 0 || sp->screen_w < 1.0f || sp->screen_h < 1.0f) {
+      continue;
+    }
+    if (!runtime_gpu_prepare_object_frame_gl_texture(mutable_frame)) {
+      ok = false;
+      break;
+    }
+
+    x0 = (int)sp->screen_x;
+    x1 = (int)(sp->screen_x + sp->screen_w);
+    y0 = (int)sp->screen_y;
+    y1 = (int)(sp->screen_y + sp->screen_h);
+    if (x1 < x || x0 > x + w - 1 || y1 < y || y0 > y + h - 1) {
+      continue;
+    }
+    if (x0 < x) x0 = x;
+    if (x1 > x + w - 1) x1 = x + w - 1;
+    if (y0 < y) y0 = y;
+    if (y1 > y + h - 1) y1 = y + h - 1;
+
+    subtract = depth_subtract_for_depth(sp->depth);
+    g_runtime_gl.BindTexture(GL_TEXTURE_2D, mutable_frame->gpu_gl_texture);
+    g_runtime_gl.Uniform2f(g_runtime_gpu_sprite_renderer.uniform_texture_size, (GLfloat)frame->width,
+                           (GLfloat)frame->height);
+    g_runtime_gl.Uniform1f(g_runtime_gpu_sprite_renderer.uniform_subtract, (GLfloat)subtract / 255.0f);
+
+    for (screen_x = x0; screen_x <= x1; ++screen_x) {
+      int rel_x = screen_x - x;
+      int draw_y = 0;
+      int first_y = -1;
+      int last_y = -1;
+      float src_x = 0.0f;
+      float src_y = 0.0f;
+      int sx = 0;
+
+      if (rel_x < 0 || rel_x >= w || sp->depth >= sprite_depth_buffer[rel_x]) {
+        continue;
+      }
+      if (!debug_sprite_source_x_coord(sp, frame, screen_x, &src_x)) {
+        continue;
+      }
+      sx = (int)src_x;
+      if (sx < 0 || sx >= frame->width) {
+        continue;
+      }
+
+      for (draw_y = y0; draw_y <= y1; ++draw_y) {
+        int sy = 0;
+        uint32_t argb = 0u;
+
+        if (!debug_sprite_source_y_coord_for_pixel(sp, frame, draw_y, &src_y)) {
+          continue;
+        }
+        sy = (int)src_y;
+        if (sy < 0 || sy >= frame->height) {
+          continue;
+        }
+        argb = frame->argb_pixels[(size_t)sy * (size_t)frame->width + (size_t)sx];
+        if ((argb >> 24u) == 0u) {
+          continue;
+        }
+        if (first_y < 0) {
+          first_y = draw_y;
+        }
+        last_y = draw_y;
+      }
+
+      if (first_y >= 0 && last_y >= first_y) {
+        float src_y0 = debug_sprite_source_y_coord_for_screen_position(sp, frame, (float)first_y);
+        float src_y1 = debug_sprite_source_y_coord_for_screen_position(sp, frame, (float)(last_y + 1));
+
+        if (!runtime_gpu_sprite_add_column_quad(batch, screen_x, first_y, last_y, src_x, src_y0, src_y1,
+                                                render_width, render_height)) {
+          ok = false;
+          break;
+        }
+        sprite_depth_buffer[rel_x] = sp->depth;
+      }
+    }
+
+    if (!runtime_gpu_sprite_flush_batch(batch)) {
+      ok = false;
+    }
+  }
+
+  g_runtime_gl.DisableVertexAttribArray(0u);
+  g_runtime_gl.DisableVertexAttribArray(1u);
+  g_runtime_gl.BindBuffer(GL_ARRAY_BUFFER, 0u);
+  g_runtime_gl.BindTexture(GL_TEXTURE_2D, 0u);
+  g_runtime_gl.UseProgram(0u);
+  profile_add_elapsed(&g_profiler.render_sprites_ms, profile_start_ms);
+  return ok;
+}
+#endif
 
 static int ui_double_scale_for_viewport(int w, int h) {
   int scale = 1;
@@ -15702,7 +18775,7 @@ static void render_scene_contents(RenderFramebuffer *framebuffer, const AppState
   double profile_start_ms = 0.0;
 
   render_wall_debug(framebuffer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals, x, y,
-                    w, h);
+                    w, h, true, true, true, NULL, 0u, NULL, true);
   profile_start_ms = profile_now_ms();
   render_player_weapon(framebuffer, state, weapon_visuals, x, y, w, h);
   profile_add_elapsed(&g_profiler.render_weapon_ms, profile_start_ms);
@@ -15719,6 +18792,10 @@ static void free_menu_image(MenuImage *image) {
     return;
   }
 
+#ifndef GLOOM_DOS_SDL3
+  runtime_gpu_destroy_texture(&image->gpu_texture);
+  runtime_gpu_destroy_texture(&image->gpu_hd_texture);
+#endif
   free(image->pixels);
   free(image->hd_pixels);
 #ifdef GLOOM_DOS_SDL3
@@ -16122,6 +19199,9 @@ static void render_menu_image(RenderFramebuffer *framebuffer, const MenuImage *i
 #endif
 
   using_hd_image = menu_image_hd_active(image);
+#ifndef GLOOM_DOS_SDL3
+  (void)using_hd_image;
+#endif
 #ifdef GLOOM_DOS_SDL3
   using_original_dos_indices = !using_hd_image && g_dos_menu_palette_active && image->indices != NULL;
   if (using_original_dos_indices) {
@@ -16189,6 +19269,402 @@ static void render_menu_image(RenderFramebuffer *framebuffer, const MenuImage *i
   }
 }
 
+#ifndef GLOOM_DOS_SDL3
+static SDL_Texture *runtime_gpu_argb_texture(SDL_Renderer *renderer, SDL_Texture **io_texture,
+                                             const uint32_t *pixels, int width, int height,
+                                             bool blend, bool update_each_call) {
+  int texture_width = 0;
+  int texture_height = 0;
+  bool needs_upload = update_each_call;
+
+  if (renderer == NULL || io_texture == NULL || pixels == NULL || width <= 0 || height <= 0) {
+    return NULL;
+  }
+
+  if (*io_texture != NULL) {
+    if (SDL_QueryTexture(*io_texture, NULL, NULL, &texture_width, &texture_height) != 0 ||
+        texture_width != width || texture_height != height) {
+      runtime_gpu_destroy_texture(io_texture);
+    }
+  }
+
+  if (*io_texture == NULL) {
+    *io_texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_STATIC, width, height);
+    if (*io_texture == NULL) {
+      runtime_logf("OpenGL texture upload failed: create %dx%d: %s", width, height, SDL_GetError());
+      return NULL;
+    }
+    (void)SDL_SetTextureScaleMode(*io_texture, SDL_ScaleModeNearest);
+    needs_upload = true;
+  }
+
+  (void)SDL_SetTextureBlendMode(*io_texture, blend ? SDL_BLENDMODE_BLEND : SDL_BLENDMODE_NONE);
+  if (needs_upload &&
+      SDL_UpdateTexture(*io_texture, NULL, pixels, width * (int)sizeof(*pixels)) != 0) {
+    runtime_logf("OpenGL texture upload failed: update %dx%d: %s", width, height, SDL_GetError());
+    runtime_gpu_destroy_texture(io_texture);
+    return NULL;
+  }
+
+  return *io_texture;
+}
+
+static SDL_Texture *runtime_gpu_menu_image_texture(SDL_Renderer *renderer, const MenuImage *image,
+                                                   int *out_width, int *out_height) {
+  const uint32_t *pixels = NULL;
+  int width = 0;
+  int height = 0;
+  MenuImage *mutable_image = (MenuImage *)image;
+  SDL_Texture **texture_slot = NULL;
+
+  if (out_width != NULL) *out_width = 0;
+  if (out_height != NULL) *out_height = 0;
+  if (renderer == NULL || image == NULL || mutable_image == NULL || !image->loaded) {
+    return NULL;
+  }
+
+  pixels = menu_image_argb_pixels(image, &width, &height);
+  if (pixels == NULL || width <= 0 || height <= 0) {
+    return NULL;
+  }
+  texture_slot = menu_image_hd_active(image) ? &mutable_image->gpu_hd_texture : &mutable_image->gpu_texture;
+  if (out_width != NULL) *out_width = width;
+  if (out_height != NULL) *out_height = height;
+  return runtime_gpu_argb_texture(renderer, texture_slot, pixels, width, height, true, false);
+}
+
+static SDL_Texture *runtime_gpu_hud_glyph_texture(SDL_Renderer *renderer, const HudGlyph *glyph,
+                                                  int *out_width, int *out_height) {
+  const uint32_t *pixels = NULL;
+  int width = 0;
+  int height = 0;
+  HudGlyph *mutable_glyph = (HudGlyph *)glyph;
+  SDL_Texture **texture_slot = NULL;
+
+  if (out_width != NULL) *out_width = 0;
+  if (out_height != NULL) *out_height = 0;
+  if (renderer == NULL || glyph == NULL || mutable_glyph == NULL) {
+    return NULL;
+  }
+
+  if (hd_art_render_enabled() && glyph->hd_argb_pixels != NULL && glyph->hd_width > 0 && glyph->hd_height > 0 &&
+      glyph->width > 0 && glyph->height > 0) {
+    pixels = glyph->hd_argb_pixels;
+    width = glyph->hd_width;
+    height = glyph->hd_height;
+    texture_slot = &mutable_glyph->gpu_hd_texture;
+  } else {
+    pixels = glyph->argb_pixels;
+    width = glyph->width;
+    height = glyph->height;
+    texture_slot = &mutable_glyph->gpu_texture;
+  }
+
+  if (pixels == NULL || width <= 0 || height <= 0) {
+    return NULL;
+  }
+  if (out_width != NULL) *out_width = width;
+  if (out_height != NULL) *out_height = height;
+  return runtime_gpu_argb_texture(renderer, texture_slot, pixels, width, height, true, false);
+}
+
+static SDL_Texture *runtime_gpu_object_frame_texture(SDL_Renderer *renderer, const ObjectFrame *frame,
+                                                     int *out_width, int *out_height) {
+  const uint32_t *pixels = NULL;
+  int width = 0;
+  int height = 0;
+  ObjectFrame *mutable_frame = (ObjectFrame *)frame;
+  SDL_Texture **texture_slot = NULL;
+
+  if (out_width != NULL) *out_width = 0;
+  if (out_height != NULL) *out_height = 0;
+  if (renderer == NULL || frame == NULL || mutable_frame == NULL) {
+    return NULL;
+  }
+
+  pixels = object_frame_argb_pixels(frame);
+  width = object_frame_bitmap_width(frame);
+  height = object_frame_bitmap_height(frame);
+  texture_slot = (hd_art_render_enabled() && frame->hd_argb_pixels != NULL && frame->hd_bitmap_width > 0 &&
+                  frame->hd_bitmap_height > 0)
+                     ? &mutable_frame->gpu_hd_texture
+                     : &mutable_frame->gpu_texture;
+  if (pixels == NULL || width <= 0 || height <= 0) {
+    return NULL;
+  }
+  if (out_width != NULL) *out_width = width;
+  if (out_height != NULL) *out_height = height;
+  return runtime_gpu_argb_texture(renderer, texture_slot, pixels, width, height, true, false);
+}
+
+static bool runtime_gpu_draw_texture(SDL_Renderer *renderer, SDL_Texture *texture, const SDL_Rect *src,
+                                     const SDL_Rect *dst, uint8_t brightness) {
+  if (renderer == NULL || texture == NULL || dst == NULL || dst->w <= 0 || dst->h <= 0) {
+    return false;
+  }
+
+  (void)SDL_SetTextureColorMod(texture, brightness, brightness, brightness);
+  (void)SDL_SetTextureAlphaMod(texture, 255u);
+  if (SDL_RenderCopy(renderer, texture, src, dst) != 0) {
+    runtime_logf("OpenGL draw failed: SDL_RenderCopy: %s", SDL_GetError());
+    return false;
+  }
+  return true;
+}
+
+static bool runtime_gpu_draw_argb_pixels(SDL_Renderer *renderer, SDL_Texture **io_texture, const uint32_t *pixels,
+                                         int width, int height, int dst_x, int dst_y, int dst_w, int dst_h,
+                                         uint8_t brightness, bool update_each_call) {
+  SDL_Texture *texture = NULL;
+  SDL_Rect dst;
+
+  if (renderer == NULL || io_texture == NULL || pixels == NULL || width <= 0 || height <= 0 ||
+      dst_w <= 0 || dst_h <= 0) {
+    return false;
+  }
+
+  texture = runtime_gpu_argb_texture(renderer, io_texture, pixels, width, height, true, update_each_call);
+  if (texture == NULL) {
+    return false;
+  }
+  dst.x = dst_x;
+  dst.y = dst_y;
+  dst.w = dst_w;
+  dst.h = dst_h;
+  return runtime_gpu_draw_texture(renderer, texture, NULL, &dst, brightness);
+}
+
+static bool runtime_gpu_draw_menu_image(SDL_Renderer *renderer, const MenuImage *image, int render_width,
+                                        int render_height) {
+  int source_width = 0;
+  int source_height = 0;
+  SDL_Texture *texture = runtime_gpu_menu_image_texture(renderer, image, &source_width, &source_height);
+  MenuImageFitRect fit_rect;
+  SDL_Rect dst;
+
+  if (texture == NULL || render_width <= 0 || render_height <= 0 || source_width <= 0 || source_height <= 0) {
+    return false;
+  }
+  fit_rect = menu_image_fit_rect_for_dimensions(source_width, source_height, render_width, render_height);
+  if (fit_rect.w <= 0 || fit_rect.h <= 0) {
+    return false;
+  }
+  dst.x = fit_rect.x;
+  dst.y = fit_rect.y;
+  dst.w = fit_rect.w;
+  dst.h = fit_rect.h;
+  return runtime_gpu_draw_texture(renderer, texture, NULL, &dst, 255u);
+}
+
+static bool runtime_gpu_draw_hud_glyph_scaled_brightness(SDL_Renderer *renderer, const HudGlyph *glyph, int x, int y,
+                                                         int scale, uint8_t brightness) {
+  int texture_width = 0;
+  int texture_height = 0;
+  SDL_Texture *texture = NULL;
+  SDL_Rect dst;
+
+  if (renderer == NULL || glyph == NULL || scale <= 0 || glyph->width <= 0 || glyph->height <= 0) {
+    return false;
+  }
+
+  texture = runtime_gpu_hud_glyph_texture(renderer, glyph, &texture_width, &texture_height);
+  if (texture == NULL || texture_width <= 0 || texture_height <= 0) {
+    return false;
+  }
+  dst.x = x;
+  dst.y = y;
+  dst.w = glyph->width * scale;
+  dst.h = glyph->height * scale;
+  return runtime_gpu_draw_texture(renderer, texture, NULL, &dst, brightness);
+}
+
+static void runtime_gpu_draw_menu_text_brightness(SDL_Renderer *renderer, const HudFont *font, const char *text,
+                                                  int center_x, int y, int scale, uint8_t brightness) {
+  size_t len = 0u;
+  int x = 0;
+
+  if (renderer == NULL || font == NULL || !font->loaded || font->glyphs == NULL || text == NULL || scale <= 0) {
+    return;
+  }
+
+  len = strlen(text);
+  x = center_x - (int)(((int)len * GLOOM_MENU_BIG_FONT_WIDTH * scale) / 2);
+  while (*text != '\0') {
+    unsigned char ch = (unsigned char)*text++;
+
+    if (ch != (unsigned char)' ') {
+      int glyph_index = menu_glyph_index_for_char(ch);
+
+      if (glyph_index >= 0 && (size_t)glyph_index < font->glyph_count) {
+        (void)runtime_gpu_draw_hud_glyph_scaled_brightness(renderer, &font->glyphs[glyph_index], x, y, scale,
+                                                           brightness);
+      }
+    }
+    x += GLOOM_MENU_BIG_FONT_WIDTH * scale;
+  }
+}
+
+static void runtime_gpu_draw_menu_text(SDL_Renderer *renderer, const HudFont *font, const char *text, int center_x,
+                                       int y, int scale) {
+  runtime_gpu_draw_menu_text_brightness(renderer, font, text, center_x, y, scale, 255u);
+}
+
+static bool runtime_gpu_draw_object_frame_scaled(SDL_Renderer *renderer, const ObjectFrame *frame, int screen_x,
+                                                 int screen_y, int scale) {
+  int texture_width = 0;
+  int texture_height = 0;
+  SDL_Texture *texture = NULL;
+  SDL_Rect dst;
+
+  if (renderer == NULL || frame == NULL || scale <= 0 || frame->width <= 0 || frame->height <= 0) {
+    return false;
+  }
+
+  texture = runtime_gpu_object_frame_texture(renderer, frame, &texture_width, &texture_height);
+  if (texture == NULL || texture_width <= 0 || texture_height <= 0) {
+    return false;
+  }
+  dst.x = screen_x;
+  dst.y = screen_y;
+  dst.w = frame->width * scale;
+  dst.h = frame->height * scale;
+  return runtime_gpu_draw_texture(renderer, texture, NULL, &dst, 255u);
+}
+
+static void runtime_gpu_render_player_weapon(SDL_Renderer *renderer, const AppState *state,
+                                             const WeaponVisualSet *weapon_visuals, int x, int y, int w, int h) {
+  const ObjectVisual *gun = NULL;
+  const ObjectFrame *base_frame = NULL;
+  size_t base_frame_index = GLOOM_GUN_IDLE_FRAME;
+  int ui_scale = 1;
+  float bounce_radians = 0.0f;
+  float side_phase = 0.0f;
+  float side_bob = 0.0f;
+  float anchor_x = 0.0f;
+  float anchor_y = 0.0f;
+  int body_draw_x = 0;
+  int body_draw_y = 0;
+
+  if (renderer == NULL || state == NULL || weapon_visuals == NULL || w <= 0 || h <= 0) {
+    return;
+  }
+
+  gun = &weapon_visuals->gun;
+  if (!gun->loaded || gun->frames == NULL || gun->frame_count == 0u) {
+    return;
+  }
+
+  if (state->player_weapon_flash > (float)(GLOOM_GUN_FLASH_AMIGA_TICKS / 2) &&
+      gun->frame_count > (size_t)GLOOM_GUN_RECOIL_FRAME) {
+    base_frame_index = GLOOM_GUN_RECOIL_FRAME;
+  }
+  if (base_frame_index >= gun->frame_count) {
+    base_frame_index = 0u;
+  }
+
+  ui_scale = ui_double_scale_for_viewport(w, h);
+  base_frame = &gun->frames[base_frame_index];
+  bounce_radians = ((float)((uint16_t)state->player_bounce & 511u) * 6.28318530718f) / 512.0f;
+  side_phase = SDL_sinf(bounce_radians);
+  side_bob = side_phase * (float)(GLOOM_GUN_SIDE_BOB * ui_scale);
+  anchor_x = (float)x + ((float)w * 0.5f);
+  anchor_y = (float)y + (float)h + (float)(GLOOM_GUN_LOWER_OFFSET * ui_scale);
+  anchor_y -= SDL_fabsf(side_phase) * (float)(GLOOM_GUN_SIDE_LIFT * ui_scale);
+  if (base_frame_index == (size_t)GLOOM_GUN_RECOIL_FRAME) {
+    anchor_y += (float)(GLOOM_GUN_RECOIL_BACK_OFFSET * ui_scale);
+  }
+  anchor_x += side_bob;
+
+  if (state->player_weapon_flash > 0.0f &&
+      gun->frame_count >= (size_t)(GLOOM_GUN_MUZZLE_FIRST_FRAME + GLOOM_GUN_MUZZLE_FRAME_COUNT)) {
+    size_t muzzle_frame_index = player_weapon_muzzle_frame_index(state);
+    float muzzle_anchor_y = (float)y + (float)h + (float)(GLOOM_GUN_MUZZLE_LOWER_OFFSET * ui_scale);
+
+    if (muzzle_frame_index < gun->frame_count) {
+      const ObjectFrame *muzzle_frame = &gun->frames[muzzle_frame_index];
+      int muzzle_draw_x = round_float_to_int32(anchor_x - (float)(muzzle_frame->handle_x * ui_scale));
+      int muzzle_draw_y =
+          round_float_to_int32(muzzle_anchor_y -
+                               (float)((muzzle_frame->handle_y + player_weapon_muzzle_frame_y_offset(muzzle_frame_index)) *
+                                       ui_scale));
+
+      (void)runtime_gpu_draw_object_frame_scaled(renderer, muzzle_frame, muzzle_draw_x, muzzle_draw_y, ui_scale);
+    }
+  }
+
+  body_draw_x = round_float_to_int32(anchor_x - (float)(base_frame->handle_x * ui_scale));
+  body_draw_y = round_float_to_int32(anchor_y - (float)(base_frame->handle_y * ui_scale));
+  (void)runtime_gpu_draw_object_frame_scaled(renderer, base_frame, body_draw_x, body_draw_y, ui_scale);
+}
+
+static void runtime_gpu_render_player_weapon_status(SDL_Renderer *renderer, const AppState *state,
+                                                    const HudFont *hud_font, int x, int y, int w, int h) {
+  int slot = 0;
+  int count = 0;
+  int base_x = x;
+  int weapon_char = 0;
+  int ui_scale = 1;
+  int status_y = y + h - GLOOM_HUD_STATUS_HEIGHT;
+
+  if (renderer == NULL || state == NULL || hud_font == NULL || !hud_font->loaded || hud_font->glyphs == NULL ||
+      state->player_weapon >= GLOOM_WEAPON_COUNT || (size_t)GLOOM_HUD_LIFE_CHAR >= hud_font->glyph_count ||
+      (size_t)GLOOM_HUD_HEALTH_CHAR >= hud_font->glyph_count) {
+    return;
+  }
+
+  ui_scale = ui_double_scale_for_viewport(w, h);
+  status_y = y + h - (GLOOM_HUD_STATUS_HEIGHT * ui_scale);
+  if (w > BASE_WIDTH * ui_scale) {
+    base_x += (w - (BASE_WIDTH * ui_scale)) / 2;
+  }
+
+  count = state->player_hitpoints;
+  if (count > GLOOM_PLAYER_INITIAL_HEALTH) {
+    count = GLOOM_PLAYER_INITIAL_HEALTH;
+  }
+  for (slot = 0; slot < count; ++slot) {
+    (void)runtime_gpu_draw_hud_glyph_scaled_brightness(
+        renderer, &hud_font->glyphs[GLOOM_HUD_HEALTH_CHAR],
+        base_x + ((GLOOM_HUD_HEALTH_X + (slot * GLOOM_HUD_HEALTH_SPACING)) * ui_scale),
+        status_y + (GLOOM_HUD_HEALTH_Y * ui_scale), ui_scale, 255u);
+  }
+
+  count = state->player_lives;
+  if (count < 0) {
+    count = 0;
+  }
+  for (slot = 0; slot < count; ++slot) {
+    int draw_x = base_x + (GLOOM_HUD_LIVES_X * ui_scale) +
+                 (((GLOOM_HUD_LIVES_RIGHT_ALIGN_COUNT - count) * GLOOM_HUD_LIVES_SPACING) * ui_scale) +
+                 ((slot * GLOOM_HUD_LIVES_SPACING) * ui_scale);
+
+    (void)runtime_gpu_draw_hud_glyph_scaled_brightness(renderer, &hud_font->glyphs[GLOOM_HUD_LIFE_CHAR], draw_x,
+                                                       status_y + (GLOOM_HUD_LIVES_Y * ui_scale), ui_scale, 255u);
+  }
+
+  weapon_char = GLOOM_HUD_WEAPON_FIRST_CHAR + (int)state->player_weapon;
+  if (weapon_char < 0 || (size_t)weapon_char >= hud_font->glyph_count) {
+    return;
+  }
+
+  count = 6 - (int)state->player_reload;
+  if (count < 0) {
+    count = 0;
+  }
+  if (count > GLOOM_WEAPON_COUNT) {
+    count = GLOOM_WEAPON_COUNT;
+  }
+
+  for (slot = 0; slot < count; ++slot) {
+    int draw_x = base_x + ((GLOOM_HUD_WEAPON_X + (slot * GLOOM_HUD_WEAPON_SPACING)) * ui_scale);
+    int draw_y = status_y + (GLOOM_HUD_WEAPON_Y * ui_scale);
+
+    (void)runtime_gpu_draw_hud_glyph_scaled_brightness(renderer, &hud_font->glyphs[weapon_char], draw_x, draw_y,
+                                                       ui_scale, 255u);
+  }
+}
+#endif
+
 static void clear_menu_image_side_bars(RenderFramebuffer *framebuffer, const MenuImage *image, int render_width,
                                        int render_height) {
   MenuImageFitRect rect;
@@ -16242,6 +19718,40 @@ static void maybe_write_live_menu_frame_dump(RenderFramebuffer *framebuffer, int
   (void)render_height;
 #endif
 }
+
+#ifndef GLOOM_DOS_SDL3
+static void maybe_write_live_menu_frame_dump_from_renderer(SDL_Renderer *renderer, int render_width,
+                                                           int render_height) {
+  uint32_t *pixels = NULL;
+  SDL_Rect read_rect = {0, 0, render_width, render_height};
+
+  if (g_live_menu_frame_dump_written || g_live_menu_frame_dump_path[0] == '\0') {
+    return;
+  }
+  g_live_menu_frame_dump_written = true;
+  if (renderer == NULL || render_width <= 0 || render_height <= 0) {
+    runtime_logf("Live menu frame dump failed: renderer was not available");
+    return;
+  }
+  pixels = (uint32_t *)malloc((size_t)render_width * (size_t)render_height * sizeof(*pixels));
+  if (pixels == NULL) {
+    runtime_logf("Live menu frame dump failed: out of memory for %dx%d", render_width, render_height);
+    return;
+  }
+  if (SDL_RenderReadPixels(renderer, &read_rect, SDL_PIXELFORMAT_ARGB8888, pixels,
+                           render_width * (int)sizeof(*pixels)) != 0) {
+    runtime_logf("Live menu frame dump failed: SDL_RenderReadPixels: %s", SDL_GetError());
+    free(pixels);
+    return;
+  }
+  if (write_argb_bmp_file(g_live_menu_frame_dump_path, pixels, render_width, render_height, render_width)) {
+    runtime_logf("Live menu frame dump: wrote %s (%dx%d)", g_live_menu_frame_dump_path, render_width, render_height);
+  } else {
+    runtime_logf("Live menu frame dump failed: could not write %s", g_live_menu_frame_dump_path);
+  }
+  free(pixels);
+}
+#endif
 
 static void log_start_menu_title_fit_once(const MenuAssets *assets, int render_width, int render_height) {
   static bool logged = false;
@@ -16676,6 +20186,117 @@ static void render_start_menu_static_marks(RenderFramebuffer *framebuffer, const
                               layout.credit_y + (GLOOM_MENU_BIG_FONT_HEIGHT * layout.scale * 2), layout.scale, 255u);
 #endif
 }
+
+#ifndef GLOOM_DOS_SDL3
+static void runtime_gpu_render_start_menu_static_marks(SDL_Renderer *renderer, const MenuAssets *assets,
+                                                       int render_width, int render_height) {
+  int item_count = start_menu_item_count();
+  int logo_src_x = 0;
+  int logo_src_y = 0;
+  int logo_src_w = 0;
+  int logo_src_h = 0;
+  StartMenuLayout layout;
+  uint32_t *scaled_logo = NULL;
+
+  if (renderer == NULL || assets == NULL || render_width <= 0 || render_height <= 0) {
+    return;
+  }
+
+  menu_image_content_bounds(&assets->black_magic_logo, &logo_src_x, &logo_src_y, &logo_src_w, &logo_src_h);
+  compute_start_menu_layout(render_width, render_height, item_count, logo_src_w, logo_src_h, &layout);
+  if (layout.logo_w > 0 && layout.logo_h > 0 && logo_src_w > 0 && logo_src_h > 0) {
+    scaled_logo = prescale_menu_image_region_box(&assets->black_magic_logo, logo_src_x, logo_src_y, logo_src_w,
+                                                 logo_src_h, layout.logo_w, layout.logo_h);
+    if (scaled_logo != NULL) {
+      (void)runtime_gpu_draw_argb_pixels(renderer, &g_runtime_gpu_start_logo_texture, scaled_logo, layout.logo_w,
+                                         layout.logo_h, layout.logo_x, layout.logo_y, layout.logo_w, layout.logo_h,
+                                         255u, true);
+      free(scaled_logo);
+    } else {
+      fprintf(stderr, "Failed to pre-scale Black Magic menu logo to %dx%d\n", layout.logo_w, layout.logo_h);
+    }
+  }
+
+  runtime_gpu_draw_menu_text_brightness(renderer, &assets->big_font, "BLACKMAGIC 1995", render_width / 2,
+                                        layout.credit_y, layout.scale, 255u);
+  runtime_gpu_draw_menu_text_brightness(renderer, &assets->big_font, "RETROFOUNDRY", render_width / 2,
+                                        layout.credit_y + (GLOOM_MENU_BIG_FONT_HEIGHT * layout.scale), layout.scale,
+                                        255u);
+#if GLOOM_RUNTIME_IS_BINARY
+  runtime_gpu_draw_menu_text_brightness(renderer, &assets->big_font, runtime_title(), render_width / 2,
+                                        layout.credit_y + (GLOOM_MENU_BIG_FONT_HEIGHT * layout.scale * 2),
+                                        layout.scale, 255u);
+#endif
+}
+
+static void runtime_gpu_render_start_menu_frame(SDL_Renderer *renderer, const MenuAssets *assets,
+                                                int render_width, int render_height, int selected_index,
+                                                bool selected_visible, uint8_t violence_mode,
+                                                const RuntimeControlConfig *control_config) {
+  const char *items[7];
+  int item_count = start_menu_item_count();
+  char player1_item[32];
+  char player2_item[32];
+#if GLOOM_RUNTIME_HAS_AUTOSAVE
+  bool one_player_autosave_available = gloom_autosave_available(false);
+  bool two_player_autosave_available = gloom_autosave_available(true);
+#endif
+  int scale = 1;
+  int y = 0;
+  int i = 0;
+  StartMenuLayout layout;
+
+  if (renderer == NULL || assets == NULL) {
+    return;
+  }
+  (void)violence_mode;
+
+  (void)snprintf(player1_item, sizeof(player1_item), "PLAYER 1 %s",
+                 control_source_menu_name(control_config != NULL ? control_config->player1 : GLOOM_CONTROL_KEYBOARD));
+  (void)snprintf(player2_item, sizeof(player2_item), "PLAYER 2 %s",
+                 control_source_menu_name(control_config != NULL ? control_config->player2 : GLOOM_CONTROL_GAMEPAD_1));
+  items[0] = "ONE PLAYER GAME";
+#if GLOOM_RUNTIME_HAS_AUTOSAVE
+  items[1] = "LOAD ONE PLAYER AUTOSAVE";
+  items[2] = "TWO PLAYER GAME";
+  items[3] = "LOAD TWO PLAYER AUTOSAVE";
+  items[4] = player1_item;
+  items[5] = player2_item;
+#ifndef __EMSCRIPTEN__
+  items[6] = "EXIT GLOOM";
+#endif
+#else
+  items[1] = "TWO PLAYER GAME";
+  items[2] = player1_item;
+  items[3] = player2_item;
+  items[4] = "EXIT GLOOM";
+#endif
+
+  SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+  SDL_RenderClear(renderer);
+  log_start_menu_title_fit_once(assets, render_width, render_height);
+  (void)runtime_gpu_draw_menu_image(renderer, &assets->title, render_width, render_height);
+  runtime_gpu_render_start_menu_static_marks(renderer, assets, render_width, render_height);
+
+  compute_start_menu_layout(render_width, render_height, item_count, g_start_menu_logo_src_w,
+                            g_start_menu_logo_src_h, &layout);
+  runtime_gpu_draw_menu_text_brightness(renderer, &assets->big_font, layout.title_text, render_width / 2,
+                                        layout.title_y, layout.title_scale, 255u);
+  scale = menu_pixel_scale_for_viewport(render_width, render_height);
+  y = start_menu_y_for_viewport(render_width, render_height, item_count);
+  for (i = 0; i < item_count; ++i) {
+    uint8_t brightness = (i == selected_index && !selected_visible) ? 96u : 255u;
+
+#if GLOOM_RUNTIME_HAS_AUTOSAVE
+    if ((i == 1 && !one_player_autosave_available) || (i == 3 && !two_player_autosave_available)) {
+      brightness = 96u;
+    }
+#endif
+    runtime_gpu_draw_menu_text_brightness(renderer, &assets->big_font, items[i], render_width / 2,
+                                          y + (i * GLOOM_MENU_BIG_FONT_HEIGHT * scale), scale, brightness);
+  }
+}
+#endif
 
 static void copy_argb_background(RenderFramebuffer *framebuffer, const uint32_t *background,
                                  int background_pitch_pixels, int render_width, int render_height) {
@@ -17160,7 +20781,11 @@ static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer
 #ifdef GLOOM_DOS_SDL3
   apply_dos_menu_display_palette(framebuffer, &assets->title, &assets->black_magic_logo, &assets->big_font);
 #endif
-  if (begin_render_framebuffer(framebuffer)) {
+  if (
+#ifndef GLOOM_DOS_SDL3
+      !runtime_opengl_draw_backend_active() &&
+#endif
+      begin_render_framebuffer(framebuffer)) {
 #ifdef GLOOM_DOS_SDL3
     (void)cache_start_menu_background_dos_indices(framebuffer, assets, render_width, render_height,
                                                   &menu_background_index_cache, &menu_background_index_capacity);
@@ -17308,6 +20933,25 @@ static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer
       }
     }
 
+    if (redraw) {
+#ifndef GLOOM_DOS_SDL3
+      if (runtime_opengl_draw_backend_active()) {
+        runtime_gpu_render_start_menu_frame(renderer, assets, render_width, render_height, selected_index,
+                                            selected_visible, *io_violence_mode, io_control_config);
+        maybe_write_live_menu_frame_dump_from_renderer(renderer, render_width, render_height);
+        SDL_RenderPresent(renderer);
+#ifdef __EMSCRIPTEN__
+        if (!web_loading_overlay_hidden) {
+          runtime_emscripten_hide_loading_overlay();
+          web_loading_overlay_hidden = true;
+        }
+#endif
+        redraw = false;
+        continue;
+      }
+#endif
+    }
+
     if (redraw && begin_render_framebuffer(framebuffer)) {
 #ifdef GLOOM_DOS_SDL3
       render_start_menu_frame(framebuffer, assets, NULL, menu_background_index_cache, render_width, render_height,
@@ -17384,6 +21028,40 @@ static void render_combat_menu_frame(RenderFramebuffer *framebuffer, const MenuI
                                 y + (i * GLOOM_MENU_BIG_FONT_HEIGHT * scale), scale, brightness);
   }
 }
+
+#ifndef GLOOM_DOS_SDL3
+static void runtime_gpu_render_combat_menu_frame(SDL_Renderer *renderer, const MenuImage *image, const HudFont *font,
+                                                 int render_width, int render_height, int selected_index,
+                                                 bool selected_visible, int16_t lives) {
+  const char *items[4];
+  char lives_item[32];
+  int scale = 1;
+  int y = 0;
+  int i = 0;
+
+  if (renderer == NULL || font == NULL) {
+    return;
+  }
+
+  items[0] = "PLAY SPACEHULK SERIES";
+  items[1] = "PLAY GOTHIC TOMB SERIES";
+  items[2] = "PLAY HELL SERIES";
+  (void)snprintf(lives_item, sizeof(lives_item), "START WITH %d LIVES", (int)lives);
+  items[3] = lives_item;
+
+  SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+  SDL_RenderClear(renderer);
+  (void)runtime_gpu_draw_menu_image(renderer, image, render_width, render_height);
+  scale = menu_pixel_scale_for_viewport(render_width, render_height);
+  y = (render_height / 2) - (((int)(sizeof(items) / sizeof(items[0])) * GLOOM_MENU_BIG_FONT_HEIGHT * scale) / 2);
+  for (i = 0; i < (int)(sizeof(items) / sizeof(items[0])); ++i) {
+    uint8_t brightness = (i == selected_index && !selected_visible) ? 96u : 255u;
+
+    runtime_gpu_draw_menu_text_brightness(renderer, font, items[i], render_width / 2,
+                                          y + (i * GLOOM_MENU_BIG_FONT_HEIGHT * scale), scale, brightness);
+  }
+}
+#endif
 
 static int run_combat_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, int render_width, int render_height,
                            uint8_t *out_series, int16_t *out_lives) {
@@ -17510,6 +21188,18 @@ static int run_combat_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffe
       }
     }
 
+    if (redraw) {
+#ifndef GLOOM_DOS_SDL3
+      if (runtime_opengl_draw_backend_active()) {
+        runtime_gpu_render_combat_menu_frame(renderer, &image, &font, render_width, render_height, selected_index,
+                                             selected_visible, lives);
+        SDL_RenderPresent(renderer);
+        redraw = false;
+        continue;
+      }
+#endif
+    }
+
     if (redraw && begin_render_framebuffer(framebuffer)) {
       render_combat_menu_frame(framebuffer, &image, &font, render_width, render_height, selected_index,
                                selected_visible, lives);
@@ -17562,7 +21252,11 @@ static bool run_combat_result_screen(SDL_Renderer *renderer, RenderFramebuffer *
       }
     }
 
-    if (begin_render_framebuffer(framebuffer)) {
+    if (
+#ifndef GLOOM_DOS_SDL3
+        !runtime_opengl_draw_backend_active() &&
+#endif
+        begin_render_framebuffer(framebuffer)) {
       framebuffer_clear(framebuffer, 0xFF000000u);
       render_menu_image(framebuffer, &image, render_width, render_height);
       render_menu_text(framebuffer, &font, message, render_width / 2, render_height / 2,
@@ -17576,6 +21270,16 @@ static bool run_combat_result_screen(SDL_Renderer *renderer, RenderFramebuffer *
       }
       SDL_RenderPresent(renderer);
     }
+#ifndef GLOOM_DOS_SDL3
+    if (runtime_opengl_draw_backend_active()) {
+      SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+      SDL_RenderClear(renderer);
+      (void)runtime_gpu_draw_menu_image(renderer, &image, render_width, render_height);
+      runtime_gpu_draw_menu_text(renderer, &font, message, render_width / 2, render_height / 2,
+                                 menu_pixel_scale_for_viewport(render_width, render_height));
+      SDL_RenderPresent(renderer);
+    }
+#endif
     SDL_Delay(1);
   }
 
@@ -17713,6 +21417,55 @@ static void render_pause_menu_frame(RenderFramebuffer *framebuffer, const HudFon
                                 y + (i * GLOOM_MENU_BIG_FONT_HEIGHT * scale), scale, brightness);
   }
 }
+
+#ifndef GLOOM_DOS_SDL3
+static void runtime_gpu_render_pause_menu_frame(SDL_Renderer *renderer, const HudFont *font, const uint32_t *background,
+                                                int background_pitch_pixels, int render_width, int render_height,
+                                                int selected_index, bool selected_visible, bool two_player_mode) {
+  const char *items[4];
+  int item_count = pause_menu_item_count(two_player_mode);
+  int item_index = 0;
+  int scale = 1;
+  int y = 0;
+  int i = 0;
+
+  if (renderer == NULL || font == NULL) {
+    return;
+  }
+
+  SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+  SDL_RenderClear(renderer);
+  if (background != NULL && background_pitch_pixels == render_width) {
+    (void)runtime_gpu_draw_argb_pixels(renderer, &g_runtime_gpu_pause_background_texture, background, render_width,
+                                       render_height, 0, 0, render_width, render_height, 255u, true);
+  }
+
+  items[item_index++] = "CONTINUE";
+  if (g_hd_art_enabled) {
+    items[item_index++] = hd_art_render_enabled() ? "HD TEXTURES: ON" : "HD TEXTURES: OFF";
+  }
+#if GLOOM_RUNTIME_HAS_AUTOSAVE
+  if (gloom_autosave_available(two_player_mode)) {
+    items[item_index++] = "LOAD GAME";
+    items[item_index++] = "RETURN TO MAIN MENU";
+  } else
+#endif
+  {
+    items[item_index++] = "RETURN TO MAIN MENU";
+  }
+  if (item_index < item_count) {
+    item_count = item_index;
+  }
+  scale = menu_pixel_scale_for_viewport(render_width, render_height);
+  y = pause_menu_y_for_viewport(render_width, render_height, item_count);
+  for (i = 0; i < item_count; ++i) {
+    uint8_t brightness = (i == selected_index && !selected_visible) ? 96u : 255u;
+
+    runtime_gpu_draw_menu_text_brightness(renderer, font, items[i], render_width / 2,
+                                          y + (i * GLOOM_MENU_BIG_FONT_HEIGHT * scale), scale, brightness);
+  }
+}
+#endif
 
 static bool pause_menu_apply_hd_toggle(PauseMenuResult result, bool *io_redraw, bool *io_selected_visible,
                                        int *io_flash_ticks) {
@@ -17988,6 +21741,19 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
       }
     }
 
+    if (redraw) {
+#ifndef GLOOM_DOS_SDL3
+      if (runtime_opengl_draw_backend_active()) {
+        runtime_gpu_render_pause_menu_frame(renderer, &font, pause_background_valid ? pause_background : NULL,
+                                            render_width, render_width, render_height, selected_index,
+                                            selected_visible, two_player_mode);
+        SDL_RenderPresent(renderer);
+        redraw = false;
+        continue;
+      }
+#endif
+    }
+
     if (redraw && begin_render_framebuffer(framebuffer)) {
 #ifdef GLOOM_DOS_SDL3
       render_pause_menu_frame(framebuffer, &font, NULL, pause_background_valid ? pause_background_indices : NULL,
@@ -18038,6 +21804,32 @@ static void render_completion_frame(RenderFramebuffer *framebuffer, const MenuIm
   render_menu_text(framebuffer, font, text, render_width / 2, y, scale);
 }
 
+#ifndef GLOOM_DOS_SDL3
+static void runtime_gpu_render_completion_frame(SDL_Renderer *renderer, const MenuImage *image, const HudFont *font,
+                                                const char *text, int render_width, int render_height) {
+  int scale = 1;
+  int y = 0;
+
+  if (renderer == NULL) {
+    return;
+  }
+
+  SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+  SDL_RenderClear(renderer);
+  (void)runtime_gpu_draw_menu_image(renderer, image, render_width, render_height);
+  if (font == NULL || text == NULL || text[0] == '\0') {
+    return;
+  }
+
+  scale = menu_pixel_scale_for_viewport(render_width, render_height);
+  y = render_height - (GLOOM_MENU_BIG_FONT_HEIGHT * scale * 3);
+  if (y < GLOOM_MENU_BIG_FONT_HEIGHT * scale) {
+    y = GLOOM_MENU_BIG_FONT_HEIGHT * scale;
+  }
+  runtime_gpu_draw_menu_text(renderer, font, text, render_width / 2, y, scale);
+}
+#endif
+
 static bool run_completion_screen(SDL_Renderer *renderer, RenderFramebuffer *framebuffer,
                                   const ScriptCompletion *completion, int render_width, int render_height) {
   MenuImage image;
@@ -18079,7 +21871,11 @@ static bool run_completion_screen(SDL_Renderer *renderer, RenderFramebuffer *fra
       }
     }
 
-    if (begin_render_framebuffer(framebuffer)) {
+    if (
+#ifndef GLOOM_DOS_SDL3
+        !runtime_opengl_draw_backend_active() &&
+#endif
+        begin_render_framebuffer(framebuffer)) {
       render_completion_frame(framebuffer, &image, &font, completion->text, render_width, render_height);
       end_render_framebuffer(framebuffer);
       SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
@@ -18090,6 +21886,12 @@ static bool run_completion_screen(SDL_Renderer *renderer, RenderFramebuffer *fra
       }
       SDL_RenderPresent(renderer);
     }
+#ifndef GLOOM_DOS_SDL3
+    if (runtime_opengl_draw_backend_active()) {
+      runtime_gpu_render_completion_frame(renderer, &image, &font, completion->text, render_width, render_height);
+      SDL_RenderPresent(renderer);
+    }
+#endif
     SDL_Delay(1);
   }
 
@@ -18181,6 +21983,93 @@ static void render_script_intro_frame(RenderFramebuffer *framebuffer, const Menu
   }
 }
 
+#ifndef GLOOM_DOS_SDL3
+static void runtime_gpu_render_script_intro_frame(SDL_Renderer *renderer, const MenuImage *image, const HudFont *font,
+                                                  const char *text, int render_width, int render_height) {
+  char line[96];
+  const char *cursor = text;
+  int scale = 1;
+  size_t max_chars = 1u;
+  int line_count = 0;
+  int line_index = 0;
+  int start_y = 0;
+
+  if (renderer == NULL) {
+    return;
+  }
+
+  SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+  SDL_RenderClear(renderer);
+  (void)runtime_gpu_draw_menu_image(renderer, image, render_width, render_height);
+  if (font == NULL || text == NULL || text[0] == '\0') {
+    return;
+  }
+
+  scale = menu_pixel_scale_for_viewport(render_width, render_height);
+  while (scale > 1 && (GLOOM_MENU_BIG_FONT_HEIGHT * scale * 3) > render_height) {
+    scale -= 1;
+  }
+  if (render_width > GLOOM_MENU_BIG_FONT_WIDTH * scale * 2) {
+    max_chars = (size_t)((render_width - (GLOOM_MENU_BIG_FONT_WIDTH * scale * 2)) /
+                         (GLOOM_MENU_BIG_FONT_WIDTH * scale));
+  }
+
+  while (*cursor != '\0') {
+    size_t segment_len = 0u;
+    size_t segment_pos = 0u;
+
+    while (cursor[segment_len] != '\0' && cursor[segment_len] != '\\') {
+      segment_len += 1u;
+    }
+    while (segment_pos < segment_len) {
+      size_t consumed = copy_wrapped_menu_line(line, sizeof(line), cursor + segment_pos, segment_len - segment_pos,
+                                               max_chars);
+      if (consumed == 0u) {
+        break;
+      }
+      line_count += 1;
+      segment_pos += consumed;
+    }
+    cursor += segment_len;
+    if (*cursor == '\\') {
+      cursor += 1;
+    }
+  }
+  if (line_count <= 0) {
+    line_count = 1;
+  }
+  start_y = (render_height / 2) - ((line_count * GLOOM_MENU_BIG_FONT_HEIGHT * scale) / 2);
+  if (start_y < GLOOM_MENU_BIG_FONT_HEIGHT * scale) {
+    start_y = GLOOM_MENU_BIG_FONT_HEIGHT * scale;
+  }
+
+  cursor = text;
+  while (*cursor != '\0') {
+    size_t segment_len = 0u;
+    size_t segment_pos = 0u;
+
+    while (cursor[segment_len] != '\0' && cursor[segment_len] != '\\') {
+      segment_len += 1u;
+    }
+    while (segment_pos < segment_len) {
+      size_t consumed = copy_wrapped_menu_line(line, sizeof(line), cursor + segment_pos, segment_len - segment_pos,
+                                               max_chars);
+      if (consumed == 0u) {
+        break;
+      }
+      runtime_gpu_draw_menu_text(renderer, font, line, render_width / 2,
+                                 start_y + (line_index * GLOOM_MENU_BIG_FONT_HEIGHT * scale), scale);
+      line_index += 1;
+      segment_pos += consumed;
+    }
+    cursor += segment_len;
+    if (*cursor == '\\') {
+      cursor += 1;
+    }
+  }
+}
+#endif
+
 static bool run_script_intro_screen(SDL_Renderer *renderer, RenderFramebuffer *framebuffer,
                                     const ScriptLevelIntro *intro, int render_width, int render_height) {
   static MenuImage image;
@@ -18260,7 +22149,11 @@ static bool run_script_intro_screen(SDL_Renderer *renderer, RenderFramebuffer *f
       running = false;
     }
 
-    if (begin_render_framebuffer(framebuffer)) {
+    if (
+#ifndef GLOOM_DOS_SDL3
+        !runtime_opengl_draw_backend_active() &&
+#endif
+        begin_render_framebuffer(framebuffer)) {
       render_script_intro_frame(framebuffer, &image, &font, intro->text, render_width, render_height);
       end_render_framebuffer(framebuffer);
       SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
@@ -18271,6 +22164,12 @@ static bool run_script_intro_screen(SDL_Renderer *renderer, RenderFramebuffer *f
       }
       SDL_RenderPresent(renderer);
     }
+#ifndef GLOOM_DOS_SDL3
+    if (runtime_opengl_draw_backend_active()) {
+      runtime_gpu_render_script_intro_frame(renderer, &image, &font, intro->text, render_width, render_height);
+      SDL_RenderPresent(renderer);
+    }
+#endif
     SDL_Delay(1);
   }
 
@@ -18465,6 +22364,20 @@ static void render(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const
   RuntimeGameplayViewport gameplay_viewport = runtime_gameplay_viewport_for_render_target(render_width, render_height);
   double profile_render_start_ms = profile_now_ms();
   double profile_start_ms = 0.0;
+#ifndef GLOOM_DOS_SDL3
+  bool use_gpu_gameplay_overlays =
+      runtime_opengl_draw_backend_active() && state != NULL && !gameplay_viewport.active;
+  bool use_gpu_world_flats = false;
+  bool use_gpu_world_walls = false;
+  bool use_gpu_world_blood = false;
+  bool use_gpu_world_sprites = false;
+  DebugSprite *gpu_sprites_left = g_runtime_gpu_sprites_left;
+  DebugSprite *gpu_sprites_right = g_runtime_gpu_sprites_right;
+  size_t gpu_sprite_count_left = 0u;
+  size_t gpu_sprite_count_right = 0u;
+  bool gpu_sprite_left_active = false;
+  bool gpu_sprite_right_active = false;
+#endif
 
   if (framebuffer == NULL || framebuffer->texture == NULL || framebuffer->width != render_width ||
       framebuffer->height != render_height) {
@@ -18472,13 +22385,44 @@ static void render(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const
     return;
   }
 
+#ifndef GLOOM_DOS_SDL3
+  use_gpu_world_flats = use_gpu_gameplay_overlays &&
+                        flat_textures != NULL && flat_textures->floor.loaded && flat_textures->roof.loaded &&
+                        runtime_gpu_prepare_flat_set(renderer, flat_textures);
+  use_gpu_world_walls = use_gpu_world_flats &&
+                        wall_textures != NULL && wall_textures->loaded_count > 0u &&
+                        runtime_gpu_prepare_wall_texture_set(renderer, wall_textures) &&
+                        runtime_gpu_init_wall_renderer();
+  use_gpu_world_blood = use_gpu_world_walls;
+  use_gpu_world_sprites = use_gpu_world_walls && !hd_art_render_enabled() &&
+                          runtime_gpu_sprite_target_supported(render_width, render_height) &&
+                          runtime_gpu_init_sprite_renderer();
+  if (use_gpu_world_walls && !hd_art_render_enabled() && !use_gpu_world_sprites &&
+      !runtime_gpu_sprite_target_supported(render_width, render_height)) {
+    static bool logged_large_sprite_overlay = false;
+
+    if (!logged_large_sprite_overlay) {
+      runtime_logf("OpenGL sprite renderer: using software drawshapes overlay above 800x450 until large-target GPU sprite parity is stable");
+      logged_large_sprite_overlay = true;
+    }
+  }
+#endif
+
   profile_start_ms = profile_now_ms();
   if (!begin_render_framebuffer(framebuffer)) {
     return;
   }
-  if (gameplay_viewport.active || state == NULL || flat_textures == NULL || !flat_textures->floor.loaded ||
+  if (
+#ifndef GLOOM_DOS_SDL3
+      use_gpu_world_flats ||
+#endif
+      gameplay_viewport.active || state == NULL || flat_textures == NULL || !flat_textures->floor.loaded ||
       !flat_textures->roof.loaded || wall_textures == NULL || wall_textures->loaded_count == 0u) {
-    framebuffer_clear(framebuffer, 0xFF000000u);
+    framebuffer_clear(framebuffer,
+#ifndef GLOOM_DOS_SDL3
+                      use_gpu_world_flats ? 0x00000000u :
+#endif
+                                            0xFF000000u);
   }
   profile_add_elapsed(&g_profiler.render_lock_clear_ms, profile_start_ms);
   if (state != NULL && state->two_player_mode) {
@@ -18488,23 +22432,79 @@ static void render(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const
     int right_w = gameplay_viewport.source_width - left_w;
 
     capture_primary_player_state(state, &player1_state);
-    render_scene_contents(framebuffer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals,
-                          hud_font, 0, 0, left_w, gameplay_viewport.source_height);
+#ifndef GLOOM_DOS_SDL3
+    if (use_gpu_gameplay_overlays) {
+      render_wall_debug(framebuffer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals,
+                        0, 0, left_w, gameplay_viewport.source_height, !use_gpu_world_flats,
+                        !use_gpu_world_walls, !use_gpu_world_blood, gpu_sprites_left,
+                        GLOOM_MAX_DEBUG_SPRITES, &gpu_sprite_count_left, !use_gpu_world_sprites);
+      if (use_gpu_world_sprites && framebuffer->gpu_sprite_depth_buffer != NULL && left_w > 0) {
+        memcpy(framebuffer->gpu_sprite_depth_buffer, framebuffer->sprite_depth_buffer,
+               (size_t)left_w * sizeof(*framebuffer->gpu_sprite_depth_buffer));
+        gpu_sprite_left_active = true;
+      }
+    } else
+#endif
+    {
+      render_scene_contents(framebuffer, state, grid_offsets, wall_textures, flat_textures, object_visuals,
+                            weapon_visuals, hud_font, 0, 0, left_w, gameplay_viewport.source_height);
+    }
     profile_start_ms = profile_now_ms();
+#ifndef GLOOM_DOS_SDL3
+    if (!use_gpu_gameplay_overlays)
+#endif
     apply_player_red_palette_rect(framebuffer, state, 0, 0, left_w, gameplay_viewport.source_height);
     profile_add_elapsed(&g_profiler.render_red_ms, profile_start_ms);
     apply_primary_player_state(&player2_state, &state->player2);
     player2_state.player2 = player1_state;
     player2_state.active_player_index = 1u;
-    render_scene_contents(framebuffer, &player2_state, grid_offsets, wall_textures, flat_textures, object_visuals,
-                          weapon_visuals, hud_font, left_w, 0, right_w, gameplay_viewport.source_height);
+#ifndef GLOOM_DOS_SDL3
+    if (use_gpu_gameplay_overlays) {
+      render_wall_debug(framebuffer, &player2_state, grid_offsets, wall_textures, flat_textures, object_visuals,
+                        weapon_visuals, left_w, 0, right_w, gameplay_viewport.source_height,
+                        !use_gpu_world_flats, !use_gpu_world_walls, !use_gpu_world_blood,
+                        gpu_sprites_right, GLOOM_MAX_DEBUG_SPRITES, &gpu_sprite_count_right,
+                        !use_gpu_world_sprites);
+      if (use_gpu_world_sprites) {
+        gpu_sprite_right_active = true;
+      }
+    } else
+#endif
+    {
+      render_scene_contents(framebuffer, &player2_state, grid_offsets, wall_textures, flat_textures, object_visuals,
+                            weapon_visuals, hud_font, left_w, 0, right_w, gameplay_viewport.source_height);
+    }
     profile_start_ms = profile_now_ms();
+#ifndef GLOOM_DOS_SDL3
+    if (!use_gpu_gameplay_overlays)
+#endif
     apply_player_red_palette_rect(framebuffer, &player2_state, left_w, 0, right_w, gameplay_viewport.source_height);
     profile_add_elapsed(&g_profiler.render_red_ms, profile_start_ms);
   } else {
-    render_scene_contents(framebuffer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals,
-                          hud_font, 0, 0, gameplay_viewport.source_width, gameplay_viewport.source_height);
+#ifndef GLOOM_DOS_SDL3
+    if (use_gpu_gameplay_overlays) {
+      render_wall_debug(framebuffer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals,
+                        0, 0, gameplay_viewport.source_width, gameplay_viewport.source_height,
+                        !use_gpu_world_flats, !use_gpu_world_walls, !use_gpu_world_blood,
+                        gpu_sprites_left, GLOOM_MAX_DEBUG_SPRITES, &gpu_sprite_count_left,
+                        !use_gpu_world_sprites);
+      if (use_gpu_world_sprites && framebuffer->gpu_sprite_depth_buffer != NULL &&
+          gameplay_viewport.source_width > 0) {
+        memcpy(framebuffer->gpu_sprite_depth_buffer, framebuffer->sprite_depth_buffer,
+               (size_t)gameplay_viewport.source_width * sizeof(*framebuffer->gpu_sprite_depth_buffer));
+        gpu_sprite_left_active = true;
+      }
+    } else
+#endif
+    {
+      render_scene_contents(framebuffer, state, grid_offsets, wall_textures, flat_textures, object_visuals,
+                            weapon_visuals, hud_font, 0, 0, gameplay_viewport.source_width,
+                            gameplay_viewport.source_height);
+    }
     profile_start_ms = profile_now_ms();
+#ifndef GLOOM_DOS_SDL3
+    if (!use_gpu_gameplay_overlays)
+#endif
     apply_player_red_palette_rect(framebuffer, state, 0, 0, gameplay_viewport.source_width,
                                   gameplay_viewport.source_height);
     profile_add_elapsed(&g_profiler.render_red_ms, profile_start_ms);
@@ -18521,10 +22521,16 @@ static void render(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const
     int scale = menu_pixel_scale_for_viewport(render_width, render_height);
     int y = (render_height / 2) - ((GLOOM_MENU_BIG_FONT_HEIGHT * scale) / 2);
 
+#ifndef GLOOM_DOS_SDL3
+    if (!use_gpu_gameplay_overlays)
+#endif
     render_menu_text_brightness(framebuffer, hud_font, notice_text, render_width / 2, y, scale, 255u);
   }
 #else
   (void)notice_text;
+#endif
+#ifndef GLOOM_DOS_SDL3
+  if (!use_gpu_gameplay_overlays)
 #endif
   snapshot_render_framebuffer(framebuffer);
 #ifdef GLOOM_DOS_SDL3
@@ -18538,6 +22544,93 @@ static void render(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const
 #ifndef GLOOM_DOS_SDL3
   SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
   SDL_RenderClear(renderer);
+  if (use_gpu_world_flats) {
+    double gpu_flat_start_ms = profile_now_ms();
+
+    if (state != NULL && state->two_player_mode) {
+      AppState player2_state = *state;
+      RuntimePlayerState player1_state;
+      int left_w = render_width / 2;
+      int right_w = render_width - left_w;
+
+      capture_primary_player_state(state, &player1_state);
+      (void)runtime_gpu_render_flat_view(renderer, state, flat_textures, 0, 0, left_w, render_height, render_width,
+                                         render_height);
+      apply_primary_player_state(&player2_state, &state->player2);
+      player2_state.player2 = player1_state;
+      player2_state.active_player_index = 1u;
+      (void)runtime_gpu_render_flat_view(renderer, &player2_state, flat_textures, left_w, 0, right_w, render_height,
+                                         render_width, render_height);
+    } else {
+      (void)runtime_gpu_render_flat_view(renderer, state, flat_textures, 0, 0, render_width, render_height,
+                                         render_width, render_height);
+    }
+    profile_add_elapsed(&g_profiler.render_flat_ms, gpu_flat_start_ms);
+  }
+  if (use_gpu_world_walls) {
+    if (state != NULL && state->two_player_mode) {
+      AppState player2_state = *state;
+      RuntimePlayerState player1_state;
+      int left_w = render_width / 2;
+      int right_w = render_width - left_w;
+
+      capture_primary_player_state(state, &player1_state);
+      (void)runtime_gpu_render_wall_view(renderer, state, grid_offsets, wall_textures, 0, 0, left_w,
+                                         render_height, render_width, render_height);
+      apply_primary_player_state(&player2_state, &state->player2);
+      player2_state.player2 = player1_state;
+      player2_state.active_player_index = 1u;
+      (void)runtime_gpu_render_wall_view(renderer, &player2_state, grid_offsets, wall_textures, left_w, 0,
+                                         right_w, render_height, render_width, render_height);
+    } else {
+      (void)runtime_gpu_render_wall_view(renderer, state, grid_offsets, wall_textures, 0, 0, render_width,
+                                         render_height, render_width, render_height);
+    }
+  }
+  if (use_gpu_world_blood) {
+    if (state != NULL && state->two_player_mode) {
+      AppState player2_state = *state;
+      RuntimePlayerState player1_state;
+      int left_w = render_width / 2;
+      int right_w = render_width - left_w;
+
+      capture_primary_player_state(state, &player1_state);
+      (void)runtime_gpu_render_blood_view(renderer, state, 0, 0, left_w, render_height, render_width,
+                                          render_height);
+      apply_primary_player_state(&player2_state, &state->player2);
+      player2_state.player2 = player1_state;
+      player2_state.active_player_index = 1u;
+      (void)runtime_gpu_render_blood_view(renderer, &player2_state, left_w, 0, right_w, render_height,
+                                          render_width, render_height);
+    } else {
+      (void)runtime_gpu_render_blood_view(renderer, state, 0, 0, render_width, render_height, render_width,
+                                          render_height);
+    }
+  }
+  if (use_gpu_world_sprites) {
+    if (state != NULL && state->two_player_mode) {
+      int left_w = render_width / 2;
+      int right_w = render_width - left_w;
+
+      if (gpu_sprite_left_active && gpu_sprite_count_left > 0u &&
+          !runtime_gpu_render_debug_sprites(renderer, gpu_sprites_left, gpu_sprite_count_left,
+                                            framebuffer->gpu_sprite_depth_buffer, 0, 0, left_w, render_height,
+                                            render_width, render_height)) {
+        runtime_logf("OpenGL sprite renderer: player-one draw failed after CPU sprite overlay was skipped");
+      }
+      if (gpu_sprite_right_active && gpu_sprite_count_right > 0u &&
+          !runtime_gpu_render_debug_sprites(renderer, gpu_sprites_right, gpu_sprite_count_right,
+                                            framebuffer->sprite_depth_buffer, left_w, 0, right_w, render_height,
+                                            render_width, render_height)) {
+        runtime_logf("OpenGL sprite renderer: player-two draw failed after CPU sprite overlay was skipped");
+      }
+    } else if (gpu_sprite_left_active && gpu_sprite_count_left > 0u &&
+               !runtime_gpu_render_debug_sprites(renderer, gpu_sprites_left, gpu_sprite_count_left,
+                                                 framebuffer->sprite_depth_buffer, 0, 0, render_width, render_height,
+                                                 render_width, render_height)) {
+      runtime_logf("OpenGL sprite renderer: draw failed after CPU sprite overlay was skipped");
+    }
+  }
 #endif
 
 #ifdef GLOOM_DOS_SDL3
@@ -18548,14 +22641,90 @@ static void render(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const
     }
   }
 #else
-  if (pixsize > 1) {
+  if (pixsize > 1 && !use_gpu_gameplay_overlays) {
     if (!render_pixelate_texture(renderer, framebuffer->texture, render_width, render_height, pixsize)) {
       fprintf(stderr, "Cannot render pixelate transition: SDL_RenderCopy failed: %s\n", SDL_GetError());
     }
   } else {
     SDL_Rect dst = {0, 0, render_width, render_height};
+    (void)SDL_SetTextureBlendMode(framebuffer->texture, use_gpu_world_flats ? SDL_BLENDMODE_BLEND
+                                                                            : SDL_BLENDMODE_NONE);
     if (SDL_RenderCopy(renderer, framebuffer->texture, NULL, &dst) != 0) {
       fprintf(stderr, "Cannot render PC framebuffer texture: %s\n", SDL_GetError());
+    }
+  }
+  if (pixsize > 1 && !use_gpu_gameplay_overlays && framebuffer->last_frame_pixels != NULL) {
+    SDL_Rect read_rect = {0, 0, render_width, render_height};
+
+    if (SDL_RenderReadPixels(renderer, &read_rect, SDL_PIXELFORMAT_ARGB8888, framebuffer->last_frame_pixels,
+                             render_width * (int)sizeof(*framebuffer->last_frame_pixels)) != 0) {
+      runtime_logf("Composed-frame snapshot failed after software pixelate: SDL_RenderReadPixels: %s",
+                   SDL_GetError());
+    }
+  }
+#endif
+
+#ifndef GLOOM_DOS_SDL3
+  if (use_gpu_gameplay_overlays) {
+    double gpu_overlay_start_ms = profile_now_ms();
+
+    if (state != NULL && state->two_player_mode) {
+      AppState player2_state = *state;
+      RuntimePlayerState player1_state;
+      int left_w = render_width / 2;
+      int right_w = render_width - left_w;
+
+      capture_primary_player_state(state, &player1_state);
+      runtime_gpu_render_player_weapon(renderer, state, weapon_visuals, 0, 0, left_w, render_height);
+      runtime_gpu_render_player_weapon_status(renderer, state, hud_font, 0, 0, left_w, render_height);
+      apply_primary_player_state(&player2_state, &state->player2);
+      player2_state.player2 = player1_state;
+      player2_state.active_player_index = 1u;
+      runtime_gpu_render_player_weapon(renderer, &player2_state, weapon_visuals, left_w, 0, right_w, render_height);
+      runtime_gpu_render_player_weapon_status(renderer, &player2_state, hud_font, left_w, 0, right_w, render_height);
+    } else {
+      runtime_gpu_render_player_weapon(renderer, state, weapon_visuals, 0, 0, render_width, render_height);
+      runtime_gpu_render_player_weapon_status(renderer, state, hud_font, 0, 0, render_width, render_height);
+    }
+#if GLOOM_RUNTIME_HAS_AUTOSAVE
+    if (notice_text != NULL && notice_text[0] != '\0') {
+      int scale = menu_pixel_scale_for_viewport(render_width, render_height);
+      int y = (render_height / 2) - ((GLOOM_MENU_BIG_FONT_HEIGHT * scale) / 2);
+
+      runtime_gpu_draw_menu_text_brightness(renderer, hud_font, notice_text, render_width / 2, y, scale, 255u);
+    }
+#endif
+    profile_add_elapsed(&g_profiler.render_hud_ms, gpu_overlay_start_ms);
+    profile_start_ms = profile_now_ms();
+    if (state != NULL && state->two_player_mode) {
+      int left_w = render_width / 2;
+      int right_w = render_width - left_w;
+
+      if (state->player_palette_timer > 0.0f) {
+        (void)runtime_gpu_apply_red_palette_rect(renderer, 0, 0, left_w, render_height, render_width,
+                                                 render_height);
+      }
+      if (state->player2.player_palette_timer > 0.0f) {
+        (void)runtime_gpu_apply_red_palette_rect(renderer, left_w, 0, right_w, render_height, render_width,
+                                                 render_height);
+      }
+    } else if (state != NULL && state->player_palette_timer > 0.0f) {
+      (void)runtime_gpu_apply_red_palette_rect(renderer, 0, 0, render_width, render_height, render_width,
+                                               render_height);
+    }
+    profile_add_elapsed(&g_profiler.render_red_ms, profile_start_ms);
+    if (pixsize > 1) {
+      if (!runtime_gpu_apply_pixelate(renderer, render_width, render_height, pixsize)) {
+        runtime_logf("OpenGL pixelate renderer: post-process failed for pixsize=%d", pixsize);
+      }
+    }
+    if (framebuffer->last_frame_pixels != NULL) {
+      SDL_Rect read_rect = {0, 0, render_width, render_height};
+
+      if (SDL_RenderReadPixels(renderer, &read_rect, SDL_PIXELFORMAT_ARGB8888, framebuffer->last_frame_pixels,
+                               render_width * (int)sizeof(*framebuffer->last_frame_pixels)) != 0) {
+        runtime_logf("OpenGL composed-frame snapshot failed: SDL_RenderReadPixels: %s", SDL_GetError());
+      }
     }
   }
 #endif
@@ -18743,6 +22912,105 @@ static bool input_selftest_expect(bool condition, const char *message) {
     return false;
   }
   return true;
+}
+
+static int run_renderer_selftest(void) {
+  RuntimeRendererPreference preference = GLOOM_RENDERER_AUTO;
+  RuntimeRendererPreference ini_preference = GLOOM_RENDERER_SOFTWARE;
+  RuntimeDisplayIniConfig display_config;
+  int selected_width = 0;
+  int selected_height = 0;
+
+  if (!input_selftest_expect(parse_renderer_preference_name("auto", &preference) &&
+                                 preference == GLOOM_RENDERER_AUTO,
+                             "renderer parser did not accept auto")) {
+    return 1;
+  }
+  if (!input_selftest_expect(parse_renderer_preference_name("software", &preference) &&
+                                 preference == GLOOM_RENDERER_SOFTWARE,
+                             "renderer parser did not accept software")) {
+    return 1;
+  }
+  if (!input_selftest_expect(parse_renderer_preference_name("opengl", &preference) &&
+                                 preference == GLOOM_RENDERER_OPENGL,
+                             "renderer parser did not accept opengl")) {
+    return 1;
+  }
+  if (!input_selftest_expect(parse_renderer_preference_name("WebGL", &preference) &&
+                                 preference == GLOOM_RENDERER_OPENGL,
+                             "renderer parser did not accept WebGL alias")) {
+    return 1;
+  }
+  if (!input_selftest_expect(!parse_renderer_preference_name("raytrace", &preference),
+                             "renderer parser accepted an unsupported backend")) {
+    return 1;
+  }
+
+  preference = ini_preference;
+  if (!input_selftest_expect(parse_renderer_preference_name("opengl", &preference) &&
+                                 preference == GLOOM_RENDERER_OPENGL,
+                             "CLI-style renderer parse did not override INI-style value")) {
+    return 1;
+  }
+
+  initialize_runtime_display_ini_config(&display_config);
+  if (!input_selftest_expect(!display_config.has_hardware_resolution &&
+                                 display_config.hardware_resolution_width == DEFAULT_HARDWARE_RENDER_WIDTH &&
+                                 display_config.hardware_resolution_height == DEFAULT_HARDWARE_RENDER_HEIGHT,
+                             "hardware renderer defaults were not initialized to 1080p")) {
+    return 1;
+  }
+  display_config.has_resolution = true;
+  display_config.resolution_width = 320;
+  display_config.resolution_height = 200;
+  display_config.has_hardware_resolution = true;
+  display_config.hardware_resolution_width = 1600;
+  display_config.hardware_resolution_height = 900;
+
+  if (!input_selftest_expect(select_configured_runtime_resolution(&display_config, GLOOM_RENDERER_SOFTWARE, false,
+                                                                  0, 0, &selected_width, &selected_height) &&
+                                 selected_width == 320 && selected_height == 200,
+                             "software renderer did not select the software resolution")) {
+    return 1;
+  }
+
+#ifndef GLOOM_DOS_SDL3
+  if (!input_selftest_expect(select_configured_runtime_resolution(&display_config, GLOOM_RENDERER_OPENGL, false,
+                                                                  0, 0, &selected_width, &selected_height) &&
+                                 selected_width == 1600 && selected_height == 900,
+                             "OpenGL renderer did not select the hardware resolution")) {
+    return 1;
+  }
+  display_config.has_hardware_resolution = false;
+  display_config.hardware_resolution_width = DEFAULT_HARDWARE_RENDER_WIDTH;
+  display_config.hardware_resolution_height = DEFAULT_HARDWARE_RENDER_HEIGHT;
+  if (!input_selftest_expect(select_configured_runtime_resolution(&display_config, GLOOM_RENDERER_AUTO, false,
+                                                                  0, 0, &selected_width, &selected_height) &&
+                                 selected_width == 1920 && selected_height == 1080,
+                             "auto renderer did not select the default hardware resolution")) {
+    return 1;
+  }
+#else
+  if (!input_selftest_expect(select_configured_runtime_resolution(&display_config, GLOOM_RENDERER_OPENGL, false,
+                                                                  0, 0, &selected_width, &selected_height) &&
+                                 selected_width == 320 && selected_height == 200,
+                             "DOS renderer should ignore the hardware resolution")) {
+    return 1;
+  }
+#endif
+
+  display_config.has_hardware_resolution = true;
+  display_config.hardware_resolution_width = 1600;
+  display_config.hardware_resolution_height = 900;
+  if (!input_selftest_expect(select_configured_runtime_resolution(&display_config, GLOOM_RENDERER_OPENGL, true,
+                                                                  640, 480, &selected_width, &selected_height) &&
+                                 selected_width == 640 && selected_height == 480,
+                             "CLI resolution did not override configured renderer resolutions")) {
+    return 1;
+  }
+
+  printf("Renderer selftest passed\n");
+  return 0;
 }
 
 static int run_input_selftest(void) {
@@ -20699,6 +24967,84 @@ static int run_wall_selftest(void) {
       return 1;
     }
 
+#ifndef GLOOM_DOS_SDL3
+    {
+      enum {
+        WALL_ATLAS_WIDTH = GLOOM_TEXTURES_PER_SCREEN * GLOOM_TEXTURE_WIDTH,
+        WALL_ATLAS_HEIGHT = 16 * GLOOM_TEXTURE_HEIGHT,
+        WALL_ATLAS_BYTES = WALL_ATLAS_WIDTH * WALL_ATLAS_HEIGHT * 4
+      };
+      uint8_t *atlas = (uint8_t *)malloc((size_t)WALL_ATLAS_BYTES);
+      size_t transparent_dst = ((size_t)half_y * (size_t)WALL_ATLAS_WIDTH) * 4u;
+      size_t shaded_dst =
+          (((size_t)3u * (size_t)GLOOM_TEXTURE_HEIGHT + (size_t)half_y) * (size_t)WALL_ATLAS_WIDTH + 1u) * 4u;
+
+      if (atlas == NULL) {
+        g_hd_art_enabled = old_hd_art_enabled;
+        g_hd_art_render_enabled = old_hd_art_render_enabled;
+        fprintf(stderr, "Wall selftest failed: out of memory for GPU wall atlas check\n");
+        return 1;
+      }
+      texels[half_y * (size_t)GLOOM_TEXTURE_WIDTH] = 0u;
+      texels[half_y * (size_t)GLOOM_TEXTURE_WIDTH + 1u] = 1u;
+      column_flags[0] = 1u;
+      column_flags[1] = 0u;
+      screen->shaded_palette[3][1] = 0xff345678u;
+
+      if (!runtime_gpu_build_wall_screen_rgba_atlas(screen, atlas, (size_t)WALL_ATLAS_BYTES)) {
+        free(atlas);
+        g_hd_art_enabled = old_hd_art_enabled;
+        g_hd_art_render_enabled = old_hd_art_render_enabled;
+        fprintf(stderr, "Wall selftest failed: GPU wall atlas builder rejected a valid source screen\n");
+        return 1;
+      }
+      if (atlas[transparent_dst + 3u] != 0u) {
+        free(atlas);
+        g_hd_art_enabled = old_hd_art_enabled;
+        g_hd_art_render_enabled = old_hd_art_render_enabled;
+        fprintf(stderr, "Wall selftest failed: GPU wall atlas did not preserve transparent-column index 0\n");
+        return 1;
+      }
+      if (atlas[shaded_dst + 0u] != 0x34u || atlas[shaded_dst + 1u] != 0x56u ||
+          atlas[shaded_dst + 2u] != 0x78u || atlas[shaded_dst + 3u] != 0xffu) {
+        free(atlas);
+        g_hd_art_enabled = old_hd_art_enabled;
+        g_hd_art_render_enabled = old_hd_art_render_enabled;
+        fprintf(stderr, "Wall selftest failed: GPU wall atlas did not store the selected darkened palette band\n");
+        return 1;
+      }
+      free(atlas);
+    }
+#endif
+
+    {
+      int test_y = 0;
+
+      for (test_y = 0; test_y < GLOOM_TEXTURE_HEIGHT; ++test_y) {
+        texels[(size_t)test_y * (size_t)GLOOM_TEXTURE_WIDTH] = 0u;
+      }
+      if (wall_column_span_has_visible_sd_texel(texels, 0u, true, 0.0f, 64.0f, 0, 63)) {
+        g_hd_art_enabled = old_hd_art_enabled;
+        g_hd_art_render_enabled = old_hd_art_render_enabled;
+        fprintf(stderr, "Wall selftest failed: GL wall depth prep treated an all-zero transparent column as visible\n");
+        return 1;
+      }
+      texels[half_y * (size_t)GLOOM_TEXTURE_WIDTH] = 1u;
+      if (!wall_column_span_has_visible_sd_texel(texels, 0u, true, 0.0f, 64.0f, 0, 63)) {
+        g_hd_art_enabled = old_hd_art_enabled;
+        g_hd_art_render_enabled = old_hd_art_render_enabled;
+        fprintf(stderr, "Wall selftest failed: GL wall depth prep missed a visible transparent-column texel\n");
+        return 1;
+      }
+      texels[half_y * (size_t)GLOOM_TEXTURE_WIDTH] = 0u;
+      if (!wall_column_span_has_visible_sd_texel(texels, 0u, false, 0.0f, 64.0f, 0, 63)) {
+        g_hd_art_enabled = old_hd_art_enabled;
+        g_hd_art_render_enabled = old_hd_art_render_enabled;
+        fprintf(stderr, "Wall selftest failed: GL wall depth prep treated opaque palette index 0 as transparent\n");
+        return 1;
+      }
+    }
+
     g_hd_art_enabled = old_hd_art_enabled;
     g_hd_art_render_enabled = old_hd_art_render_enabled;
   }
@@ -22468,6 +26814,107 @@ static bool parse_ini_pixel_size_value(const char *value, int *out_width, int *o
   return true;
 }
 
+static const char *runtime_renderer_preference_name(RuntimeRendererPreference preference) {
+  switch (preference) {
+    case GLOOM_RENDERER_SOFTWARE:
+      return "software";
+    case GLOOM_RENDERER_OPENGL:
+      return "opengl";
+    case GLOOM_RENDERER_AUTO:
+    default:
+      return "auto";
+  }
+}
+
+static bool parse_renderer_preference_name(const char *value, RuntimeRendererPreference *out_preference) {
+  char normalized[32];
+  size_t write_index = 0u;
+  size_t read_index = 0u;
+
+  if (value == NULL || out_preference == NULL) {
+    return false;
+  }
+  for (read_index = 0u; value[read_index] != '\0' && write_index + 1u < sizeof(normalized); ++read_index) {
+    unsigned char ch = (unsigned char)value[read_index];
+
+    if (isalnum(ch)) {
+      normalized[write_index++] = (char)tolower(ch);
+    }
+  }
+  normalized[write_index] = '\0';
+
+  if (strcmp(normalized, "auto") == 0 || strcmp(normalized, "default") == 0) {
+    *out_preference = GLOOM_RENDERER_AUTO;
+    return true;
+  }
+  if (strcmp(normalized, "software") == 0 || strcmp(normalized, "soft") == 0 ||
+      strcmp(normalized, "cpu") == 0) {
+    *out_preference = GLOOM_RENDERER_SOFTWARE;
+    return true;
+  }
+  if (strcmp(normalized, "opengl") == 0 || strcmp(normalized, "gl") == 0 ||
+      strcmp(normalized, "webgl") == 0 || strcmp(normalized, "gles") == 0 ||
+      strcmp(normalized, "opengles") == 0) {
+    *out_preference = GLOOM_RENDERER_OPENGL;
+    return true;
+  }
+  return false;
+}
+
+static void initialize_runtime_display_ini_config(RuntimeDisplayIniConfig *config) {
+  if (config == NULL) {
+    return;
+  }
+  memset(config, 0, sizeof(*config));
+  config->gameplay_pixel_width = 1;
+  config->gameplay_pixel_height = 1;
+  config->renderer_preference = GLOOM_RENDERER_AUTO;
+  config->hardware_resolution_width = DEFAULT_HARDWARE_RENDER_WIDTH;
+  config->hardware_resolution_height = DEFAULT_HARDWARE_RENDER_HEIGHT;
+}
+
+static bool runtime_renderer_preference_prefers_hardware(RuntimeRendererPreference preference) {
+#ifdef GLOOM_DOS_SDL3
+  (void)preference;
+  return false;
+#else
+  return preference == GLOOM_RENDERER_AUTO || preference == GLOOM_RENDERER_OPENGL;
+#endif
+}
+
+static bool select_configured_runtime_resolution(const RuntimeDisplayIniConfig *config,
+                                                 RuntimeRendererPreference renderer_preference,
+                                                 bool cli_has_resolution, int cli_width, int cli_height,
+                                                 int *out_width, int *out_height) {
+  if (out_width == NULL || out_height == NULL) {
+    return false;
+  }
+
+  if (cli_has_resolution) {
+    *out_width = cli_width;
+    *out_height = cli_height;
+    return true;
+  }
+
+  if (config == NULL) {
+    return false;
+  }
+
+  if (runtime_renderer_preference_prefers_hardware(renderer_preference)) {
+    *out_width = config->hardware_resolution_width;
+    *out_height = config->hardware_resolution_height;
+    return true;
+  }
+
+  if (config->has_resolution) {
+    *out_width = config->resolution_width;
+    *out_height = config->resolution_height;
+    return true;
+  }
+
+  return false;
+}
+
 static bool normalized_key_name_equals(const char *name, const char *expected) {
   char normalized[48];
   size_t write_index = 0u;
@@ -22667,9 +27114,7 @@ static void load_runtime_display_ini(RuntimeDisplayIniConfig *config) {
   if (config == NULL) {
     return;
   }
-  memset(config, 0, sizeof(*config));
-  config->gameplay_pixel_width = 1;
-  config->gameplay_pixel_height = 1;
+  initialize_runtime_display_ini_config(config);
 
 #ifdef GLOOM_DOS_SDL3
   for (candidate_index = 0u; candidate_index < sizeof(candidates) / sizeof(candidates[0]); ++candidate_index) {
@@ -22745,6 +27190,16 @@ static void load_runtime_display_ini(RuntimeDisplayIniConfig *config) {
       } else {
         fprintf(stderr, "Ignoring GLOOM.INI %s=%s; expected WIDTHxHEIGHT within CLI resolution limits\n", key, value);
       }
+    } else if (strcmp(key, "hardware_resolution") == 0 || strcmp(key, "opengl_resolution") == 0 ||
+               strcmp(key, "webgl_resolution") == 0 || strcmp(key, "gpu_resolution") == 0) {
+      if (parse_ini_resolution_value(value, 320, 7680, 200, 4320, &parsed_width, &parsed_height)) {
+        config->has_hardware_resolution = true;
+        config->hardware_resolution_width = parsed_width;
+        config->hardware_resolution_height = parsed_height;
+      } else {
+        fprintf(stderr, "Ignoring GLOOM.INI %s=%s; expected WIDTHxHEIGHT within CLI resolution limits\n", key,
+                value);
+      }
     } else if (strcmp(key, "gameplay_viewport") == 0 || strcmp(key, "viewport_size") == 0 ||
                strcmp(key, "reduced_window_size") == 0 || strcmp(key, "amiga_window_size") == 0) {
       if (parse_ini_resolution_value(value, 64, BASE_WIDTH, 64, BASE_HEIGHT, &parsed_width, &parsed_height)) {
@@ -22766,6 +27221,16 @@ static void load_runtime_display_ini(RuntimeDisplayIniConfig *config) {
     } else if (strcmp(key, "hd_art_path") == 0 || strcmp(key, "hd_art") == 0) {
       if (!set_hd_art_root(value)) {
         fprintf(stderr, "Ignoring GLOOM.INI %s=%s; expected an HD art root path\n", key, value);
+      }
+    } else if (strcmp(key, "renderer") == 0 || strcmp(key, "render_backend") == 0 ||
+               strcmp(key, "video_renderer") == 0) {
+      RuntimeRendererPreference preference = GLOOM_RENDERER_AUTO;
+
+      if (parse_renderer_preference_name(value, &preference)) {
+        config->has_renderer = true;
+        config->renderer_preference = preference;
+      } else {
+        fprintf(stderr, "Ignoring GLOOM.INI %s=%s; expected software, opengl, or auto\n", key, value);
       }
     } else if (apply_ini_control_source(key, value, &g_control_config)) {
     } else if (apply_ini_keyboard_binding(key, value, &g_keyboard_config)) {
@@ -22819,8 +27284,10 @@ static RuntimeGameplayViewport runtime_gameplay_viewport_for_render_target(int r
 }
 
 static void log_runtime_display_config(const RuntimeDisplayIniConfig *config, int render_width, int render_height,
-                                       int window_width, int window_height) {
+                                       int window_width, int window_height,
+                                       RuntimeRendererPreference renderer_preference) {
   char resolution[32];
+  char hardware_resolution[48];
 
   if (config == NULL) {
     return;
@@ -22831,27 +27298,99 @@ static void log_runtime_display_config(const RuntimeDisplayIniConfig *config, in
   } else {
     (void)snprintf(resolution, sizeof(resolution), "default");
   }
+  if (config->has_hardware_resolution) {
+    (void)snprintf(hardware_resolution, sizeof(hardware_resolution), "%dx%d",
+                   config->hardware_resolution_width, config->hardware_resolution_height);
+  } else {
+    (void)snprintf(hardware_resolution, sizeof(hardware_resolution), "%dx%d default",
+                   DEFAULT_HARDWARE_RENDER_WIDTH, DEFAULT_HARDWARE_RENDER_HEIGHT);
+  }
 
   runtime_logf("Display config: GLOOM.INI=%s",
                config->ini_loaded ? config->ini_path : "not found; using built-in defaults");
 #ifdef GLOOM_DOS_SDL3
-  runtime_logf("Display config: DOS indexed software framebuffer resolution=%s framebuffer=%dx%d window=%dx%d",
+  runtime_logf("Display config: DOS indexed software framebuffer resolution=%s framebuffer=%dx%d window=%dx%d renderer=software",
                resolution, render_width, render_height, window_width, window_height);
 #else
-  runtime_logf("Display config: software framebuffer resolution=%s framebuffer=%dx%d window=%dx%d", resolution,
-               render_width, render_height, window_width, window_height);
+  runtime_logf("Display config: software_resolution=%s hardware_resolution=%s selected=%s framebuffer=%dx%d window=%dx%d renderer=%s",
+               resolution, hardware_resolution,
+               runtime_renderer_preference_prefers_hardware(renderer_preference) ? "hardware" : "software",
+               render_width, render_height, window_width, window_height,
+               runtime_renderer_preference_name(renderer_preference));
 #endif
 }
 
-/* amiga/gloom2.s draws through drawall into chunky pixels, then doc2p presents them.
-   The PC runtime keeps that software framebuffer flow and asks SDL for its software presenter. */
-static SDL_Renderer *create_runtime_renderer(SDL_Window *window) {
+static bool sdl_renderer_info_is_opengl(const SDL_RendererInfo *info) {
+  char lower_name[64];
+  size_t i = 0u;
+
+  if (info == NULL || info->name == NULL) {
+    return false;
+  }
+  for (i = 0u; info->name[i] != '\0' && i + 1u < sizeof(lower_name); ++i) {
+    lower_name[i] = (char)tolower((unsigned char)info->name[i]);
+  }
+  lower_name[i] = '\0';
+  return strstr(lower_name, "opengl") != NULL || strstr(lower_name, "gles") != NULL;
+}
+
+/* amiga/gloom2.s drawall_/drawscene render into chunky pixels, then doc2p presents them.
+   The OpenGL/WebGL option uses SDL's OpenGL-family backend for GPU-owned 2D draw
+   commands where the port already has source-backed pixels/layout; DOS stays indexed software. */
+static SDL_Renderer *create_runtime_renderer(SDL_Window *window, RuntimeRendererPreference preference,
+                                             bool *out_using_opengl) {
+  SDL_Renderer *renderer = NULL;
+
   if (window == NULL) {
     return NULL;
   }
+  if (out_using_opengl != NULL) {
+    *out_using_opengl = false;
+  }
 
+#ifdef GLOOM_DOS_SDL3
+  if (preference == GLOOM_RENDERER_OPENGL) {
+    fprintf(stderr, "OpenGL renderer is not available for the DOS target; use renderer=software\n");
+    return NULL;
+  }
   (void)SDL_SetHint(SDL_HINT_RENDER_DRIVER, "software");
   return SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+#else
+  if (preference != GLOOM_RENDERER_SOFTWARE) {
+    SDL_RendererInfo info;
+
+#ifdef __EMSCRIPTEN__
+    (void)SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengles2");
+#else
+    (void)SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
+#endif
+    renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+    memset(&info, 0, sizeof(info));
+    if (renderer != NULL && SDL_GetRendererInfo(renderer, &info) == 0 && sdl_renderer_info_is_opengl(&info)) {
+      if (out_using_opengl != NULL) {
+        *out_using_opengl = true;
+      }
+      return renderer;
+    }
+    if (renderer != NULL) {
+      fprintf(stderr, "Requested OpenGL renderer but SDL selected %s\n", info.name != NULL ? info.name : "(unknown)");
+      runtime_destroy_sdl_renderer(&renderer);
+      renderer = NULL;
+    }
+    if (preference == GLOOM_RENDERER_OPENGL) {
+      fprintf(stderr, "SDL could not create an OpenGL/WebGL renderer: %s\n", SDL_GetError());
+      return NULL;
+    }
+    runtime_logf("OpenGL/WebGL renderer unavailable; using software renderer");
+  }
+
+  (void)SDL_SetHint(SDL_HINT_RENDER_DRIVER, "software");
+  renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+  if (renderer == NULL) {
+    fprintf(stderr, "SDL could not create software renderer: %s\n", SDL_GetError());
+  }
+  return renderer;
+#endif
 }
 
 static void configure_runtime_sdl_dpi_hints(void) {
@@ -22903,7 +27442,8 @@ static void log_runtime_sdl_window_metrics(SDL_Window *window, SDL_Renderer *ren
 #endif
 }
 
-static void report_runtime_renderer_backend(SDL_Renderer *renderer) {
+static void report_runtime_renderer_backend(SDL_Renderer *renderer, RuntimeRendererPreference preference,
+                                            bool using_opengl) {
 #ifdef GLOOM_DOS_SDL3
   const char *name = renderer != NULL ? SDL_GetRendererName(renderer) : NULL;
 
@@ -22912,14 +27452,20 @@ static void report_runtime_renderer_backend(SDL_Renderer *renderer) {
   } else {
     runtime_logf("Presentation backend: software framebuffer");
   }
+  (void)preference;
+  (void)using_opengl;
 #else
   SDL_RendererInfo info;
 
   memset(&info, 0, sizeof(info));
   if (renderer != NULL && SDL_GetRendererInfo(renderer, &info) == 0 && info.name != NULL) {
-    runtime_logf("Presentation backend: SDL %s renderer (software framebuffer)", info.name);
+    runtime_logf("Presentation backend: SDL %s renderer (requested=%s opengl=%s gpu=%s world_overlay=%s)",
+                 info.name, runtime_renderer_preference_name(preference), using_opengl ? "yes" : "no",
+                 using_opengl ? "flats(sd+hd)/walls(sd+hd)/sd-sprites<=800x450/blood/red/pixelate/menus/hud/weapon" : "no",
+                 using_opengl ? "software large-target/HD sprites" : "software framebuffer");
   } else {
-    runtime_logf("Presentation backend: software framebuffer");
+    runtime_logf("Presentation backend: software framebuffer (requested=%s)",
+                 runtime_renderer_preference_name(preference));
   }
 #endif
 }
@@ -22955,16 +27501,25 @@ int main(int argc, char **argv) {
   int render_scale = 1;
   int window_width = DEFAULT_WINDOW_WIDTH;
   int window_height = DEFAULT_WINDOW_HEIGHT;
+  int cli_resolution_width = 0;
+  int cli_resolution_height = 0;
+  RuntimeRendererPreference renderer_preference = GLOOM_RENDERER_AUTO;
+  bool renderer_using_opengl = false;
 #ifdef GLOOM_DOS_SDL3
   bool classic_viewport = true;
 #else
   bool classic_viewport = false;
 #endif
   bool explicit_resolution = false;
+  bool cli_has_resolution = false;
   bool barrel_projectile_origin = true;
   bool two_player_mode = false;
   bool combat_mode = false;
   bool skip_menu = false;
+  bool force_red_palette = false;
+  bool force_blood = false;
+  int force_pixelate = 0;
+  const char *frame_dump_path = NULL;
   uint8_t violence_mode = GLOOM_VIOLENCE_MEATY_MESSY;
   uint32_t profile_render_frames = 0u;
 #ifdef GLOOM_DOS_SDL3
@@ -22976,6 +27531,7 @@ int main(int argc, char **argv) {
 #endif
   bool level_transition_pending = false;
   bool combat_round_pending = false;
+  int exit_code = 0;
   AppState state;
   AppState previous_state;
 
@@ -22989,13 +27545,7 @@ int main(int argc, char **argv) {
   memset(&framebuffer, 0, sizeof(framebuffer));
   initialize_default_keyboard_config(&g_keyboard_config);
   load_runtime_display_ini(&g_runtime_display_ini);
-  if (g_runtime_display_ini.has_resolution) {
-    window_width = g_runtime_display_ini.resolution_width;
-    window_height = g_runtime_display_ini.resolution_height;
-    render_width = window_width;
-    render_height = window_height;
-    explicit_resolution = true;
-  }
+  renderer_preference = g_runtime_display_ini.renderer_preference;
   if (argc > 1 && strcmp(argv[1], "--version") == 0) {
     printf("%s\n", runtime_title());
     return 0;
@@ -23084,6 +27634,10 @@ int main(int argc, char **argv) {
     return run_input_selftest();
   }
 
+  if (argc > 1 && strcmp(argv[1], "--renderer-selftest") == 0) {
+    return run_renderer_selftest();
+  }
+
 #if GLOOM_RUNTIME_HAS_AUTOSAVE
   if (argc > 1 && strcmp(argv[1], "--autosave-selftest") == 0) {
     return run_autosave_selftest();
@@ -23142,6 +27696,19 @@ int main(int argc, char **argv) {
           return 1;
         }
         render_scale = (int)parsed;
+      } else if (strcmp(argv[argi], "--renderer") == 0) {
+        if (argi + 1 >= argc || !parse_renderer_preference_name(argv[argi + 1], &renderer_preference)) {
+          fprintf(stderr, "--renderer requires software, opengl, or auto\n");
+          return 1;
+        }
+        ++argi;
+      } else if (strncmp(argv[argi], "--renderer=", 11) == 0) {
+        const char *value = argv[argi] + 11;
+
+        if (!parse_renderer_preference_name(value, &renderer_preference)) {
+          fprintf(stderr, "--renderer requires software, opengl, or auto\n");
+          return 1;
+        }
       } else if (strcmp(argv[argi], "--window-size") == 0 || strcmp(argv[argi], "--resolution") == 0 ||
                  strcmp(argv[argi], "--boot-resolution") == 0) {
         char *end = NULL;
@@ -23162,11 +27729,9 @@ int main(int argc, char **argv) {
           fprintf(stderr, "%s requires WIDTHxHEIGHT, height 200..4320\n", argv[argi - 1]);
           return 1;
         }
-        window_width = (int)parsed_width;
-        window_height = (int)parsed_height;
-        render_width = window_width;
-        render_height = window_height;
-        explicit_resolution = true;
+        cli_resolution_width = (int)parsed_width;
+        cli_resolution_height = (int)parsed_height;
+        cli_has_resolution = true;
       } else if (strncmp(argv[argi], "--window-size=", 14) == 0 ||
                  strncmp(argv[argi], "--resolution=", 13) == 0 ||
                  strncmp(argv[argi], "--boot-resolution=", 18) == 0) {
@@ -23179,11 +27744,9 @@ int main(int argc, char **argv) {
           fprintf(stderr, "%s requires WIDTHxHEIGHT, width 320..7680, height 200..4320\n", argv[argi]);
           return 1;
         }
-        window_width = parsed_width;
-        window_height = parsed_height;
-        render_width = window_width;
-        render_height = window_height;
-        explicit_resolution = true;
+        cli_resolution_width = parsed_width;
+        cli_resolution_height = parsed_height;
+        cli_has_resolution = true;
       } else if (strcmp(argv[argi], "--barrel-projectiles") == 0) {
         barrel_projectile_origin = true;
       } else if (strcmp(argv[argi], "--two-player") == 0 || strcmp(argv[argi], "--2p") == 0) {
@@ -23192,6 +27755,49 @@ int main(int argc, char **argv) {
         two_player_mode = true;
         combat_mode = true;
       } else if (strcmp(argv[argi], "--skip-menu") == 0) {
+        skip_menu = true;
+      } else if (strcmp(argv[argi], "--force-redpal") == 0 ||
+                 strcmp(argv[argi], "--force-red-palette") == 0) {
+        force_red_palette = true;
+      } else if (strcmp(argv[argi], "--force-blood") == 0) {
+        force_blood = true;
+      } else if (strcmp(argv[argi], "--force-pixelate") == 0) {
+        char *end = NULL;
+        long parsed = 0;
+
+        if (argi + 1 >= argc) {
+          fprintf(stderr, "--force-pixelate requires a pixel block size from 2 to 24\n");
+          return 1;
+        }
+        parsed = strtol(argv[++argi], &end, 10);
+        if (end == argv[argi] || *end != '\0' || parsed < 2 || parsed > 24) {
+          fprintf(stderr, "--force-pixelate requires a pixel block size from 2 to 24\n");
+          return 1;
+        }
+        force_pixelate = (int)parsed;
+      } else if (strncmp(argv[argi], "--force-pixelate=", 17) == 0) {
+        const char *value = argv[argi] + 17;
+        char *end = NULL;
+        long parsed = strtol(value, &end, 10);
+
+        if (end == value || *end != '\0' || parsed < 2 || parsed > 24) {
+          fprintf(stderr, "--force-pixelate requires a pixel block size from 2 to 24\n");
+          return 1;
+        }
+        force_pixelate = (int)parsed;
+      } else if (strcmp(argv[argi], "--frame-dump") == 0) {
+        if (argi + 1 >= argc) {
+          fprintf(stderr, "--frame-dump requires an output BMP path\n");
+          return 1;
+        }
+        frame_dump_path = argv[++argi];
+        skip_menu = true;
+      } else if (strncmp(argv[argi], "--frame-dump=", 13) == 0) {
+        frame_dump_path = argv[argi] + 13;
+        if (frame_dump_path[0] == '\0') {
+          fprintf(stderr, "--frame-dump requires an output BMP path\n");
+          return 1;
+        }
         skip_menu = true;
       } else if (strcmp(argv[argi], "--profile-render") == 0) {
         char *end = NULL;
@@ -23267,6 +27873,10 @@ int main(int argc, char **argv) {
         map_path = argv[argi];
       }
     }
+  }
+
+  if (frame_dump_path != NULL && profile_render_frames == 0u) {
+    profile_render_frames = 1u;
   }
 
   if (resolve_runtime_file_path(map_path, map_path_buffer, sizeof(map_path_buffer))) {
@@ -23375,6 +27985,28 @@ int main(int argc, char **argv) {
   }
   state.violence_mode = violence_mode;
   initialize_runtime_objects(&state);
+  if (force_red_palette) {
+    state.player_palette_timer = (float)GLOOM_PLAYER_RED_PAL_TIMER;
+    if (state.two_player_mode) {
+      state.player2.player_palette_timer = (float)GLOOM_PLAYER_RED_PAL_TIMER;
+    }
+  }
+  if (force_blood) {
+    RuntimeBlood *blood = &state.blood[0];
+    float forward_x = SDL_sinf(state.camera_angle);
+    float forward_z = SDL_cosf(state.camera_angle);
+
+    memset(blood, 0, sizeof(*blood));
+    blood->active = true;
+    blood->color_mask = 0x0f00u;
+    blood->x = state.camera_x + (forward_x * 256.0f);
+    blood->y = state.camera_y;
+    blood->z = state.camera_z + (forward_z * 256.0f);
+  }
+  if (force_pixelate > 1) {
+    state.player_pixsize = (int16_t)force_pixelate;
+    state.player_pixsize_accum = (float)force_pixelate;
+  }
   printf("Camera spawn: x=%.0f z=%.0f angle=%.3f\n", state.camera_x, state.camera_z, state.camera_angle);
   if (state.two_player_mode) {
     printf("Two-player mode: p1 x=%.0f z=%.0f, p2 x=%.0f z=%.0f\n", state.camera_x, state.camera_z,
@@ -23460,6 +28092,13 @@ int main(int argc, char **argv) {
   fprintf(stderr, "DOS checkpoint: SDL_Init video/events/audio ok\n");
   fflush(stderr);
 #endif
+  if (select_configured_runtime_resolution(&g_runtime_display_ini, renderer_preference, cli_has_resolution,
+                                           cli_resolution_width, cli_resolution_height, &render_width,
+                                           &render_height)) {
+    window_width = render_width;
+    window_height = render_height;
+    explicit_resolution = true;
+  }
   if (!explicit_resolution) {
     if (classic_viewport) {
       render_width = BASE_WIDTH;
@@ -23484,7 +28123,8 @@ int main(int argc, char **argv) {
     window_height = render_height;
   }
   configure_runtime_gameplay_viewport(render_width, render_height);
-  log_runtime_display_config(&g_runtime_display_ini, render_width, render_height, window_width, window_height);
+  log_runtime_display_config(&g_runtime_display_ini, render_width, render_height, window_width, window_height,
+                             renderer_preference);
   gamepad_init();
 
 #ifdef GLOOM_DOS_SDL3
@@ -23539,7 +28179,7 @@ int main(int argc, char **argv) {
   configure_dos_index_display_mode(window, render_width, render_height);
 #endif
 
-  renderer = create_runtime_renderer(window);
+  renderer = create_runtime_renderer(window, renderer_preference, &renderer_using_opengl);
   if (renderer == NULL) {
     fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
     SDL_DestroyWindow(window);
@@ -23557,7 +28197,10 @@ int main(int argc, char **argv) {
     gloom_map_free(&state.map);
     return 1;
   }
-  report_runtime_renderer_backend(renderer);
+#ifndef GLOOM_DOS_SDL3
+  g_runtime_opengl_draw_backend = renderer_using_opengl;
+#endif
+  report_runtime_renderer_backend(renderer, renderer_preference, renderer_using_opengl);
   log_runtime_sdl_window_metrics(window, renderer, window_width, window_height, render_width, render_height);
 #ifdef GLOOM_DOS_SDL3
   dos_logf("DOS checkpoint: SDL_CreateRenderer ok");
@@ -23574,7 +28217,7 @@ int main(int argc, char **argv) {
   apply_dos_index_palette_to_window(window);
 #endif
   if (!ensure_render_framebuffer(renderer, &framebuffer, render_width, render_height)) {
-    SDL_DestroyRenderer(renderer);
+    runtime_destroy_sdl_renderer(&renderer);
     SDL_DestroyWindow(window);
     audio_shutdown(&g_audio);
     gamepad_shutdown();
@@ -23606,7 +28249,7 @@ int main(int argc, char **argv) {
     if (!load_menu_assets(&menu_assets)) {
       fprintf(stderr, "Failed to load original menu assets\n");
       free_render_framebuffer(&framebuffer);
-      SDL_DestroyRenderer(renderer);
+      runtime_destroy_sdl_renderer(&renderer);
       SDL_DestroyWindow(window);
       audio_shutdown(&g_audio);
       gamepad_shutdown();
@@ -23632,7 +28275,7 @@ int main(int argc, char **argv) {
                        &menu_violence_mode, &g_control_config) != 0) {
       free_menu_assets(&menu_assets);
       free_render_framebuffer(&framebuffer);
-      SDL_DestroyRenderer(renderer);
+      runtime_destroy_sdl_renderer(&renderer);
       SDL_DestroyWindow(window);
       audio_shutdown(&g_audio);
       gamepad_shutdown();
@@ -23669,7 +28312,7 @@ int main(int argc, char **argv) {
                                        sizeof(map_path_buffer), &resolved_map_path)) {
         fprintf(stderr, "Failed to load autosave from menu\n");
         free_render_framebuffer(&framebuffer);
-        SDL_DestroyRenderer(renderer);
+        runtime_destroy_sdl_renderer(&renderer);
         SDL_DestroyWindow(window);
         audio_shutdown(&g_audio);
         gamepad_shutdown();
@@ -23695,7 +28338,7 @@ int main(int argc, char **argv) {
 
       if (run_combat_menu(renderer, &framebuffer, render_width, render_height, &series, &lives) != 0) {
         free_render_framebuffer(&framebuffer);
-        SDL_DestroyRenderer(renderer);
+        runtime_destroy_sdl_renderer(&renderer);
         SDL_DestroyWindow(window);
         audio_shutdown(&g_audio);
         gamepad_shutdown();
@@ -23718,7 +28361,7 @@ int main(int argc, char **argv) {
       if (!resolve_next_combat_map(&state, selected_map_path, sizeof(selected_map_path))) {
         fprintf(stderr, "Failed to pick original combat map\n");
         free_render_framebuffer(&framebuffer);
-        SDL_DestroyRenderer(renderer);
+        runtime_destroy_sdl_renderer(&renderer);
         SDL_DestroyWindow(window);
         audio_shutdown(&g_audio);
         gamepad_shutdown();
@@ -23742,7 +28385,7 @@ int main(int argc, char **argv) {
       if (!resolve_script_level_intro_for_map(selected_map_path, &intro) ||
           !run_script_intro_screen(renderer, &framebuffer, &intro, render_width, render_height)) {
         free_render_framebuffer(&framebuffer);
-        SDL_DestroyRenderer(renderer);
+        runtime_destroy_sdl_renderer(&renderer);
         SDL_DestroyWindow(window);
         audio_shutdown(&g_audio);
         gamepad_shutdown();
@@ -23770,7 +28413,7 @@ int main(int argc, char **argv) {
                               sizeof(map_path_buffer))) {
         fprintf(stderr, "Failed to load original selected menu map\n");
         free_render_framebuffer(&framebuffer);
-        SDL_DestroyRenderer(renderer);
+        runtime_destroy_sdl_renderer(&renderer);
         SDL_DestroyWindow(window);
         audio_shutdown(&g_audio);
         gamepad_shutdown();
@@ -24289,6 +28932,25 @@ int main(int argc, char **argv) {
 #endif
   }
 
+#ifdef GLOOM_DOS_SDL3
+  if (frame_dump_path != NULL) {
+    fprintf(stderr, "--frame-dump is only available for desktop/web ARGB renderers\n");
+    exit_code = 1;
+  }
+#else
+  if (frame_dump_path != NULL) {
+    if (framebuffer.last_frame_pixels == NULL ||
+        !write_argb_bmp_file(frame_dump_path, framebuffer.last_frame_pixels, render_width, render_height,
+                             render_width)) {
+      fprintf(stderr, "Frame dump failed writing %s\n", frame_dump_path);
+      exit_code = 1;
+    } else {
+      printf("Wrote gameplay frame dump %s (%dx%d renderer=%s)\n", frame_dump_path, render_width, render_height,
+             runtime_renderer_preference_name(renderer_preference));
+    }
+  }
+#endif
+
   profile_report(render_width, render_height);
   free(previous_zones);
   free(render_zones);
@@ -24300,12 +28962,12 @@ int main(int argc, char **argv) {
   free_object_visual_set(&object_visuals);
   free_flat_texture_set(&flat_textures);
   free_wall_texture_set(&wall_textures);
-  SDL_DestroyRenderer(renderer);
+  runtime_destroy_sdl_renderer(&renderer);
   SDL_DestroyWindow(window);
   audio_shutdown(&g_audio);
   gamepad_shutdown();
   SDL_Quit();
   gloom_map_free(&state.map);
 
-  return 0;
+  return exit_code;
 }
