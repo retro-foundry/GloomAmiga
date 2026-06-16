@@ -36,11 +36,11 @@ optional viewport, HD art, control-source, and keyboard settings. `--renderer` o
 `--resolution`/`--window-size`/`--boot-resolution` override either configured renderer resolution.
 On desktop/web, the OpenGL/WebGL backend owns source-backed menu, script, pause, HUD, weapon, SD floor/ceiling
 `flat` texture draws, and SD wall-column draws from original 16-band wall atlases with transparent-column alpha.
-It also draws HD floor/ceiling and wall presentation pixels from the same source-backed layout, draws represented
-`drawblood` one-pixel splots on the GPU, and applies the original red-palette injury feedback and pixelate transition
-as GPU post-processes. SD `drawshapes` billboards/effects use the GPU path on the validated low comparison target;
-large hardware targets and HD sprite presentation still use the Amiga-derived software overlay pending the remaining
-GL sprite port.
+It also draws HD floor/ceiling and wall presentation pixels from the same source-backed layout, blending PNG alpha
+over the original source texel without adding non-Amiga wall holes, draws SD and HD `drawshapes` billboards/effects
+as GPU column quads using the existing source-backed sprite layout and depth mask, draws represented `drawblood`
+one-pixel splots on the GPU, and applies the original red-palette injury feedback and pixelate transition as GPU
+post-processes.
 Use `--frame-dump out.bmp --renderer software|opengl` for one-frame gameplay captures from the selected renderer.
 Use `python scripts/compare_renderer_frames.py --build-dir build --config Debug` on a machine with an OpenGL-capable
 SDL video driver for a fixed `map1_1` software/OpenGL frame comparison.

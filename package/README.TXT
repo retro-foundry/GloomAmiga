@@ -67,11 +67,9 @@
        opengl, or software; auto prefers OpenGL/WebGL on desktop/web and
        uses software on DOS. hardware_resolution controls the OpenGL/WebGL
        logical render target and defaults to 1920x1080.
-       The OpenGL/WebGL path renders SD and HD floors/walls, blood, gun,
-       HUD, menus, red flash, and pixelate transitions on the GPU. SD
-       sprites/effects use the GPU path on the validated low comparison
-       target. Large hardware targets and HD sprite presentation still use
-       the software overlay.
+       The OpenGL/WebGL path renders SD and HD floors/walls,
+       sprites/effects, blood, gun, HUD, menus, red flash, and pixelate
+       transitions on the GPU.
        viewport_size enables an Amiga-style centered gameplay window.
        viewport_pixel_size accepts 1x1 or 2x2.
 

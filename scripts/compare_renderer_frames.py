@@ -101,7 +101,14 @@ def compare_frames(software_path: Path, opengl_path: Path) -> dict[str, float]:
     }
 
 
-def run_frame_dump(exe: Path, renderer: str, output_path: Path, resolution: str, env: dict[str, str]) -> None:
+def run_frame_dump(
+    exe: Path,
+    renderer: str,
+    output_path: Path,
+    resolution: str,
+    env: dict[str, str],
+    hd_art: Path | None,
+) -> None:
     command = [
         str(exe),
         "--renderer",
@@ -111,6 +118,8 @@ def run_frame_dump(exe: Path, renderer: str, output_path: Path, resolution: str,
         "--frame-dump",
         str(output_path),
     ]
+    if hd_art is not None:
+        command.extend(["--hd-art", str(hd_art)])
     subprocess.run(command, cwd=exe.parent, env=env, check=True)
 
 
@@ -119,6 +128,7 @@ def main() -> int:
     parser.add_argument("--build-dir", default="build", type=Path)
     parser.add_argument("--config", default=None)
     parser.add_argument("--resolution", default="320x200")
+    parser.add_argument("--hd-art", default=None, type=Path)
     parser.add_argument("--keep-dumps", action="store_true")
     parser.add_argument("--max-changed-pixels", type=int, default=1200)
     parser.add_argument("--max-changed-percent", type=float, default=2.0)
@@ -137,8 +147,10 @@ def main() -> int:
         software_path = temp_path / "software.bmp"
         opengl_path = temp_path / "opengl.bmp"
 
-        run_frame_dump(exe, "software", software_path, args.resolution, env)
-        run_frame_dump(exe, "opengl", opengl_path, args.resolution, env)
+        hd_art = args.hd_art.resolve() if args.hd_art is not None else None
+
+        run_frame_dump(exe, "software", software_path, args.resolution, env, hd_art)
+        run_frame_dump(exe, "opengl", opengl_path, args.resolution, env, hd_art)
         metrics = compare_frames(software_path, opengl_path)
 
         print(

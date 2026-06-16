@@ -231,6 +231,11 @@ if(NOT EMSCRIPTEN)
     target_link_libraries(gloom_pc PRIVATE SDL2_mixer::SDL2_mixer-static)
   endif()
 
+  if(NOT DEFINED GLOOM_DOS_SDL3)
+    find_package(OpenGL REQUIRED)
+    target_link_libraries(gloom_pc PRIVATE OpenGL::GL)
+  endif()
+
   if(WIN32)
     target_link_libraries(gloom_pc PRIVATE ole32 windowscodecs)
   endif()
