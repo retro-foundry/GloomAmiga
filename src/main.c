@@ -732,6 +732,33 @@ typedef struct {
 
 static RuntimeDisplayIniConfig g_runtime_display_ini;
 
+typedef enum {
+  RUNTIME_RENDERER_BACKEND_SOFTWARE = 0,
+  RUNTIME_RENDERER_BACKEND_OPENGL = 1
+} RuntimeRendererBackend;
+
+typedef struct {
+  SDL_Renderer *sdl;
+  RenderFramebuffer framebuffer;
+  RuntimeRendererPreference preference;
+  RuntimeRendererBackend backend;
+  int render_width;
+  int render_height;
+} RuntimeRenderer;
+
+typedef struct {
+  bool has_camera_pose;
+  float camera_x;
+  float camera_z;
+  float camera_angle;
+  uint32_t update_ticks;
+  uint8_t force_event_id;
+  bool force_first_door;
+  bool look_at_first_door;
+  bool look_at_first_transparent_wall;
+  bool force_level_transition;
+} FrameDumpSetup;
+
 typedef struct {
   bool active;
   int source_width;
@@ -1232,6 +1259,20 @@ static const char *runtime_renderer_preference_name(RuntimeRendererPreference pr
 static bool parse_renderer_preference_name(const char *value, RuntimeRendererPreference *out_preference);
 static void initialize_runtime_display_ini_config(RuntimeDisplayIniConfig *config);
 static bool runtime_renderer_preference_prefers_hardware(RuntimeRendererPreference preference);
+static SDL_Renderer *runtime_renderer_sdl(RuntimeRenderer *renderer);
+static RenderFramebuffer *runtime_renderer_framebuffer(RuntimeRenderer *renderer);
+static bool runtime_renderer_uses_opengl(const RuntimeRenderer *renderer);
+static bool runtime_renderer_ready(const RuntimeRenderer *renderer, int render_width, int render_height);
+static bool runtime_renderer_begin_framebuffer(RuntimeRenderer *renderer);
+static void runtime_renderer_end_framebuffer(RuntimeRenderer *renderer);
+static bool runtime_renderer_blit_framebuffer(RuntimeRenderer *renderer);
+static void runtime_renderer_present(RuntimeRenderer *renderer);
+#ifndef GLOOM_DOS_SDL3
+static bool runtime_renderer_read_pixels(RuntimeRenderer *renderer, uint32_t *pixels, int width, int height,
+                                         int pitch_pixels);
+static bool runtime_renderer_write_current_frame_bmp(RuntimeRenderer *renderer, const char *path, int width,
+                                                     int height);
+#endif
 static bool select_configured_runtime_resolution(const RuntimeDisplayIniConfig *config,
                                                  RuntimeRendererPreference renderer_preference,
                                                  bool cli_has_resolution, int cli_width, int cli_height,
@@ -1825,7 +1866,10 @@ static bool g_live_menu_frame_dump_written = false;
 #ifndef GLOOM_DOS_SDL3
 static bool g_runtime_opengl_draw_backend = false;
 static SDL_Texture *g_runtime_gpu_start_logo_texture = NULL;
+static SDL_Texture *g_runtime_gpu_menu_image_texture = NULL;
 static SDL_Texture *g_runtime_gpu_pause_background_texture = NULL;
+static uint32_t *g_runtime_gpu_menu_image_pixels = NULL;
+static size_t g_runtime_gpu_menu_image_pixel_capacity = 0u;
 #endif
 
 static bool hd_art_render_enabled(void) {
@@ -1872,7 +1916,11 @@ static void runtime_gpu_destroy_texture(SDL_Texture **texture) {
 
 static void runtime_gpu_destroy_transient_textures(void) {
   runtime_gpu_destroy_texture(&g_runtime_gpu_start_logo_texture);
+  runtime_gpu_destroy_texture(&g_runtime_gpu_menu_image_texture);
   runtime_gpu_destroy_texture(&g_runtime_gpu_pause_background_texture);
+  free(g_runtime_gpu_menu_image_pixels);
+  g_runtime_gpu_menu_image_pixels = NULL;
+  g_runtime_gpu_menu_image_pixel_capacity = 0u;
 }
 
 typedef void(APIENTRYP RuntimeGLActiveTextureProc)(GLenum texture);
@@ -1896,6 +1944,7 @@ typedef void(APIENTRYP RuntimeGLDisableVertexAttribArrayProc)(GLuint index);
 typedef void(APIENTRYP RuntimeGLDrawArraysProc)(GLenum mode, GLint first, GLsizei count);
 typedef void(APIENTRYP RuntimeGLEnableProc)(GLenum cap);
 typedef void(APIENTRYP RuntimeGLEnableVertexAttribArrayProc)(GLuint index);
+typedef void(APIENTRYP RuntimeGLFinishProc)(void);
 typedef void(APIENTRYP RuntimeGLGenBuffersProc)(GLsizei n, GLuint *buffers);
 typedef void(APIENTRYP RuntimeGLGenTexturesProc)(GLsizei n, GLuint *textures);
 typedef GLenum(APIENTRYP RuntimeGLGetErrorProc)(void);
@@ -1949,6 +1998,7 @@ typedef struct {
   RuntimeGLDrawArraysProc DrawArrays;
   RuntimeGLEnableProc Enable;
   RuntimeGLEnableVertexAttribArrayProc EnableVertexAttribArray;
+  RuntimeGLFinishProc Finish;
   RuntimeGLGenBuffersProc GenBuffers;
   RuntimeGLGenTexturesProc GenTextures;
   RuntimeGLGetErrorProc GetError;
@@ -2100,6 +2150,7 @@ static bool runtime_gl_load_api(void) {
   GLOOM_LOAD_GL_PROC(Enable, RuntimeGLEnableProc, "glEnable");
   GLOOM_LOAD_GL_PROC(EnableVertexAttribArray, RuntimeGLEnableVertexAttribArrayProc,
                      "glEnableVertexAttribArray");
+  GLOOM_LOAD_GL_PROC(Finish, RuntimeGLFinishProc, "glFinish");
   GLOOM_LOAD_GL_PROC(GenBuffers, RuntimeGLGenBuffersProc, "glGenBuffers");
   GLOOM_LOAD_GL_PROC(GenTextures, RuntimeGLGenTexturesProc, "glGenTextures");
   GLOOM_LOAD_GL_PROC(GetError, RuntimeGLGetErrorProc, "glGetError");
@@ -2157,6 +2208,20 @@ static void runtime_gpu_prepare_sdl_texture_draw_state(bool blend) {
     g_runtime_gl.BlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
   } else {
     g_runtime_gl.Disable(GL_BLEND);
+  }
+}
+
+static void runtime_gpu_finish_direct_draw_for_readback(const char *context) {
+  GLenum error = GL_NO_ERROR;
+
+  if (!runtime_opengl_draw_backend_active() || !runtime_gl_load_api()) {
+    return;
+  }
+  g_runtime_gl.Finish();
+  error = g_runtime_gl.GetError();
+  if (error != GL_NO_ERROR) {
+    runtime_logf("OpenGL readback fence after %s reported gl=0x%x",
+                 context != NULL ? context : "direct draw", (unsigned)error);
   }
 }
 
@@ -7453,6 +7518,11 @@ static bool load_hd_object_visual_frames(const char *resolved_path, const char *
   size_t key_count = 0u;
   size_t frame_index = 0u;
   size_t loaded_count = 0u;
+  int first_hd_width = 0;
+  int first_hd_height = 0;
+  int max_hd_width = 0;
+  int max_hd_height = 0;
+  bool mixed_sizes = false;
 
   if (!g_hd_art_enabled) {
     return true;
@@ -7506,6 +7576,14 @@ static bool load_hd_object_visual_frames(const char *resolved_path, const char *
     frame->hd_argb_pixels = bitmap.pixels;
     frame->hd_bitmap_width = bitmap.width;
     frame->hd_bitmap_height = bitmap.height;
+    if (loaded_count == 0u) {
+      first_hd_width = bitmap.width;
+      first_hd_height = bitmap.height;
+    } else if (bitmap.width != first_hd_width || bitmap.height != first_hd_height) {
+      mixed_sizes = true;
+    }
+    if (bitmap.width > max_hd_width) max_hd_width = bitmap.width;
+    if (bitmap.height > max_hd_height) max_hd_height = bitmap.height;
     bitmap.pixels = NULL;
     free_hd_bitmap(&bitmap);
     loaded_count += 1u;
@@ -7522,8 +7600,13 @@ static bool load_hd_object_visual_frames(const char *resolved_path, const char *
       (void)snprintf(visual->source_name + len, sizeof(visual->source_name) - len, " + HD art");
     }
   }
-  printf("Loaded %zu/%zu HD object frames for %s\n", loaded_count, visual->frame_count,
-         asset_name != NULL ? asset_name : resolved_path);
+  if (mixed_sizes) {
+    printf("Loaded %zu/%zu HD object frames for %s (mixed sizes up to %dx%d)\n", loaded_count,
+           visual->frame_count, asset_name != NULL ? asset_name : resolved_path, max_hd_width, max_hd_height);
+  } else {
+    printf("Loaded %zu/%zu HD object frames for %s at %dx%d per frame\n", loaded_count,
+           visual->frame_count, asset_name != NULL ? asset_name : resolved_path, first_hd_width, first_hd_height);
+  }
   return true;
 }
 
@@ -15487,8 +15570,8 @@ static void end_render_framebuffer(RenderFramebuffer *framebuffer) {
   framebuffer->pitch_pixels = 0;
 }
 
-static void present_framebuffer_texture(SDL_Renderer *renderer, const RenderFramebuffer *framebuffer, int render_width,
-                                        int render_height) {
+static bool blit_framebuffer_texture(SDL_Renderer *renderer, const RenderFramebuffer *framebuffer, int render_width,
+                                     int render_height) {
 #ifdef GLOOM_DOS_SDL3
   (void)render_width;
   (void)render_height;
@@ -15497,7 +15580,7 @@ static void present_framebuffer_texture(SDL_Renderer *renderer, const RenderFram
 #endif
 
   if (renderer == NULL || framebuffer == NULL || framebuffer->texture == NULL) {
-    return;
+    return false;
   }
 #ifndef GLOOM_DOS_SDL3
   if (!logged_present_config) {
@@ -15522,8 +15605,49 @@ static void present_framebuffer_texture(SDL_Renderer *renderer, const RenderFram
 #endif
   SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
   SDL_RenderClear(renderer);
-  (void)SDL_RenderCopy(renderer, framebuffer->texture, NULL, NULL);
-  SDL_RenderPresent(renderer);
+  if (SDL_RenderCopy(renderer, framebuffer->texture, NULL, NULL) != 0) {
+    fprintf(stderr, "Cannot render PC framebuffer texture: %s\n", SDL_GetError());
+    return false;
+  }
+  return true;
+}
+
+static SDL_Renderer *runtime_renderer_sdl(RuntimeRenderer *renderer) {
+  return renderer != NULL ? renderer->sdl : NULL;
+}
+
+static RenderFramebuffer *runtime_renderer_framebuffer(RuntimeRenderer *renderer) {
+  return renderer != NULL ? &renderer->framebuffer : NULL;
+}
+
+static bool runtime_renderer_ready(const RuntimeRenderer *renderer, int render_width, int render_height) {
+  return renderer != NULL && renderer->sdl != NULL && renderer->framebuffer.texture != NULL &&
+         renderer->framebuffer.width == render_width && renderer->framebuffer.height == render_height;
+}
+
+static bool runtime_renderer_begin_framebuffer(RuntimeRenderer *renderer) {
+  return begin_render_framebuffer(runtime_renderer_framebuffer(renderer));
+}
+
+static void runtime_renderer_end_framebuffer(RuntimeRenderer *renderer) {
+  end_render_framebuffer(runtime_renderer_framebuffer(renderer));
+}
+
+static bool runtime_renderer_blit_framebuffer(RuntimeRenderer *renderer) {
+  if (renderer == NULL) {
+    return false;
+  }
+  return blit_framebuffer_texture(renderer->sdl, &renderer->framebuffer, renderer->render_width,
+                                  renderer->render_height);
+}
+
+static void runtime_renderer_present(RuntimeRenderer *renderer) {
+  SDL_Renderer *sdl = runtime_renderer_sdl(renderer);
+
+  if (sdl == NULL) {
+    return;
+  }
+  SDL_RenderPresent(sdl);
 #ifdef GLOOM_DOS_SDL3
   audio_dos_pump(&g_audio);
 #endif
@@ -18098,6 +18222,50 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
 }
 
 #ifndef GLOOM_DOS_SDL3
+static bool runtime_renderer_prepare_gpu_drawshape_view(RuntimeRenderer *runtime_renderer, const AppState *state,
+                                                        const GridOffsetSet *grid_offsets,
+                                                        const WallTextureSet *wall_textures,
+                                                        const FlatTextureSet *flat_textures,
+                                                        const ObjectVisualSet *object_visuals,
+                                                        const WeaponVisualSet *weapon_visuals, int x, int y, int w,
+                                                        int h, DebugSprite *out_sprites,
+                                                        size_t out_sprite_capacity, size_t *out_sprite_count,
+                                                        float *out_depth_copy, size_t out_depth_count) {
+  RenderFramebuffer *framebuffer = runtime_renderer_framebuffer(runtime_renderer);
+  size_t sprite_count = 0u;
+
+  if (out_sprite_count != NULL) {
+    *out_sprite_count = 0u;
+  }
+  if (framebuffer == NULL || state == NULL || w <= 0 || h <= 0 || out_sprites == NULL ||
+      out_sprite_capacity == 0u || framebuffer->sprite_depth_buffer == NULL) {
+    return false;
+  }
+
+  /*
+   * amiga/gloom2.s drawshapes clips against the represented wall-column mask before
+   * later sprites update that same mask. Until the GL path grows an FBO/depth target
+   * that can represent transparent wall columns directly, keep this source-derived
+   * prep isolated from the software framebuffer presentation path.
+   */
+  render_wall_debug(framebuffer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals,
+                    x, y, w, h, false, false, false, out_sprites, out_sprite_capacity, &sprite_count, false);
+  if (out_sprite_count != NULL) {
+    *out_sprite_count = sprite_count;
+  }
+
+  if (out_depth_copy != NULL) {
+    if (out_depth_count < (size_t)w) {
+      runtime_logf("OpenGL drawshape prep failed: depth copy has %zu columns for %d-column view",
+                   out_depth_count, w);
+      return false;
+    }
+    memcpy(out_depth_copy, framebuffer->sprite_depth_buffer, (size_t)w * sizeof(*out_depth_copy));
+  }
+
+  return true;
+}
+
 static bool debug_sprite_source_x_coord(const DebugSprite *sprite, const ObjectFrame *frame, int screen_x,
                                         float *out_src_x) {
   float tu = 0.0f;
@@ -19668,6 +19836,63 @@ static void render_menu_image(RenderFramebuffer *framebuffer, const MenuImage *i
 }
 
 #ifndef GLOOM_DOS_SDL3
+static bool fill_menu_image_fit_argb(uint32_t *dst_pixels, int dst_pitch_pixels, const MenuImage *image,
+                                     int render_width, int render_height, bool use_gpu_source) {
+  const uint32_t *source_pixels = NULL;
+  int source_width = 0;
+  int source_height = 0;
+  MenuImageFitRect fit_rect;
+  int dst_y = 0;
+
+  if (dst_pixels == NULL || dst_pitch_pixels < render_width || image == NULL || !image->loaded ||
+      render_width <= 0 || render_height <= 0) {
+    return false;
+  }
+  if (use_gpu_source) {
+    source_pixels = menu_image_gpu_argb_pixels(image, &source_width, &source_height);
+  } else {
+    source_pixels = menu_image_argb_pixels(image, &source_width, &source_height);
+  }
+  if (source_pixels == NULL || source_width <= 0 || source_height <= 0) {
+    return false;
+  }
+
+  fit_rect = menu_image_fit_rect_for_dimensions(source_width, source_height, render_width, render_height);
+  if (fit_rect.w <= 0 || fit_rect.h <= 0) {
+    return false;
+  }
+
+  for (dst_y = 0; dst_y < render_height; ++dst_y) {
+    uint32_t *dst_row = dst_pixels + ((size_t)dst_y * (size_t)dst_pitch_pixels);
+    int dst_x = 0;
+
+    for (dst_x = 0; dst_x < render_width; ++dst_x) {
+      int64_t src_x = 0;
+      int64_t src_y = 0;
+      uint32_t argb = 0u;
+
+      if (dst_x < fit_rect.x || dst_x >= fit_rect.x + fit_rect.w || dst_y < fit_rect.y ||
+          dst_y >= fit_rect.y + fit_rect.h) {
+        dst_row[dst_x] = 0xFF000000u;
+        continue;
+      }
+
+      src_x = ((int64_t)(dst_x - fit_rect.x) * (int64_t)source_width) / (int64_t)fit_rect.w;
+      src_y = ((int64_t)(dst_y - fit_rect.y) * (int64_t)source_height) / (int64_t)fit_rect.h;
+      if (src_x < 0) src_x = 0;
+      if (src_y < 0) src_y = 0;
+      if (src_x >= source_width) src_x = source_width - 1;
+      if (src_y >= source_height) src_y = source_height - 1;
+
+      argb = source_pixels[(size_t)src_y * (size_t)source_width + (size_t)src_x];
+      dst_row[dst_x] = (argb >> 24u) == 0u ? 0xFF000000u : (0xFF000000u | (argb & 0x00FFFFFFu));
+    }
+  }
+  return true;
+}
+#endif
+
+#ifndef GLOOM_DOS_SDL3
 static SDL_Texture *runtime_gpu_argb_texture(SDL_Renderer *renderer, SDL_Texture **io_texture,
                                              const uint32_t *pixels, int width, int height,
                                              bool blend, bool update_each_call) {
@@ -19705,30 +19930,6 @@ static SDL_Texture *runtime_gpu_argb_texture(SDL_Renderer *renderer, SDL_Texture
   }
 
   return *io_texture;
-}
-
-static SDL_Texture *runtime_gpu_menu_image_texture(SDL_Renderer *renderer, const MenuImage *image,
-                                                   int *out_width, int *out_height) {
-  const uint32_t *pixels = NULL;
-  int width = 0;
-  int height = 0;
-  MenuImage *mutable_image = (MenuImage *)image;
-  SDL_Texture **texture_slot = NULL;
-
-  if (out_width != NULL) *out_width = 0;
-  if (out_height != NULL) *out_height = 0;
-  if (renderer == NULL || image == NULL || mutable_image == NULL || !image->loaded) {
-    return NULL;
-  }
-
-  pixels = menu_image_gpu_argb_pixels(image, &width, &height);
-  if (pixels == NULL || width <= 0 || height <= 0) {
-    return NULL;
-  }
-  texture_slot = menu_image_gpu_hd_active(image) ? &mutable_image->gpu_hd_texture : &mutable_image->gpu_texture;
-  if (out_width != NULL) *out_width = width;
-  if (out_height != NULL) *out_height = height;
-  return runtime_gpu_argb_texture(renderer, texture_slot, pixels, width, height, true, false);
 }
 
 static SDL_Texture *runtime_gpu_hud_glyph_texture(SDL_Renderer *renderer, const HudGlyph *glyph,
@@ -19841,24 +20042,32 @@ static bool runtime_gpu_draw_argb_pixels(SDL_Renderer *renderer, SDL_Texture **i
 
 static bool runtime_gpu_draw_menu_image(SDL_Renderer *renderer, const MenuImage *image, int render_width,
                                         int render_height) {
-  int source_width = 0;
-  int source_height = 0;
-  SDL_Texture *texture = runtime_gpu_menu_image_texture(renderer, image, &source_width, &source_height);
-  MenuImageFitRect fit_rect;
-  SDL_Rect dst;
+  size_t pixel_count = 0u;
+  uint32_t *new_pixels = NULL;
 
-  if (texture == NULL || render_width <= 0 || render_height <= 0 || source_width <= 0 || source_height <= 0) {
+  if (renderer == NULL || image == NULL || render_width <= 0 || render_height <= 0) {
     return false;
   }
-  fit_rect = menu_image_fit_rect_for_dimensions(source_width, source_height, render_width, render_height);
-  if (fit_rect.w <= 0 || fit_rect.h <= 0) {
+  if ((size_t)render_width > SIZE_MAX / (size_t)render_height) {
     return false;
   }
-  dst.x = fit_rect.x;
-  dst.y = fit_rect.y;
-  dst.w = fit_rect.w;
-  dst.h = fit_rect.h;
-  return runtime_gpu_draw_texture(renderer, texture, NULL, &dst, 255u);
+  pixel_count = (size_t)render_width * (size_t)render_height;
+  if (g_runtime_gpu_menu_image_pixel_capacity < pixel_count) {
+    new_pixels = (uint32_t *)realloc(g_runtime_gpu_menu_image_pixels, pixel_count * sizeof(*new_pixels));
+    if (new_pixels == NULL) {
+      runtime_logf("OpenGL menu image draw failed: out of memory for fitted %dx%d surface",
+                   render_width, render_height);
+      return false;
+    }
+    g_runtime_gpu_menu_image_pixels = new_pixels;
+    g_runtime_gpu_menu_image_pixel_capacity = pixel_count;
+  }
+  if (!fill_menu_image_fit_argb(g_runtime_gpu_menu_image_pixels, render_width, image, render_width, render_height,
+                                true)) {
+    return false;
+  }
+  return runtime_gpu_draw_argb_pixels(renderer, &g_runtime_gpu_menu_image_texture, g_runtime_gpu_menu_image_pixels,
+                                      render_width, render_height, 0, 0, render_width, render_height, 255u, true);
 }
 
 static bool runtime_gpu_draw_hud_glyph_scaled_brightness(SDL_Renderer *renderer, const HudGlyph *glyph, int x, int y,
@@ -20101,29 +20310,6 @@ static void clear_menu_image_side_bars(RenderFramebuffer *framebuffer, const Men
 
 static bool write_argb_bmp_file(const char *path, const uint32_t *pixels, int width, int height, int pitch_pixels);
 
-static void maybe_write_live_menu_frame_dump(RenderFramebuffer *framebuffer, int render_width, int render_height) {
-#ifndef GLOOM_DOS_SDL3
-  if (g_live_menu_frame_dump_written || g_live_menu_frame_dump_path[0] == '\0') {
-    return;
-  }
-  g_live_menu_frame_dump_written = true;
-  if (framebuffer == NULL || framebuffer->pixels == NULL || framebuffer->pitch_pixels < framebuffer->width) {
-    runtime_logf("Live menu frame dump failed: framebuffer was not locked");
-    return;
-  }
-  if (write_argb_bmp_file(g_live_menu_frame_dump_path, framebuffer->pixels, render_width, render_height,
-                          framebuffer->pitch_pixels)) {
-    runtime_logf("Live menu frame dump: wrote %s (%dx%d)", g_live_menu_frame_dump_path, render_width, render_height);
-  } else {
-    runtime_logf("Live menu frame dump failed: could not write %s", g_live_menu_frame_dump_path);
-  }
-#else
-  (void)framebuffer;
-  (void)render_width;
-  (void)render_height;
-#endif
-}
-
 #ifndef GLOOM_DOS_SDL3
 static void maybe_write_live_menu_frame_dump_from_renderer(SDL_Renderer *renderer, int render_width,
                                                            int render_height) {
@@ -20143,6 +20329,7 @@ static void maybe_write_live_menu_frame_dump_from_renderer(SDL_Renderer *rendere
     runtime_logf("Live menu frame dump failed: out of memory for %dx%d", render_width, render_height);
     return;
   }
+  runtime_gpu_finish_direct_draw_for_readback("live menu capture");
   if (SDL_RenderReadPixels(renderer, &read_rect, SDL_PIXELFORMAT_ARGB8888, pixels,
                            render_width * (int)sizeof(*pixels)) != 0) {
     runtime_logf("Live menu frame dump failed: SDL_RenderReadPixels: %s", SDL_GetError());
@@ -21053,6 +21240,7 @@ static void render_start_menu_frame(RenderFramebuffer *framebuffer, const MenuAs
   int scale = 1;
   int y = 0;
   int i = 0;
+  bool background_includes_static_marks = false;
 
   if (framebuffer == NULL || assets == NULL) {
     return;
@@ -21094,8 +21282,10 @@ static void render_start_menu_frame(RenderFramebuffer *framebuffer, const MenuAs
 #ifdef GLOOM_DOS_SDL3
   if (dos_index_background != NULL) {
     copy_dos_index_background(framebuffer, dos_index_background, render_width, render_height);
+    background_includes_static_marks = true;
   } else if (background != NULL) {
     copy_menu_background(framebuffer, background, render_width, render_height);
+    background_includes_static_marks = true;
   } else {
     framebuffer_clear(framebuffer, 0xFF000000u);
     log_start_menu_title_fit_once(assets, render_width, render_height);
@@ -21105,6 +21295,7 @@ static void render_start_menu_frame(RenderFramebuffer *framebuffer, const MenuAs
 #else
   if (background != NULL) {
     copy_menu_background(framebuffer, background, render_width, render_height);
+    background_includes_static_marks = true;
   } else {
     framebuffer_clear(framebuffer, 0xFF000000u);
     log_start_menu_title_fit_once(assets, render_width, render_height);
@@ -21112,6 +21303,15 @@ static void render_start_menu_frame(RenderFramebuffer *framebuffer, const MenuAs
   }
   clear_menu_image_side_bars(framebuffer, &assets->title, render_width, render_height);
 #endif
+  if (!background_includes_static_marks) {
+    StartMenuLayout layout;
+
+    render_start_menu_static_marks(framebuffer, assets, render_width, render_height);
+    compute_start_menu_layout(render_width, render_height, item_count, g_start_menu_logo_src_w,
+                              g_start_menu_logo_src_h, &layout);
+    render_menu_text_brightness(framebuffer, &assets->big_font, layout.title_text, render_width / 2,
+                                layout.title_y, layout.title_scale, 255u);
+  }
 
   scale = menu_pixel_scale_for_viewport(render_width, render_height);
   y = start_menu_y_for_viewport(render_width, render_height, item_count);
@@ -21128,9 +21328,39 @@ static void render_start_menu_frame(RenderFramebuffer *framebuffer, const MenuAs
   }
 }
 
-static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const MenuAssets *assets,
-                          int render_width, int render_height, GloomGameMode *out_game_mode,
+static bool runtime_renderer_draw_start_menu_frame(RuntimeRenderer *runtime_renderer, const MenuAssets *assets,
+                                                   const uint32_t *background,
+                                                   const uint8_t *dos_index_background, int render_width,
+                                                   int render_height, int selected_index, bool selected_visible,
+                                                   uint8_t violence_mode,
+                                                   const RuntimeControlConfig *control_config) {
+  RenderFramebuffer *framebuffer = runtime_renderer_framebuffer(runtime_renderer);
+
+  if (!runtime_renderer_ready(runtime_renderer, render_width, render_height) || assets == NULL ||
+      framebuffer == NULL) {
+    return false;
+  }
+#ifndef GLOOM_DOS_SDL3
+  if (runtime_renderer_uses_opengl(runtime_renderer) && runtime_opengl_draw_backend_active()) {
+    runtime_gpu_render_start_menu_frame(runtime_renderer_sdl(runtime_renderer), assets, render_width, render_height,
+                                        selected_index, selected_visible, violence_mode, control_config);
+    return true;
+  }
+#endif
+  if (!runtime_renderer_begin_framebuffer(runtime_renderer)) {
+    return false;
+  }
+  render_start_menu_frame(framebuffer, assets, background, dos_index_background, render_width, render_height,
+                          selected_index, selected_visible, violence_mode, control_config);
+  runtime_renderer_end_framebuffer(runtime_renderer);
+  return runtime_renderer_blit_framebuffer(runtime_renderer);
+}
+
+static int run_start_menu(RuntimeRenderer *runtime_renderer, const MenuAssets *assets, int render_width,
+                          int render_height, GloomGameMode *out_game_mode,
                           uint8_t *io_violence_mode, RuntimeControlConfig *io_control_config) {
+  SDL_Renderer *renderer = runtime_renderer_sdl(runtime_renderer);
+  RenderFramebuffer *framebuffer = runtime_renderer_framebuffer(runtime_renderer);
 #ifdef GLOOM_DOS_SDL3
   static uint8_t *menu_background_index_cache = NULL;
   static size_t menu_background_index_capacity = 0u;
@@ -21338,36 +21568,21 @@ static int run_start_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer
       }
     }
 
-    if (redraw) {
-#ifndef GLOOM_DOS_SDL3
-      if (runtime_opengl_draw_backend_active()) {
-        runtime_gpu_render_start_menu_frame(renderer, assets, render_width, render_height, selected_index,
-                                            selected_visible, *io_violence_mode, io_control_config);
-        maybe_write_live_menu_frame_dump_from_renderer(renderer, render_width, render_height);
-        SDL_RenderPresent(renderer);
-#ifdef __EMSCRIPTEN__
-        if (!web_loading_overlay_hidden) {
-          runtime_emscripten_hide_loading_overlay();
-          web_loading_overlay_hidden = true;
-        }
-#endif
-        redraw = false;
-        continue;
-      }
-#endif
-    }
-
-    if (redraw && begin_render_framebuffer(framebuffer)) {
+    if (redraw &&
 #ifdef GLOOM_DOS_SDL3
-      render_start_menu_frame(framebuffer, assets, NULL, menu_background_index_cache, render_width, render_height,
-                              selected_index, selected_visible, *io_violence_mode, io_control_config);
+        runtime_renderer_draw_start_menu_frame(runtime_renderer, assets, NULL, menu_background_index_cache,
+                                               render_width, render_height, selected_index, selected_visible,
+                                               *io_violence_mode, io_control_config)
 #else
-      render_start_menu_frame(framebuffer, assets, menu_background_cache, NULL, render_width, render_height, selected_index,
-                              selected_visible, *io_violence_mode, io_control_config);
+        runtime_renderer_draw_start_menu_frame(runtime_renderer, assets, menu_background_cache, NULL, render_width,
+                                               render_height, selected_index, selected_visible, *io_violence_mode,
+                                               io_control_config)
 #endif
-      maybe_write_live_menu_frame_dump(framebuffer, render_width, render_height);
-      end_render_framebuffer(framebuffer);
-      present_framebuffer_texture(renderer, framebuffer, render_width, render_height);
+    ) {
+#ifndef GLOOM_DOS_SDL3
+      maybe_write_live_menu_frame_dump_from_renderer(renderer, render_width, render_height);
+#endif
+      runtime_renderer_present(runtime_renderer);
 #ifdef __EMSCRIPTEN__
       if (!web_loading_overlay_hidden) {
         runtime_emscripten_hide_loading_overlay();
@@ -21468,8 +21683,35 @@ static void runtime_gpu_render_combat_menu_frame(SDL_Renderer *renderer, const M
 }
 #endif
 
-static int run_combat_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, int render_width, int render_height,
-                           uint8_t *out_series, int16_t *out_lives) {
+static bool runtime_renderer_draw_combat_menu_frame(RuntimeRenderer *runtime_renderer, const MenuImage *image,
+                                                    const HudFont *font, int render_width, int render_height,
+                                                    int selected_index, bool selected_visible, int16_t lives) {
+  RenderFramebuffer *framebuffer = runtime_renderer_framebuffer(runtime_renderer);
+
+  if (!runtime_renderer_ready(runtime_renderer, render_width, render_height) || image == NULL || font == NULL ||
+      framebuffer == NULL) {
+    return false;
+  }
+#ifndef GLOOM_DOS_SDL3
+  if (runtime_renderer_uses_opengl(runtime_renderer) && runtime_opengl_draw_backend_active()) {
+    runtime_gpu_render_combat_menu_frame(runtime_renderer_sdl(runtime_renderer), image, font, render_width,
+                                         render_height, selected_index, selected_visible, lives);
+    return true;
+  }
+#endif
+  if (!runtime_renderer_begin_framebuffer(runtime_renderer)) {
+    return false;
+  }
+  render_combat_menu_frame(framebuffer, image, font, render_width, render_height, selected_index, selected_visible,
+                           lives);
+  runtime_renderer_end_framebuffer(runtime_renderer);
+  return runtime_renderer_blit_framebuffer(runtime_renderer);
+}
+
+static int run_combat_menu(RuntimeRenderer *runtime_renderer, int render_width, int render_height, uint8_t *out_series,
+                           int16_t *out_lives) {
+  SDL_Renderer *renderer = runtime_renderer_sdl(runtime_renderer);
+  RenderFramebuffer *framebuffer = runtime_renderer_framebuffer(runtime_renderer);
   MenuImage image;
   HudFont font;
   int selected_index = 0;
@@ -21593,23 +21835,9 @@ static int run_combat_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffe
       }
     }
 
-    if (redraw) {
-#ifndef GLOOM_DOS_SDL3
-      if (runtime_opengl_draw_backend_active()) {
-        runtime_gpu_render_combat_menu_frame(renderer, &image, &font, render_width, render_height, selected_index,
-                                             selected_visible, lives);
-        SDL_RenderPresent(renderer);
-        redraw = false;
-        continue;
-      }
-#endif
-    }
-
-    if (redraw && begin_render_framebuffer(framebuffer)) {
-      render_combat_menu_frame(framebuffer, &image, &font, render_width, render_height, selected_index,
-                               selected_visible, lives);
-      end_render_framebuffer(framebuffer);
-      present_framebuffer_texture(renderer, framebuffer, render_width, render_height);
+    if (redraw && runtime_renderer_draw_combat_menu_frame(runtime_renderer, &image, &font, render_width,
+                                                          render_height, selected_index, selected_visible, lives)) {
+      runtime_renderer_present(runtime_renderer);
       redraw = false;
     }
 #ifdef GLOOM_DOS_SDL3
@@ -21620,8 +21848,60 @@ static int run_combat_menu(SDL_Renderer *renderer, RenderFramebuffer *framebuffe
   }
 }
 
-static bool run_combat_result_screen(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, int render_width,
-                                     int render_height, const char *message) {
+static void render_combat_result_frame(RenderFramebuffer *framebuffer, const MenuImage *image, const HudFont *font,
+                                       const char *message, int render_width, int render_height) {
+  if (framebuffer == NULL) {
+    return;
+  }
+  framebuffer_clear(framebuffer, 0xFF000000u);
+  render_menu_image(framebuffer, image, render_width, render_height);
+  render_menu_text(framebuffer, font, message, render_width / 2, render_height / 2,
+                   menu_pixel_scale_for_viewport(render_width, render_height));
+}
+
+#ifndef GLOOM_DOS_SDL3
+static void runtime_gpu_render_combat_result_frame(SDL_Renderer *renderer, const MenuImage *image,
+                                                   const HudFont *font, const char *message, int render_width,
+                                                   int render_height) {
+  if (renderer == NULL) {
+    return;
+  }
+  SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+  SDL_RenderClear(renderer);
+  (void)runtime_gpu_draw_menu_image(renderer, image, render_width, render_height);
+  runtime_gpu_draw_menu_text(renderer, font, message, render_width / 2, render_height / 2,
+                             menu_pixel_scale_for_viewport(render_width, render_height));
+}
+#endif
+
+static bool runtime_renderer_draw_combat_result_frame(RuntimeRenderer *runtime_renderer, const MenuImage *image,
+                                                      const HudFont *font, const char *message, int render_width,
+                                                      int render_height) {
+  RenderFramebuffer *framebuffer = runtime_renderer_framebuffer(runtime_renderer);
+
+  if (!runtime_renderer_ready(runtime_renderer, render_width, render_height) || image == NULL || font == NULL ||
+      message == NULL || framebuffer == NULL) {
+    return false;
+  }
+#ifndef GLOOM_DOS_SDL3
+  if (runtime_renderer_uses_opengl(runtime_renderer) && runtime_opengl_draw_backend_active()) {
+    runtime_gpu_render_combat_result_frame(runtime_renderer_sdl(runtime_renderer), image, font, message,
+                                           render_width, render_height);
+    return true;
+  }
+#endif
+  if (!runtime_renderer_begin_framebuffer(runtime_renderer)) {
+    return false;
+  }
+  render_combat_result_frame(framebuffer, image, font, message, render_width, render_height);
+  runtime_renderer_end_framebuffer(runtime_renderer);
+  return runtime_renderer_blit_framebuffer(runtime_renderer);
+}
+
+static bool run_combat_result_screen(RuntimeRenderer *runtime_renderer, int render_width, int render_height,
+                                     const char *message) {
+  SDL_Renderer *renderer = runtime_renderer_sdl(runtime_renderer);
+  RenderFramebuffer *framebuffer = runtime_renderer_framebuffer(runtime_renderer);
   MenuImage image;
   HudFont font;
   bool running = true;
@@ -21657,34 +21937,10 @@ static bool run_combat_result_screen(SDL_Renderer *renderer, RenderFramebuffer *
       }
     }
 
-    if (
-#ifndef GLOOM_DOS_SDL3
-        !runtime_opengl_draw_backend_active() &&
-#endif
-        begin_render_framebuffer(framebuffer)) {
-      framebuffer_clear(framebuffer, 0xFF000000u);
-      render_menu_image(framebuffer, &image, render_width, render_height);
-      render_menu_text(framebuffer, &font, message, render_width / 2, render_height / 2,
-                       menu_pixel_scale_for_viewport(render_width, render_height));
-      end_render_framebuffer(framebuffer);
-      SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
-      SDL_RenderClear(renderer);
-      {
-        SDL_Rect dst = {0, 0, render_width, render_height};
-        (void)SDL_RenderCopy(renderer, framebuffer->texture, NULL, &dst);
-      }
-      SDL_RenderPresent(renderer);
+    if (runtime_renderer_draw_combat_result_frame(runtime_renderer, &image, &font, message, render_width,
+                                                  render_height)) {
+      runtime_renderer_present(runtime_renderer);
     }
-#ifndef GLOOM_DOS_SDL3
-    if (runtime_opengl_draw_backend_active()) {
-      SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
-      SDL_RenderClear(renderer);
-      (void)runtime_gpu_draw_menu_image(renderer, &image, render_width, render_height);
-      runtime_gpu_draw_menu_text(renderer, &font, message, render_width / 2, render_height / 2,
-                                 menu_pixel_scale_for_viewport(render_width, render_height));
-      SDL_RenderPresent(renderer);
-    }
-#endif
     SDL_Delay(1);
   }
 
@@ -21872,6 +22128,35 @@ static void runtime_gpu_render_pause_menu_frame(SDL_Renderer *renderer, const Hu
 }
 #endif
 
+static bool runtime_renderer_draw_pause_menu_frame(RuntimeRenderer *runtime_renderer, const HudFont *font,
+                                                   const uint32_t *background,
+                                                   const uint8_t *dos_index_background,
+                                                   int background_pitch_pixels, int render_width,
+                                                   int render_height, int selected_index, bool selected_visible,
+                                                   bool two_player_mode) {
+  RenderFramebuffer *framebuffer = runtime_renderer_framebuffer(runtime_renderer);
+
+  if (!runtime_renderer_ready(runtime_renderer, render_width, render_height) || font == NULL ||
+      framebuffer == NULL) {
+    return false;
+  }
+#ifndef GLOOM_DOS_SDL3
+  if (runtime_renderer_uses_opengl(runtime_renderer) && runtime_opengl_draw_backend_active()) {
+    runtime_gpu_render_pause_menu_frame(runtime_renderer_sdl(runtime_renderer), font, background,
+                                        background_pitch_pixels, render_width, render_height, selected_index,
+                                        selected_visible, two_player_mode);
+    return true;
+  }
+#endif
+  if (!runtime_renderer_begin_framebuffer(runtime_renderer)) {
+    return false;
+  }
+  render_pause_menu_frame(framebuffer, font, background, dos_index_background, background_pitch_pixels, render_width,
+                          render_height, selected_index, selected_visible, two_player_mode);
+  runtime_renderer_end_framebuffer(runtime_renderer);
+  return runtime_renderer_blit_framebuffer(runtime_renderer);
+}
+
 static bool pause_menu_apply_hd_toggle(PauseMenuResult result, bool *io_redraw, bool *io_selected_visible,
                                        int *io_flash_ticks) {
   if (result != PAUSE_MENU_TOGGLE_HD_ART) {
@@ -21891,10 +22176,12 @@ static bool pause_menu_apply_hd_toggle(PauseMenuResult result, bool *io_redraw, 
   return true;
 }
 
-static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer, RenderFramebuffer *framebuffer,
-                                      int render_width, int render_height, bool *io_mouse_captured,
+static PauseMenuResult run_pause_menu(SDL_Window *window, RuntimeRenderer *runtime_renderer, int render_width,
+                                      int render_height, bool *io_mouse_captured,
                                       double *io_mouse_dx_accum, bool *io_suppress_mouse_fire_until_button_up,
                                       bool two_player_mode) {
+  SDL_Renderer *renderer = runtime_renderer_sdl(runtime_renderer);
+  RenderFramebuffer *framebuffer = runtime_renderer_framebuffer(runtime_renderer);
 #ifdef GLOOM_DOS_SDL3
   static uint8_t *pause_background_indices = NULL;
   static size_t pause_background_index_capacity = 0u;
@@ -22146,36 +22433,19 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
       }
     }
 
-    if (redraw) {
-#ifndef GLOOM_DOS_SDL3
-      if (runtime_opengl_draw_backend_active()) {
-        runtime_gpu_render_pause_menu_frame(renderer, &font, pause_background_valid ? pause_background : NULL,
-                                            render_width, render_width, render_height, selected_index,
-                                            selected_visible, two_player_mode);
-        SDL_RenderPresent(renderer);
-        redraw = false;
-        continue;
-      }
-#endif
-    }
-
-    if (redraw && begin_render_framebuffer(framebuffer)) {
+    if (redraw &&
 #ifdef GLOOM_DOS_SDL3
-      render_pause_menu_frame(framebuffer, &font, NULL, pause_background_valid ? pause_background_indices : NULL,
-                              render_width, render_width, render_height, selected_index, selected_visible,
-                              two_player_mode);
+        runtime_renderer_draw_pause_menu_frame(runtime_renderer, &font, NULL,
+                                               pause_background_valid ? pause_background_indices : NULL,
+                                               render_width, render_width, render_height, selected_index,
+                                               selected_visible, two_player_mode)
 #else
-      render_pause_menu_frame(framebuffer, &font, pause_background_valid ? pause_background : NULL, NULL, render_width,
-                              render_width, render_height, selected_index, selected_visible, two_player_mode);
+        runtime_renderer_draw_pause_menu_frame(runtime_renderer, &font, pause_background_valid ? pause_background : NULL,
+                                               NULL, render_width, render_width, render_height, selected_index,
+                                               selected_visible, two_player_mode)
 #endif
-      end_render_framebuffer(framebuffer);
-      SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
-      SDL_RenderClear(renderer);
-      {
-        SDL_Rect dst = {0, 0, render_width, render_height};
-        (void)SDL_RenderCopy(renderer, framebuffer->texture, NULL, &dst);
-      }
-      SDL_RenderPresent(renderer);
+    ) {
+      runtime_renderer_present(runtime_renderer);
       redraw = false;
     }
 #ifdef GLOOM_DOS_SDL3
@@ -22235,8 +22505,34 @@ static void runtime_gpu_render_completion_frame(SDL_Renderer *renderer, const Me
 }
 #endif
 
-static bool run_completion_screen(SDL_Renderer *renderer, RenderFramebuffer *framebuffer,
-                                  const ScriptCompletion *completion, int render_width, int render_height) {
+static bool runtime_renderer_draw_completion_frame(RuntimeRenderer *runtime_renderer, const MenuImage *image,
+                                                   const HudFont *font, const char *text, int render_width,
+                                                   int render_height) {
+  RenderFramebuffer *framebuffer = runtime_renderer_framebuffer(runtime_renderer);
+
+  if (!runtime_renderer_ready(runtime_renderer, render_width, render_height) || image == NULL ||
+      framebuffer == NULL) {
+    return false;
+  }
+#ifndef GLOOM_DOS_SDL3
+  if (runtime_renderer_uses_opengl(runtime_renderer) && runtime_opengl_draw_backend_active()) {
+    runtime_gpu_render_completion_frame(runtime_renderer_sdl(runtime_renderer), image, font, text, render_width,
+                                        render_height);
+    return true;
+  }
+#endif
+  if (!runtime_renderer_begin_framebuffer(runtime_renderer)) {
+    return false;
+  }
+  render_completion_frame(framebuffer, image, font, text, render_width, render_height);
+  runtime_renderer_end_framebuffer(runtime_renderer);
+  return runtime_renderer_blit_framebuffer(runtime_renderer);
+}
+
+static bool run_completion_screen(RuntimeRenderer *runtime_renderer, const ScriptCompletion *completion,
+                                  int render_width, int render_height) {
+  SDL_Renderer *renderer = runtime_renderer_sdl(runtime_renderer);
+  RenderFramebuffer *framebuffer = runtime_renderer_framebuffer(runtime_renderer);
   MenuImage image;
   HudFont font;
   bool running = true;
@@ -22276,27 +22572,10 @@ static bool run_completion_screen(SDL_Renderer *renderer, RenderFramebuffer *fra
       }
     }
 
-    if (
-#ifndef GLOOM_DOS_SDL3
-        !runtime_opengl_draw_backend_active() &&
-#endif
-        begin_render_framebuffer(framebuffer)) {
-      render_completion_frame(framebuffer, &image, &font, completion->text, render_width, render_height);
-      end_render_framebuffer(framebuffer);
-      SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
-      SDL_RenderClear(renderer);
-      {
-        SDL_Rect dst = {0, 0, render_width, render_height};
-        (void)SDL_RenderCopy(renderer, framebuffer->texture, NULL, &dst);
-      }
-      SDL_RenderPresent(renderer);
+    if (runtime_renderer_draw_completion_frame(runtime_renderer, &image, &font, completion->text, render_width,
+                                               render_height)) {
+      runtime_renderer_present(runtime_renderer);
     }
-#ifndef GLOOM_DOS_SDL3
-    if (runtime_opengl_draw_backend_active()) {
-      runtime_gpu_render_completion_frame(renderer, &image, &font, completion->text, render_width, render_height);
-      SDL_RenderPresent(renderer);
-    }
-#endif
     SDL_Delay(1);
   }
 
@@ -22475,8 +22754,34 @@ static void runtime_gpu_render_script_intro_frame(SDL_Renderer *renderer, const 
 }
 #endif
 
-static bool run_script_intro_screen(SDL_Renderer *renderer, RenderFramebuffer *framebuffer,
-                                    const ScriptLevelIntro *intro, int render_width, int render_height) {
+static bool runtime_renderer_draw_script_intro_frame(RuntimeRenderer *runtime_renderer, const MenuImage *image,
+                                                     const HudFont *font, const char *text, int render_width,
+                                                     int render_height) {
+  RenderFramebuffer *framebuffer = runtime_renderer_framebuffer(runtime_renderer);
+
+  if (!runtime_renderer_ready(runtime_renderer, render_width, render_height) || image == NULL ||
+      framebuffer == NULL) {
+    return false;
+  }
+#ifndef GLOOM_DOS_SDL3
+  if (runtime_renderer_uses_opengl(runtime_renderer) && runtime_opengl_draw_backend_active()) {
+    runtime_gpu_render_script_intro_frame(runtime_renderer_sdl(runtime_renderer), image, font, text, render_width,
+                                          render_height);
+    return true;
+  }
+#endif
+  if (!runtime_renderer_begin_framebuffer(runtime_renderer)) {
+    return false;
+  }
+  render_script_intro_frame(framebuffer, image, font, text, render_width, render_height);
+  runtime_renderer_end_framebuffer(runtime_renderer);
+  return runtime_renderer_blit_framebuffer(runtime_renderer);
+}
+
+static bool run_script_intro_screen(RuntimeRenderer *runtime_renderer, const ScriptLevelIntro *intro, int render_width,
+                                    int render_height) {
+  SDL_Renderer *renderer = runtime_renderer_sdl(runtime_renderer);
+  RenderFramebuffer *framebuffer = runtime_renderer_framebuffer(runtime_renderer);
   static MenuImage image;
   static char cached_picture[sizeof(((ScriptLevelIntro *)0)->picture)] = {0};
   static HudFont font;
@@ -22554,27 +22859,10 @@ static bool run_script_intro_screen(SDL_Renderer *renderer, RenderFramebuffer *f
       running = false;
     }
 
-    if (
-#ifndef GLOOM_DOS_SDL3
-        !runtime_opengl_draw_backend_active() &&
-#endif
-        begin_render_framebuffer(framebuffer)) {
-      render_script_intro_frame(framebuffer, &image, &font, intro->text, render_width, render_height);
-      end_render_framebuffer(framebuffer);
-      SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
-      SDL_RenderClear(renderer);
-      {
-        SDL_Rect dst = {0, 0, render_width, render_height};
-        (void)SDL_RenderCopy(renderer, framebuffer->texture, NULL, &dst);
-      }
-      SDL_RenderPresent(renderer);
+    if (runtime_renderer_draw_script_intro_frame(runtime_renderer, &image, &font, intro->text, render_width,
+                                                 render_height)) {
+      runtime_renderer_present(runtime_renderer);
     }
-#ifndef GLOOM_DOS_SDL3
-    if (runtime_opengl_draw_backend_active()) {
-      runtime_gpu_render_script_intro_frame(renderer, &image, &font, intro->text, render_width, render_height);
-      SDL_RenderPresent(renderer);
-    }
-#endif
     SDL_Delay(1);
   }
 
@@ -22766,19 +23054,21 @@ static void framebuffer_scale_rect_in_place(RenderFramebuffer *framebuffer, int 
   }
 }
 
-static void render(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const AppState *state,
-                   const GridOffsetSet *grid_offsets,
+static void render(RuntimeRenderer *runtime_renderer, const AppState *state, const GridOffsetSet *grid_offsets,
                    const WallTextureSet *wall_textures, const FlatTextureSet *flat_textures,
                    const ObjectVisualSet *object_visuals, const WeaponVisualSet *weapon_visuals,
                    const HudFont *hud_font, int render_width, int render_height, const char *notice_text,
                    bool capture_composed_frame) {
+  SDL_Renderer *renderer = runtime_renderer_sdl(runtime_renderer);
+  RenderFramebuffer *framebuffer = runtime_renderer_framebuffer(runtime_renderer);
   int pixsize = state != NULL ? state->player_pixsize : 0;
   RuntimeGameplayViewport gameplay_viewport = runtime_gameplay_viewport_for_render_target(render_width, render_height);
   double profile_render_start_ms = profile_now_ms();
   double profile_start_ms = 0.0;
 #ifndef GLOOM_DOS_SDL3
   bool use_gpu_gameplay_overlays =
-      runtime_opengl_draw_backend_active() && state != NULL && !gameplay_viewport.active;
+      runtime_renderer_uses_opengl(runtime_renderer) && runtime_opengl_draw_backend_active() && state != NULL &&
+      !gameplay_viewport.active;
   bool use_gpu_world_flats = false;
   bool use_gpu_world_walls = false;
   bool use_gpu_world_blood = false;
@@ -22823,38 +23113,27 @@ static void render(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const
       int right_w = gameplay_viewport.source_width - left_w;
 
       capture_primary_player_state(state, &player1_state);
-      render_wall_debug(framebuffer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals,
-                        0, 0, left_w, gameplay_viewport.source_height, !use_gpu_world_flats,
-                        !use_gpu_world_walls, !use_gpu_world_blood, gpu_sprites_left,
-                        GLOOM_MAX_DEBUG_SPRITES, &gpu_sprite_count_left, !use_gpu_world_sprites);
-      if (use_gpu_world_sprites && framebuffer->gpu_sprite_depth_buffer != NULL && left_w > 0) {
-        memcpy(framebuffer->gpu_sprite_depth_buffer, framebuffer->sprite_depth_buffer,
-               (size_t)left_w * sizeof(*framebuffer->gpu_sprite_depth_buffer));
-        gpu_sprite_left_active = true;
-      }
+      gpu_sprite_left_active =
+          runtime_renderer_prepare_gpu_drawshape_view(runtime_renderer, state, grid_offsets, wall_textures,
+                                                     flat_textures, object_visuals, weapon_visuals, 0, 0, left_w,
+                                                     gameplay_viewport.source_height, gpu_sprites_left,
+                                                     GLOOM_MAX_DEBUG_SPRITES, &gpu_sprite_count_left,
+                                                     framebuffer->gpu_sprite_depth_buffer, (size_t)left_w);
       apply_primary_player_state(&player2_state, &state->player2);
       player2_state.player2 = player1_state;
       player2_state.active_player_index = 1u;
-      render_wall_debug(framebuffer, &player2_state, grid_offsets, wall_textures, flat_textures, object_visuals,
-                        weapon_visuals, left_w, 0, right_w, gameplay_viewport.source_height,
-                        !use_gpu_world_flats, !use_gpu_world_walls, !use_gpu_world_blood,
-                        gpu_sprites_right, GLOOM_MAX_DEBUG_SPRITES, &gpu_sprite_count_right,
-                        !use_gpu_world_sprites);
-      if (use_gpu_world_sprites) {
-        gpu_sprite_right_active = true;
-      }
+      gpu_sprite_right_active =
+          runtime_renderer_prepare_gpu_drawshape_view(runtime_renderer, &player2_state, grid_offsets, wall_textures,
+                                                     flat_textures, object_visuals, weapon_visuals, left_w, 0,
+                                                     right_w, gameplay_viewport.source_height, gpu_sprites_right,
+                                                     GLOOM_MAX_DEBUG_SPRITES, &gpu_sprite_count_right, NULL, 0u);
     } else {
-      render_wall_debug(framebuffer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals,
-                        0, 0, gameplay_viewport.source_width, gameplay_viewport.source_height,
-                        !use_gpu_world_flats, !use_gpu_world_walls, !use_gpu_world_blood,
-                        gpu_sprites_left, GLOOM_MAX_DEBUG_SPRITES, &gpu_sprite_count_left,
-                        !use_gpu_world_sprites);
-      if (use_gpu_world_sprites && framebuffer->gpu_sprite_depth_buffer != NULL &&
-          gameplay_viewport.source_width > 0) {
-        memcpy(framebuffer->gpu_sprite_depth_buffer, framebuffer->sprite_depth_buffer,
-               (size_t)gameplay_viewport.source_width * sizeof(*framebuffer->gpu_sprite_depth_buffer));
-        gpu_sprite_left_active = true;
-      }
+      gpu_sprite_left_active =
+          runtime_renderer_prepare_gpu_drawshape_view(runtime_renderer, state, grid_offsets, wall_textures,
+                                                     flat_textures, object_visuals, weapon_visuals, 0, 0,
+                                                     gameplay_viewport.source_width,
+                                                     gameplay_viewport.source_height, gpu_sprites_left,
+                                                     GLOOM_MAX_DEBUG_SPRITES, &gpu_sprite_count_left, NULL, 0u);
     }
 
     if (use_gpu_world_sprites) {
@@ -23207,6 +23486,7 @@ static void render(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, const
     if (capture_composed_frame && framebuffer->last_frame_pixels != NULL) {
       SDL_Rect read_rect = {0, 0, render_width, render_height};
 
+      runtime_gpu_finish_direct_draw_for_readback("gameplay frame capture");
       if (SDL_RenderReadPixels(renderer, &read_rect, SDL_PIXELFORMAT_ARGB8888, framebuffer->last_frame_pixels,
                                render_width * (int)sizeof(*framebuffer->last_frame_pixels)) != 0) {
         runtime_logf("OpenGL composed-frame snapshot failed: SDL_RenderReadPixels: %s", SDL_GetError());
@@ -25073,6 +25353,44 @@ static bool write_argb_bmp_file(const char *path, const uint32_t *pixels, int wi
   return true;
 }
 
+#ifndef GLOOM_DOS_SDL3
+static bool runtime_renderer_read_pixels(RuntimeRenderer *renderer, uint32_t *pixels, int width, int height,
+                                         int pitch_pixels) {
+  SDL_Renderer *sdl = runtime_renderer_sdl(renderer);
+  SDL_Rect read_rect = {0, 0, width, height};
+
+  if (sdl == NULL || pixels == NULL || width <= 0 || height <= 0 || pitch_pixels < width) {
+    return false;
+  }
+  runtime_gpu_finish_direct_draw_for_readback("renderer readback");
+  if (SDL_RenderReadPixels(sdl, &read_rect, SDL_PIXELFORMAT_ARGB8888, pixels,
+                           pitch_pixels * (int)sizeof(*pixels)) != 0) {
+    runtime_logf("Renderer readback failed: SDL_RenderReadPixels: %s", SDL_GetError());
+    return false;
+  }
+  return true;
+}
+
+static bool runtime_renderer_write_current_frame_bmp(RuntimeRenderer *renderer, const char *path, int width,
+                                                     int height) {
+  uint32_t *pixels = NULL;
+  bool ok = false;
+
+  if (path == NULL || path[0] == '\0' || width <= 0 || height <= 0) {
+    return false;
+  }
+  pixels = (uint32_t *)malloc((size_t)width * (size_t)height * sizeof(*pixels));
+  if (pixels == NULL) {
+    runtime_logf("Renderer frame dump failed: out of memory for %dx%d", width, height);
+    return false;
+  }
+  ok = runtime_renderer_read_pixels(renderer, pixels, width, height, width) &&
+       write_argb_bmp_file(path, pixels, width, height, width);
+  free(pixels);
+  return ok;
+}
+#endif
+
 static int run_menu_frame_dump(int argc, char **argv) {
 #ifdef GLOOM_DOS_SDL3
   (void)argc;
@@ -25538,6 +25856,95 @@ static int run_wall_selftest(void) {
         fprintf(stderr, "Wall selftest failed: mixed-size HD wall slot metadata resolved incorrectly\n");
         return 1;
       }
+    }
+
+    {
+      ObjectVisual visual;
+      ObjectVisual clone;
+      ObjectFrame *frame0 = NULL;
+      ObjectFrame *frame1 = NULL;
+      uint32_t frame0_pixels[4] = {0xff010101u, 0xff020202u, 0xff030303u, 0xff040404u};
+      uint32_t frame1_pixels[4] = {0xff111111u, 0xff121212u, 0xff131313u, 0xff141414u};
+      uint32_t frame0_hd_pixels[4 * 4];
+      uint32_t frame1_hd_pixels[8 * 6];
+      const uint32_t frame0_hd_edge = 0xff2100f0u;
+      const uint32_t frame1_hd_edge = 0xff4300f0u;
+      bool old_opengl_draw_backend = g_runtime_opengl_draw_backend;
+
+      memset(&visual, 0, sizeof(visual));
+      memset(&clone, 0, sizeof(clone));
+      memset(frame0_hd_pixels, 0, sizeof(frame0_hd_pixels));
+      memset(frame1_hd_pixels, 0, sizeof(frame1_hd_pixels));
+      frame0_hd_pixels[0] = 0xff210000u;
+      frame0_hd_pixels[(4u * 4u) - 1u] = frame0_hd_edge;
+      frame1_hd_pixels[0] = 0xff430000u;
+      frame1_hd_pixels[(8u * 6u) - 1u] = frame1_hd_edge;
+      visual.loaded = true;
+      visual.frame_count = 2u;
+      visual.frames = (ObjectFrame *)calloc(visual.frame_count, sizeof(*visual.frames));
+      if (visual.frames == NULL) {
+        g_hd_art_enabled = old_hd_art_enabled;
+        g_hd_art_render_enabled = old_hd_art_render_enabled;
+        fprintf(stderr, "Wall selftest failed: out of memory for mixed-size HD sprite frames\n");
+        return 1;
+      }
+      frame0 = &visual.frames[0];
+      frame1 = &visual.frames[1];
+      frame0->width = 2;
+      frame0->height = 2;
+      frame0->bitmap_width = 2;
+      frame0->bitmap_height = 2;
+      frame0->argb_pixels = frame0_pixels;
+      frame0->hd_bitmap_width = 4;
+      frame0->hd_bitmap_height = 4;
+      frame0->hd_argb_pixels = frame0_hd_pixels;
+      frame1->width = 2;
+      frame1->height = 2;
+      frame1->bitmap_width = 2;
+      frame1->bitmap_height = 2;
+      frame1->argb_pixels = frame1_pixels;
+      frame1->hd_bitmap_width = 8;
+      frame1->hd_bitmap_height = 6;
+      frame1->hd_argb_pixels = frame1_hd_pixels;
+
+      g_runtime_opengl_draw_backend = true;
+      if (!object_frame_gpu_hd_active(frame0) || !object_frame_gpu_hd_active(frame1) ||
+          frame0->hd_bitmap_width == frame1->hd_bitmap_width ||
+          frame0->hd_bitmap_height == frame1->hd_bitmap_height) {
+        g_runtime_opengl_draw_backend = old_opengl_draw_backend;
+        g_hd_art_enabled = old_hd_art_enabled;
+        g_hd_art_render_enabled = old_hd_art_render_enabled;
+        free(visual.frames);
+        fprintf(stderr, "Wall selftest failed: mixed-size HD sprite frames were not independently active\n");
+        return 1;
+      }
+      if (sample_hd_bitmap_argb(frame0->hd_argb_pixels, frame0->hd_bitmap_width, frame0->hd_bitmap_height,
+                                1.0f, 1.0f) != frame0_hd_edge ||
+          sample_hd_bitmap_argb(frame1->hd_argb_pixels, frame1->hd_bitmap_width, frame1->hd_bitmap_height,
+                                1.0f, 1.0f) != frame1_hd_edge) {
+        g_runtime_opengl_draw_backend = old_opengl_draw_backend;
+        g_hd_art_enabled = old_hd_art_enabled;
+        g_hd_art_render_enabled = old_hd_art_render_enabled;
+        free(visual.frames);
+        fprintf(stderr, "Wall selftest failed: mixed-size HD sprite frames did not keep per-frame sample extents\n");
+        return 1;
+      }
+      g_runtime_opengl_draw_backend = old_opengl_draw_backend;
+
+      if (!clone_object_visual(&visual, &clone) || clone.frame_count != 2u ||
+          clone.frames[0].hd_bitmap_width != 4 || clone.frames[0].hd_bitmap_height != 4 ||
+          clone.frames[1].hd_bitmap_width != 8 || clone.frames[1].hd_bitmap_height != 6 ||
+          clone.frames[0].hd_argb_pixels[(4u * 4u) - 1u] != frame0_hd_edge ||
+          clone.frames[1].hd_argb_pixels[(8u * 6u) - 1u] != frame1_hd_edge) {
+        g_hd_art_enabled = old_hd_art_enabled;
+        g_hd_art_render_enabled = old_hd_art_render_enabled;
+        free_object_visual(&clone);
+        free(visual.frames);
+        fprintf(stderr, "Wall selftest failed: mixed-size HD sprite frame metadata did not clone per frame\n");
+        return 1;
+      }
+      free_object_visual(&clone);
+      free(visual.frames);
     }
 
     {
@@ -26489,13 +26896,15 @@ static bool load_runtime_level(const char *map_path, AppState *state, WallTextur
 }
 
 #if GLOOM_RUNTIME_HAS_AUTOSAVE
-static bool load_autosaved_runtime_game(bool two_player_save, SDL_Renderer *renderer, RenderFramebuffer *framebuffer,
-                                        int render_width, int render_height, AppState *state,
+static bool load_autosaved_runtime_game(bool two_player_save, RuntimeRenderer *runtime_renderer, int render_width,
+                                        int render_height, AppState *state,
                                         WallTextureSet *wall_textures, FlatTextureSet *flat_textures,
                                         ObjectVisualSet *object_visuals, GloomZone *previous_zones,
                                         GloomZone *render_zones, bool *io_two_player_mode, bool *io_combat_mode,
                                         uint8_t *io_violence_mode, char *resolved_map_buffer,
                                         size_t resolved_map_buffer_size, const char **io_resolved_map_path) {
+  SDL_Renderer *renderer = runtime_renderer_sdl(runtime_renderer);
+  RenderFramebuffer *framebuffer = runtime_renderer_framebuffer(runtime_renderer);
   GloomAutosaveData save;
   ScriptLevelIntro intro;
 
@@ -26510,7 +26919,7 @@ static bool load_autosaved_runtime_game(bool two_player_save, SDL_Renderer *rend
     return false;
   }
   if (!resolve_script_level_intro_for_map(save.map_path, &intro) ||
-      !run_script_intro_screen(renderer, framebuffer, &intro, render_width, render_height)) {
+      !run_script_intro_screen(runtime_renderer, &intro, render_width, render_height)) {
     fprintf(stderr, "Cannot load autosave %s: failed to show original script intro for saved map %s\n",
             gloom_autosave_path_for_mode(two_player_save), save.map_path);
     return false;
@@ -26936,13 +27345,15 @@ cleanup:
   return result;
 }
 
-static bool run_menu_and_restart_game(SDL_Renderer *renderer, RenderFramebuffer *framebuffer, int render_width,
-                                      int render_height, AppState *state, WallTextureSet *wall_textures,
+static bool run_menu_and_restart_game(RuntimeRenderer *runtime_renderer, int render_width, int render_height,
+                                      AppState *state, WallTextureSet *wall_textures,
                                       FlatTextureSet *flat_textures, ObjectVisualSet *object_visuals,
                                       GloomZone *previous_zones, GloomZone *render_zones, bool barrel_projectile_origin,
                                       bool *io_two_player_mode, bool *io_combat_mode, uint8_t *io_violence_mode,
                                       char *resolved_map_buffer, size_t resolved_map_buffer_size,
                                       const char **io_resolved_map_path) {
+  SDL_Renderer *renderer = runtime_renderer_sdl(runtime_renderer);
+  RenderFramebuffer *framebuffer = runtime_renderer_framebuffer(runtime_renderer);
   MenuAssets menu_assets;
   GloomGameMode menu_game_mode = GLOOM_GAME_MODE_ONE_PLAYER;
   uint8_t menu_violence_mode = GLOOM_VIOLENCE_MEATY_MESSY;
@@ -26963,7 +27374,7 @@ static bool run_menu_and_restart_game(SDL_Renderer *renderer, RenderFramebuffer 
     fprintf(stderr, "Failed to load original menu assets\n");
     return false;
   }
-  if (run_start_menu(renderer, framebuffer, &menu_assets, render_width, render_height, &menu_game_mode,
+  if (run_start_menu(runtime_renderer, &menu_assets, render_width, render_height, &menu_game_mode,
                      &menu_violence_mode, &g_control_config) != 0) {
     free_menu_assets(&menu_assets);
     return false;
@@ -26981,7 +27392,7 @@ static bool run_menu_and_restart_game(SDL_Renderer *renderer, RenderFramebuffer 
   if (menu_game_mode == GLOOM_GAME_MODE_LOAD_ONE_PLAYER || menu_game_mode == GLOOM_GAME_MODE_LOAD_TWO_PLAYER) {
     bool load_two_player = menu_game_mode == GLOOM_GAME_MODE_LOAD_TWO_PLAYER;
 
-    if (!load_autosaved_runtime_game(load_two_player, renderer, framebuffer, render_width, render_height, state,
+    if (!load_autosaved_runtime_game(load_two_player, runtime_renderer, render_width, render_height, state,
                                      wall_textures, flat_textures, object_visuals, previous_zones, render_zones,
                                      io_two_player_mode, io_combat_mode, io_violence_mode, resolved_map_buffer,
                                      resolved_map_buffer_size, io_resolved_map_path)) {
@@ -26994,7 +27405,7 @@ static bool run_menu_and_restart_game(SDL_Renderer *renderer, RenderFramebuffer 
     uint8_t series = 1u;
     int16_t lives = 3;
 
-    if (run_combat_menu(renderer, framebuffer, render_width, render_height, &series, &lives) != 0) {
+    if (run_combat_menu(runtime_renderer, render_width, render_height, &series, &lives) != 0) {
       return false;
     }
 #ifdef GLOOM_DOS_SDL3
@@ -27010,7 +27421,7 @@ static bool run_menu_and_restart_game(SDL_Renderer *renderer, RenderFramebuffer 
     ScriptLevelIntro intro;
 
     if (!resolve_script_level_intro_for_map(first_map_path, &intro) ||
-        !run_script_intro_screen(renderer, framebuffer, &intro, render_width, render_height)) {
+        !run_script_intro_screen(runtime_renderer, &intro, render_width, render_height)) {
       return false;
     }
 #ifdef GLOOM_DOS_SDL3
@@ -28034,12 +28445,580 @@ static void report_runtime_renderer_backend(SDL_Renderer *renderer, RuntimeRende
     runtime_logf("Presentation backend: SDL %s renderer (requested=%s opengl=%s gpu=%s world_overlay=%s)",
                  info.name, runtime_renderer_preference_name(preference), using_opengl ? "yes" : "no",
                  using_opengl ? "flats(sd+hd)/walls(sd+hd)/sprites(sd+hd)/blood/red/pixelate/menus/hud/weapon" : "no",
-                 using_opengl ? "gpu world with software depth prep" : "software framebuffer");
+                 using_opengl ? "gpu world with source drawshape mask" : "software framebuffer");
   } else {
     runtime_logf("Presentation backend: software framebuffer (requested=%s)",
                  runtime_renderer_preference_name(preference));
   }
 #endif
+}
+
+static void runtime_renderer_init(RuntimeRenderer *renderer) {
+  if (renderer == NULL) {
+    return;
+  }
+  memset(renderer, 0, sizeof(*renderer));
+  renderer->preference = GLOOM_RENDERER_AUTO;
+  renderer->backend = RUNTIME_RENDERER_BACKEND_SOFTWARE;
+}
+
+static bool runtime_renderer_uses_opengl(const RuntimeRenderer *renderer) {
+  return renderer != NULL && renderer->backend == RUNTIME_RENDERER_BACKEND_OPENGL;
+}
+
+static void runtime_renderer_destroy(RuntimeRenderer *renderer) {
+  if (renderer == NULL) {
+    return;
+  }
+
+  free_render_framebuffer(&renderer->framebuffer);
+  runtime_destroy_sdl_renderer(&renderer->sdl);
+  renderer->backend = RUNTIME_RENDERER_BACKEND_SOFTWARE;
+  renderer->render_width = 0;
+  renderer->render_height = 0;
+}
+
+static bool runtime_renderer_create_for_window(RuntimeRenderer *renderer, SDL_Window *window,
+                                               RuntimeRendererPreference preference, bool integer_scale,
+                                               int render_width, int render_height, int window_width,
+                                               int window_height) {
+  bool using_opengl = false;
+
+  if (renderer == NULL || window == NULL || render_width <= 0 || render_height <= 0) {
+    return false;
+  }
+
+  runtime_renderer_destroy(renderer);
+  renderer->preference = preference;
+  renderer->sdl = create_runtime_renderer(window, preference, &using_opengl);
+  if (renderer->sdl == NULL) {
+    return false;
+  }
+#ifndef GLOOM_DOS_SDL3
+  renderer->backend = using_opengl ? RUNTIME_RENDERER_BACKEND_OPENGL : RUNTIME_RENDERER_BACKEND_SOFTWARE;
+  g_runtime_opengl_draw_backend = using_opengl;
+  runtime_gpu_set_resource_renderer(renderer->sdl);
+  if (g_hd_art_enabled && !using_opengl) {
+    runtime_logf("HD presentation art is disabled for the software renderer; using original source assets");
+  }
+#else
+  renderer->backend = RUNTIME_RENDERER_BACKEND_SOFTWARE;
+#endif
+
+  report_runtime_renderer_backend(renderer->sdl, preference, using_opengl);
+  log_runtime_sdl_window_metrics(window, renderer->sdl, window_width, window_height, render_width, render_height);
+  (void)SDL_RenderSetIntegerScale(renderer->sdl, integer_scale ? SDL_TRUE : SDL_FALSE);
+  (void)SDL_RenderSetLogicalSize(renderer->sdl, render_width, render_height);
+
+  if (!ensure_render_framebuffer(renderer->sdl, &renderer->framebuffer, render_width, render_height)) {
+    runtime_renderer_destroy(renderer);
+    return false;
+  }
+
+  renderer->render_width = render_width;
+  renderer->render_height = render_height;
+  return true;
+}
+
+#ifndef GLOOM_DOS_SDL3
+static int run_screen_frame_dump(int argc, char **argv) {
+  const char *kind = NULL;
+  const char *path = NULL;
+  RuntimeRendererPreference preference = GLOOM_RENDERER_AUTO;
+  RuntimeRenderer runtime_renderer;
+  SDL_Window *window = NULL;
+  int render_width = 320;
+  int render_height = 200;
+  int argi = 0;
+  bool ok = false;
+
+  if (argc < 4) {
+    fprintf(stderr,
+            "--screen-frame-dump requires SCREEN OUTPUT.bmp [WIDTHxHEIGHT] [--renderer software|opengl|auto]\n");
+    return 1;
+  }
+  kind = argv[2];
+  path = argv[3];
+  runtime_renderer_init(&runtime_renderer);
+  initialize_default_keyboard_config(&g_keyboard_config);
+  normalize_control_config(&g_control_config);
+
+  for (argi = 4; argi < argc; ++argi) {
+    if (strcmp(argv[argi], "--renderer") == 0) {
+      if (argi + 1 >= argc || !parse_renderer_preference_name(argv[argi + 1], &preference)) {
+        fprintf(stderr, "--screen-frame-dump --renderer requires software, opengl, or auto\n");
+        return 1;
+      }
+      ++argi;
+    } else if (strncmp(argv[argi], "--renderer=", 11) == 0) {
+      if (!parse_renderer_preference_name(argv[argi] + 11, &preference)) {
+        fprintf(stderr, "--screen-frame-dump --renderer requires software, opengl, or auto\n");
+        return 1;
+      }
+    } else if (strcmp(argv[argi], "--resolution") == 0) {
+      if (argi + 1 >= argc ||
+          !parse_ini_resolution_value(argv[argi + 1], 320, 7680, 200, 4320, &render_width, &render_height)) {
+        fprintf(stderr, "--screen-frame-dump --resolution requires WIDTHxHEIGHT\n");
+        return 1;
+      }
+      ++argi;
+    } else if (strncmp(argv[argi], "--resolution=", 13) == 0) {
+      if (!parse_ini_resolution_value(argv[argi] + 13, 320, 7680, 200, 4320, &render_width, &render_height)) {
+        fprintf(stderr, "--screen-frame-dump --resolution requires WIDTHxHEIGHT\n");
+        return 1;
+      }
+    } else if (strcmp(argv[argi], "--hd-art") == 0 || strcmp(argv[argi], "--hd-art-path") == 0) {
+      if (argi + 1 >= argc || !set_hd_art_root(argv[argi + 1])) {
+        fprintf(stderr, "--screen-frame-dump %s requires a valid HD art root path\n", argv[argi]);
+        return 1;
+      }
+      ++argi;
+    } else if (strncmp(argv[argi], "--hd-art=", 9) == 0) {
+      if (!set_hd_art_root(argv[argi] + 9)) {
+        return 1;
+      }
+    } else if (strncmp(argv[argi], "--hd-art-path=", 14) == 0) {
+      if (!set_hd_art_root(argv[argi] + 14)) {
+        return 1;
+      }
+    } else if (parse_ini_resolution_value(argv[argi], 320, 7680, 200, 4320, &render_width, &render_height)) {
+      continue;
+    } else {
+      fprintf(stderr, "Unknown --screen-frame-dump option: %s\n", argv[argi]);
+      return 1;
+    }
+  }
+
+  configure_runtime_sdl_dpi_hints();
+  if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS) != 0) {
+    fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
+    return 1;
+  }
+  window = SDL_CreateWindow("Gloom Screen Frame Dump", SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                            render_width, render_height, SDL_WINDOW_HIDDEN);
+  if (window == NULL) {
+    fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
+    SDL_Quit();
+    return 1;
+  }
+  if (!runtime_renderer_create_for_window(&runtime_renderer, window, preference, false, render_width, render_height,
+                                          render_width, render_height)) {
+    fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
+    SDL_DestroyWindow(window);
+    SDL_Quit();
+    return 1;
+  }
+
+  if (strcmp(kind, "start_menu") == 0 || strcmp(kind, "menu") == 0) {
+    MenuAssets assets;
+    int logo_src_x = 0;
+    int logo_src_y = 0;
+
+    memset(&assets, 0, sizeof(assets));
+    if (!load_menu_assets(&assets)) {
+      fprintf(stderr, "Screen frame dump failed: could not load original menu assets\n");
+      goto cleanup;
+    }
+    menu_image_content_bounds(&assets.black_magic_logo, &logo_src_x, &logo_src_y, &g_start_menu_logo_src_w,
+                              &g_start_menu_logo_src_h);
+    (void)logo_src_x;
+    (void)logo_src_y;
+    ok = runtime_renderer_draw_start_menu_frame(&runtime_renderer, &assets, NULL, NULL, render_width, render_height,
+                                                0, true, GLOOM_VIOLENCE_MEATY_MESSY, &g_control_config);
+    free_menu_assets(&assets);
+  } else if (strcmp(kind, "combat_menu") == 0) {
+    MenuImage image;
+    HudFont font;
+
+    memset(&image, 0, sizeof(image));
+    memset(&font, 0, sizeof(font));
+    if (!load_combat_menu_image(&image) || !load_menu_big_font(&font)) {
+      fprintf(stderr, "Screen frame dump failed: could not load original combat menu assets\n");
+      free_menu_image(&image);
+      free_hud_font(&font);
+      goto cleanup;
+    }
+    ok = runtime_renderer_draw_combat_menu_frame(&runtime_renderer, &image, &font, render_width, render_height,
+                                                 0, true, 3);
+    free_menu_image(&image);
+    free_hud_font(&font);
+  } else if (strcmp(kind, "pause") == 0 || strcmp(kind, "pause_menu") == 0) {
+    HudFont font;
+
+    memset(&font, 0, sizeof(font));
+    if (!load_menu_big_font(&font)) {
+      fprintf(stderr, "Screen frame dump failed: could not load original pause menu font\n");
+      goto cleanup;
+    }
+    ok = runtime_renderer_draw_pause_menu_frame(&runtime_renderer, &font, NULL, NULL, render_width, render_width,
+                                                render_height, 0, true, false);
+    free_hud_font(&font);
+  } else if (strcmp(kind, "completion") == 0 || strcmp(kind, "completion_screen") == 0) {
+    ScriptCompletion completion;
+    MenuImage image;
+    HudFont font;
+    char next_map_path[1024] = {0};
+
+    memset(&completion, 0, sizeof(completion));
+    memset(&image, 0, sizeof(image));
+    memset(&font, 0, sizeof(font));
+    if (resolve_next_script_play_map_or_done("amiga/data/maps/map4_7", next_map_path, sizeof(next_map_path),
+                                             &completion) != SCRIPT_PLAY_NEXT_DONE ||
+        !load_script_picture_image(completion.picture, &image) || !load_menu_big_font(&font)) {
+      fprintf(stderr, "Screen frame dump failed: could not load original completion screen assets\n");
+      free_menu_image(&image);
+      free_hud_font(&font);
+      goto cleanup;
+    }
+    ok = runtime_renderer_draw_completion_frame(&runtime_renderer, &image, &font, completion.text, render_width,
+                                                render_height);
+    free_menu_image(&image);
+    free_hud_font(&font);
+  } else if (strcmp(kind, "script_intro") == 0 || strcmp(kind, "intro") == 0) {
+    ScriptLevelIntro intro;
+    MenuImage image;
+    HudFont font;
+
+    memset(&intro, 0, sizeof(intro));
+    memset(&image, 0, sizeof(image));
+    memset(&font, 0, sizeof(font));
+    if (!resolve_script_level_intro_for_map("amiga/maps/map1_1", &intro) ||
+        !load_script_picture_image(intro.picture, &image) || !load_menu_big_font(&font)) {
+      fprintf(stderr, "Screen frame dump failed: could not load original script intro assets\n");
+      free_menu_image(&image);
+      free_hud_font(&font);
+      goto cleanup;
+    }
+    ok = runtime_renderer_draw_script_intro_frame(&runtime_renderer, &image, &font, intro.text, render_width,
+                                                  render_height);
+    free_menu_image(&image);
+    free_hud_font(&font);
+  } else if (strcmp(kind, "combat_result") == 0) {
+    MenuImage image;
+    HudFont font;
+
+    memset(&image, 0, sizeof(image));
+    memset(&font, 0, sizeof(font));
+    if (!load_combat_menu_image(&image) || !load_menu_big_font(&font)) {
+      fprintf(stderr, "Screen frame dump failed: could not load original combat result assets\n");
+      free_menu_image(&image);
+      free_hud_font(&font);
+      goto cleanup;
+    }
+    ok = runtime_renderer_draw_combat_result_frame(&runtime_renderer, &image, &font,
+                                                   "PLAYER ONE WINS COMBAT GAME!", render_width, render_height);
+    free_menu_image(&image);
+    free_hud_font(&font);
+  } else {
+    fprintf(stderr, "Unknown screen frame dump kind: %s\n", kind);
+    goto cleanup;
+  }
+
+  if (!ok || !runtime_renderer_write_current_frame_bmp(&runtime_renderer, path, render_width, render_height)) {
+    fprintf(stderr, "Screen frame dump failed writing %s\n", path);
+    ok = false;
+    goto cleanup;
+  }
+  printf("Wrote screen frame dump %s (%s %dx%d renderer=%s)\n", path, kind, render_width, render_height,
+         runtime_renderer_preference_name(preference));
+
+cleanup:
+  runtime_renderer_destroy(&runtime_renderer);
+  SDL_DestroyWindow(window);
+  SDL_Quit();
+  return ok ? 0 : 1;
+}
+#else
+static int run_screen_frame_dump(int argc, char **argv) {
+  (void)argc;
+  (void)argv;
+  fprintf(stderr, "--screen-frame-dump is only available for desktop/web ARGB renderers\n");
+  return 1;
+}
+#endif
+
+static bool parse_long_option_value(const char *value, long min_value, long max_value, long *out_value) {
+  char *end = NULL;
+  long parsed = 0;
+
+  if (value == NULL || out_value == NULL) {
+    return false;
+  }
+  parsed = strtol(value, &end, 10);
+  if (end == value || *end != '\0' || parsed < min_value || parsed > max_value) {
+    return false;
+  }
+  *out_value = parsed;
+  return true;
+}
+
+static bool parse_float_option_value(const char *value, float min_value, float max_value, float *out_value) {
+  char *end = NULL;
+  float parsed = 0.0f;
+
+  if (value == NULL || out_value == NULL) {
+    return false;
+  }
+  parsed = strtof(value, &end);
+  if (end == value || *end != '\0' || parsed < min_value || parsed > max_value) {
+    return false;
+  }
+  *out_value = parsed;
+  return true;
+}
+
+static void apply_frame_dump_camera_pose(AppState *state, const FrameDumpSetup *setup) {
+  if (state == NULL || setup == NULL || !setup->has_camera_pose) {
+    return;
+  }
+
+  state->camera_x = setup->camera_x;
+  state->camera_z = setup->camera_z;
+  state->camera_angle = setup->camera_angle;
+  state->player_rot_fixed = amiga_rotation_to_fixed(radians_to_amiga_rotation(setup->camera_angle));
+  state->player_rotspeed = 0;
+  state->player_bounce = 0.0f;
+  state->player_frame_fixed = 0u;
+}
+
+static void set_frame_dump_camera_pose(AppState *state, float camera_x, float camera_z, float camera_angle) {
+  if (state == NULL) {
+    return;
+  }
+
+  state->camera_x = camera_x;
+  state->camera_z = camera_z;
+  state->camera_angle = camera_angle;
+  state->player_rot_fixed = amiga_rotation_to_fixed(radians_to_amiga_rotation(camera_angle));
+  state->player_rotspeed = 0;
+  state->player_bounce = 0.0f;
+  state->player_frame_fixed = 0u;
+}
+
+static bool frame_dump_camera_pose_for_zone(const GloomZone *zone, float distance, float *out_camera_x,
+                                            float *out_camera_z, float *out_camera_angle) {
+  float center_x = 0.0f;
+  float center_z = 0.0f;
+  float dx = 0.0f;
+  float dz = 0.0f;
+  float len = 0.0f;
+  float normal_x[2] = {0.0f, 0.0f};
+  float normal_z[2] = {0.0f, 0.0f};
+  int side = 0;
+
+  if (zone == NULL || out_camera_x == NULL || out_camera_z == NULL || out_camera_angle == NULL ||
+      distance <= 0.0f) {
+    return false;
+  }
+
+  center_x = ((float)zone->x1 + (float)zone->x2) * 0.5f;
+  center_z = ((float)zone->z1 + (float)zone->z2) * 0.5f;
+  dx = (float)zone->x2 - (float)zone->x1;
+  dz = (float)zone->z2 - (float)zone->z1;
+  len = SDL_sqrtf((dx * dx) + (dz * dz));
+  if (len < 1.0f) {
+    return false;
+  }
+
+  normal_x[0] = -dz / len;
+  normal_z[0] = dx / len;
+  normal_x[1] = -normal_x[0];
+  normal_z[1] = -normal_z[0];
+
+  for (side = 0; side < 2; ++side) {
+    float camera_x = center_x + normal_x[side] * distance;
+    float camera_z = center_z + normal_z[side] * distance;
+    float camera_angle = SDL_atan2f(center_x - camera_x, center_z - camera_z);
+    float view_cos = SDL_cosf(camera_angle);
+    float view_sin = SDL_sinf(camera_angle);
+    float x1 = (float)zone->x1 - camera_x;
+    float z1 = (float)zone->z1 - camera_z;
+    float x2 = (float)zone->x2 - camera_x;
+    float z2 = (float)zone->z2 - camera_z;
+    float vx1 = x1 * view_cos - z1 * view_sin;
+    float vz1 = x1 * view_sin + z1 * view_cos;
+    float vx2 = x2 * view_cos - z2 * view_sin;
+    float vz2 = x2 * view_sin + z2 * view_cos;
+    float face_a = vz1 - vz2;
+    float face_b = vx2 - vx1;
+    float face_c = vx1 * face_a + vz1 * face_b;
+
+    if (vz1 > 1.0f && vz2 > 1.0f && face_c >= 0.0f) {
+      *out_camera_x = camera_x;
+      *out_camera_z = camera_z;
+      *out_camera_angle = camera_angle;
+      return true;
+    }
+  }
+
+  *out_camera_x = center_x + normal_x[0] * distance;
+  *out_camera_z = center_z + normal_z[0] * distance;
+  *out_camera_angle = SDL_atan2f(center_x - *out_camera_x, center_z - *out_camera_z);
+  return true;
+}
+
+static bool frame_dump_zone_uses_transparent_wall_column(const AppState *state, const WallTextureSet *wall_textures,
+                                                         const GloomZone *zone) {
+  size_t slot = 0u;
+
+  if (state == NULL || wall_textures == NULL || zone == NULL) {
+    return false;
+  }
+
+  for (slot = 0u; slot < sizeof(zone->textures) / sizeof(zone->textures[0]); ++slot) {
+    uint8_t texture_index = remap_wall_texture_index(state, zone->textures[slot]);
+    size_t screen_index = texture_index / (uint8_t)GLOOM_TEXTURES_PER_SCREEN;
+    size_t local_index = texture_index % (uint8_t)GLOOM_TEXTURES_PER_SCREEN;
+    const WallTextureScreen *screen = NULL;
+    size_t column = 0u;
+
+    if (screen_index >= (size_t)GLOOM_TEXTURE_SCREENS ||
+        local_index >= (size_t)GLOOM_TEXTURES_PER_SCREEN ||
+        !wall_textures->screens[screen_index].loaded) {
+      continue;
+    }
+
+    screen = &wall_textures->screens[screen_index];
+    if (screen->column_flags == NULL || local_index >= screen->texture_count) {
+      continue;
+    }
+    for (column = 0u; column < (size_t)GLOOM_TEXTURE_WIDTH; ++column) {
+      if (screen->column_flags[(local_index * (size_t)GLOOM_TEXTURE_WIDTH) + column] != 0u) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+static bool set_frame_dump_camera_to_first_door(AppState *state) {
+  float camera_x = 0.0f;
+  float camera_z = 0.0f;
+  float camera_angle = 0.0f;
+  size_t zone_index = 0u;
+
+  if (state == NULL || state->map.door_command_count == 0u) {
+    return false;
+  }
+  zone_index = (size_t)state->map.door_commands[0].zone_index;
+  if (zone_index >= state->map.zone_count ||
+      !frame_dump_camera_pose_for_zone(&state->map.zones[zone_index], 512.0f, &camera_x, &camera_z,
+                                       &camera_angle)) {
+    return false;
+  }
+  set_frame_dump_camera_pose(state, camera_x, camera_z, camera_angle);
+  return true;
+}
+
+static bool set_frame_dump_camera_to_first_transparent_wall(AppState *state, const WallTextureSet *wall_textures) {
+  size_t zone_index = 0u;
+
+  if (state == NULL || wall_textures == NULL) {
+    return false;
+  }
+
+  for (zone_index = 0u; zone_index < state->map.zone_count; ++zone_index) {
+    float camera_x = 0.0f;
+    float camera_z = 0.0f;
+    float camera_angle = 0.0f;
+
+    if (!frame_dump_zone_uses_transparent_wall_column(state, wall_textures, &state->map.zones[zone_index])) {
+      continue;
+    }
+    if (!frame_dump_camera_pose_for_zone(&state->map.zones[zone_index], 512.0f, &camera_x, &camera_z,
+                                         &camera_angle)) {
+      continue;
+    }
+    set_frame_dump_camera_pose(state, camera_x, camera_z, camera_angle);
+    return true;
+  }
+  return false;
+}
+
+static bool apply_frame_dump_setup(const FrameDumpSetup *setup, AppState *state, WallTextureSet *wall_textures,
+                                   FlatTextureSet *flat_textures, ObjectVisualSet *object_visuals,
+                                   GloomZone *previous_zones, GloomZone *render_zones,
+                                   bool barrel_projectile_origin, uint8_t violence_mode,
+                                   char *resolved_map_buffer, size_t resolved_map_buffer_size,
+                                   const char **io_resolved_map_path) {
+  PlayerControls zero_controls;
+  uint32_t tick = 0u;
+
+  if (setup == NULL || state == NULL || wall_textures == NULL || flat_textures == NULL || object_visuals == NULL ||
+      previous_zones == NULL || render_zones == NULL || resolved_map_buffer == NULL ||
+      resolved_map_buffer_size == 0u || io_resolved_map_path == NULL || *io_resolved_map_path == NULL) {
+    return false;
+  }
+
+  if (setup->force_event_id != 0u) {
+    execute_map_event(state, setup->force_event_id);
+  }
+
+  if (setup->force_first_door) {
+    if (state->map.door_command_count == 0u) {
+      fprintf(stderr, "--force-first-door requires the loaded original map to contain a door command\n");
+      return false;
+    }
+    start_runtime_door(state, state->map.door_commands[0].zone_index);
+  }
+
+  if (setup->force_level_transition) {
+    char next_map_path[1024] = {0};
+    ScriptCompletion completion;
+    ScriptPlayNextResult next_result = SCRIPT_PLAY_NEXT_ERROR;
+    int16_t preserved_hitpoints = state->player_hitpoints;
+    int16_t preserved_lives = state->player_lives;
+    uint8_t preserved_weapon = state->player_weapon;
+    uint8_t preserved_reload = state->player_reload;
+    int16_t preserved_p2_hitpoints = state->player2.player_hitpoints;
+    int16_t preserved_p2_lives = state->player2.player_lives;
+    uint8_t preserved_p2_weapon = state->player2.player_weapon;
+    uint8_t preserved_p2_reload = state->player2.player_reload;
+
+    memset(&completion, 0, sizeof(completion));
+    next_result = resolve_next_script_play_map_or_done(*io_resolved_map_path, next_map_path, sizeof(next_map_path),
+                                                       &completion);
+    if (next_result != SCRIPT_PLAY_NEXT_MAP) {
+      fprintf(stderr, "--force-level-transition requires %s to resolve to another play_ map in misc/script\n",
+              *io_resolved_map_path);
+      return false;
+    }
+
+    if (state->two_player_mode) {
+      share_levelover_two_player_lives(&preserved_lives, &preserved_p2_lives);
+    }
+
+    if (!load_runtime_level(next_map_path, state, wall_textures, flat_textures, object_visuals, previous_zones,
+                            render_zones, true, preserved_hitpoints, preserved_lives, preserved_weapon,
+                            preserved_reload, preserved_p2_hitpoints, preserved_p2_lives, preserved_p2_weapon,
+                            preserved_p2_reload, barrel_projectile_origin, state->two_player_mode, violence_mode,
+                            resolved_map_buffer, resolved_map_buffer_size)) {
+      fprintf(stderr, "--force-level-transition failed loading original next script map %s\n", next_map_path);
+      return false;
+    }
+    *io_resolved_map_path = resolved_map_buffer;
+  }
+
+  memset(&zero_controls, 0, sizeof(zero_controls));
+  for (tick = 0u; tick < setup->update_ticks; ++tick) {
+    update_with_controls(state, &zero_controls, &zero_controls, object_visuals);
+  }
+
+  if (setup->has_camera_pose) {
+    apply_frame_dump_camera_pose(state, setup);
+  } else if (setup->look_at_first_door) {
+    if (!set_frame_dump_camera_to_first_door(state)) {
+      fprintf(stderr, "--frame-dump-look-at-first-door could not aim at the first original door zone\n");
+      return false;
+    }
+  } else if (setup->look_at_first_transparent_wall) {
+    if (!set_frame_dump_camera_to_first_transparent_wall(state, wall_textures)) {
+      fprintf(stderr,
+              "--frame-dump-look-at-transparent-wall could not find a loaded original transparent wall column\n");
+      return false;
+    }
+  }
+  return true;
 }
 
 int main(int argc, char **argv) {
@@ -28049,6 +29028,8 @@ int main(int argc, char **argv) {
   char error[256] = {0};
   SDL_Window *window = NULL;
   SDL_Renderer *renderer = NULL;
+  RenderFramebuffer *framebuffer = NULL;
+  RuntimeRenderer runtime_renderer;
   GridOffsetSet grid_offsets;
   WallTextureSet wall_textures;
   FlatTextureSet flat_textures;
@@ -28056,7 +29037,6 @@ int main(int argc, char **argv) {
   WeaponVisualSet weapon_visuals;
   HudFont hud_font;
   MenuAssets menu_assets;
-  RenderFramebuffer framebuffer;
   GloomZone *previous_zones = NULL;
   GloomZone *render_zones = NULL;
   uint64_t perf_frequency = 0;
@@ -28076,7 +29056,6 @@ int main(int argc, char **argv) {
   int cli_resolution_width = 0;
   int cli_resolution_height = 0;
   RuntimeRendererPreference renderer_preference = GLOOM_RENDERER_AUTO;
-  bool renderer_using_opengl = false;
 #ifdef GLOOM_DOS_SDL3
   bool classic_viewport = true;
 #else
@@ -28091,6 +29070,7 @@ int main(int argc, char **argv) {
   bool force_red_palette = false;
   bool force_blood = false;
   int force_pixelate = 0;
+  FrameDumpSetup frame_dump_setup;
   const char *frame_dump_path = NULL;
   uint8_t violence_mode = GLOOM_VIOLENCE_MEATY_MESSY;
   uint32_t profile_render_frames = 0u;
@@ -28114,7 +29094,8 @@ int main(int argc, char **argv) {
   memset(&weapon_visuals, 0, sizeof(weapon_visuals));
   memset(&hud_font, 0, sizeof(hud_font));
   memset(&menu_assets, 0, sizeof(menu_assets));
-  memset(&framebuffer, 0, sizeof(framebuffer));
+  memset(&frame_dump_setup, 0, sizeof(frame_dump_setup));
+  runtime_renderer_init(&runtime_renderer);
   initialize_default_keyboard_config(&g_keyboard_config);
   load_runtime_display_ini(&g_runtime_display_ini);
   renderer_preference = g_runtime_display_ini.renderer_preference;
@@ -28178,6 +29159,10 @@ int main(int argc, char **argv) {
 
   if (argc > 1 && strcmp(argv[1], "--menu-frame-dump") == 0) {
     return run_menu_frame_dump(argc, argv);
+  }
+
+  if (argc > 1 && strcmp(argv[1], "--screen-frame-dump") == 0) {
+    return run_screen_frame_dump(argc, argv);
   }
 
   if (argc > 1 && strcmp(argv[1], "--hd-art-selftest") == 0) {
@@ -28357,6 +29342,66 @@ int main(int argc, char **argv) {
           return 1;
         }
         force_pixelate = (int)parsed;
+      } else if (strcmp(argv[argi], "--frame-dump-ticks") == 0) {
+        long parsed = 0;
+
+        if (argi + 1 >= argc || !parse_long_option_value(argv[argi + 1], 0, 60000, &parsed)) {
+          fprintf(stderr, "--frame-dump-ticks requires an integer value from 0 to 60000\n");
+          return 1;
+        }
+        frame_dump_setup.update_ticks = (uint32_t)parsed;
+        ++argi;
+      } else if (strncmp(argv[argi], "--frame-dump-ticks=", 19) == 0) {
+        long parsed = 0;
+
+        if (!parse_long_option_value(argv[argi] + 19, 0, 60000, &parsed)) {
+          fprintf(stderr, "--frame-dump-ticks requires an integer value from 0 to 60000\n");
+          return 1;
+        }
+        frame_dump_setup.update_ticks = (uint32_t)parsed;
+      } else if (strcmp(argv[argi], "--frame-dump-camera") == 0) {
+        float camera_x = 0.0f;
+        float camera_z = 0.0f;
+        float camera_angle = 0.0f;
+
+        if (argi + 3 >= argc ||
+            !parse_float_option_value(argv[argi + 1], -32768.0f, 65535.0f, &camera_x) ||
+            !parse_float_option_value(argv[argi + 2], -32768.0f, 65535.0f, &camera_z) ||
+            !parse_float_option_value(argv[argi + 3], -100.0f, 100.0f, &camera_angle)) {
+          fprintf(stderr, "--frame-dump-camera requires X Z ANGLE_RADIANS\n");
+          return 1;
+        }
+        frame_dump_setup.has_camera_pose = true;
+        frame_dump_setup.camera_x = camera_x;
+        frame_dump_setup.camera_z = camera_z;
+        frame_dump_setup.camera_angle = camera_angle;
+        argi += 3;
+      } else if (strcmp(argv[argi], "--force-event") == 0) {
+        long parsed = 0;
+
+        if (argi + 1 >= argc || !parse_long_option_value(argv[argi + 1], 1, GLOOM_EVENT_COUNT, &parsed)) {
+          fprintf(stderr, "--force-event requires an event id from 1 to %u\n", (unsigned)GLOOM_EVENT_COUNT);
+          return 1;
+        }
+        frame_dump_setup.force_event_id = (uint8_t)parsed;
+        ++argi;
+      } else if (strncmp(argv[argi], "--force-event=", 14) == 0) {
+        long parsed = 0;
+
+        if (!parse_long_option_value(argv[argi] + 14, 1, GLOOM_EVENT_COUNT, &parsed)) {
+          fprintf(stderr, "--force-event requires an event id from 1 to %u\n", (unsigned)GLOOM_EVENT_COUNT);
+          return 1;
+        }
+        frame_dump_setup.force_event_id = (uint8_t)parsed;
+      } else if (strcmp(argv[argi], "--force-first-door") == 0) {
+        frame_dump_setup.force_first_door = true;
+      } else if (strcmp(argv[argi], "--frame-dump-look-at-first-door") == 0) {
+        frame_dump_setup.look_at_first_door = true;
+      } else if (strcmp(argv[argi], "--frame-dump-look-at-transparent-wall") == 0) {
+        frame_dump_setup.look_at_first_transparent_wall = true;
+      } else if (strcmp(argv[argi], "--force-level-transition") == 0 ||
+                 strcmp(argv[argi], "--force-script-transition") == 0) {
+        frame_dump_setup.force_level_transition = true;
       } else if (strcmp(argv[argi], "--frame-dump") == 0) {
         if (argi + 1 >= argc) {
           fprintf(stderr, "--frame-dump requires an output BMP path\n");
@@ -28450,6 +29495,16 @@ int main(int argc, char **argv) {
   if (frame_dump_path != NULL && profile_render_frames == 0u) {
     profile_render_frames = 1u;
   }
+  if (frame_dump_path == NULL &&
+      (frame_dump_setup.has_camera_pose || frame_dump_setup.update_ticks > 0u ||
+       frame_dump_setup.force_event_id != 0u || frame_dump_setup.force_first_door ||
+       frame_dump_setup.look_at_first_door || frame_dump_setup.look_at_first_transparent_wall ||
+       frame_dump_setup.force_level_transition)) {
+    fprintf(stderr,
+            "--frame-dump-ticks/--frame-dump-camera/--force-event/--force-first-door/--force-level-transition "
+            "are diagnostic capture options and require --frame-dump\n");
+    return 1;
+  }
 
   if (resolve_runtime_file_path(map_path, map_path_buffer, sizeof(map_path_buffer))) {
     resolved_map_path = map_path_buffer;
@@ -28476,7 +29531,7 @@ int main(int argc, char **argv) {
     }
     resolved_map_path = map_path_buffer;
 #ifdef GLOOM_DOS_SDL3
-    refresh_dos_index_palette(&framebuffer, window);
+    refresh_dos_index_palette(framebuffer, window);
 #endif
   }
 
@@ -28751,8 +29806,8 @@ int main(int argc, char **argv) {
   configure_dos_index_display_mode(window, render_width, render_height);
 #endif
 
-  renderer = create_runtime_renderer(window, renderer_preference, &renderer_using_opengl);
-  if (renderer == NULL) {
+  if (!runtime_renderer_create_for_window(&runtime_renderer, window, renderer_preference, classic_viewport,
+                                          render_width, render_height, window_width, window_height)) {
     fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
     SDL_DestroyWindow(window);
     audio_shutdown(&g_audio);
@@ -28769,31 +29824,17 @@ int main(int argc, char **argv) {
     gloom_map_free(&state.map);
     return 1;
   }
-#ifndef GLOOM_DOS_SDL3
-  g_runtime_opengl_draw_backend = renderer_using_opengl;
-  runtime_gpu_set_resource_renderer(renderer);
-  if (g_hd_art_enabled && !renderer_using_opengl) {
-    runtime_logf("HD presentation art is disabled for the software renderer; using original source assets");
-  }
-#endif
-  report_runtime_renderer_backend(renderer, renderer_preference, renderer_using_opengl);
-  log_runtime_sdl_window_metrics(window, renderer, window_width, window_height, render_width, render_height);
-#ifdef GLOOM_DOS_SDL3
-  dos_logf("DOS checkpoint: SDL_CreateRenderer ok");
-  fprintf(stderr, "DOS checkpoint: SDL_CreateRenderer ok\n");
-  fflush(stderr);
-#endif
-  runtime_emscripten_install_pointer_lock_listener();
-  runtime_emscripten_install_fullscreen_listeners();
-
-  (void)SDL_RenderSetIntegerScale(renderer, classic_viewport ? SDL_TRUE : SDL_FALSE);
-  (void)SDL_RenderSetLogicalSize(renderer, render_width, render_height);
-#ifdef GLOOM_DOS_SDL3
-  dos_runtime_set_mouse_pump_enabled(false);
-  apply_dos_index_palette_to_window(window);
-#endif
-  if (!ensure_render_framebuffer(renderer, &framebuffer, render_width, render_height)) {
-    runtime_destroy_sdl_renderer(&renderer);
+  renderer = runtime_renderer_sdl(&runtime_renderer);
+  framebuffer = runtime_renderer_framebuffer(&runtime_renderer);
+  if (frame_dump_path != NULL &&
+      (frame_dump_setup.has_camera_pose || frame_dump_setup.update_ticks > 0u ||
+       frame_dump_setup.force_event_id != 0u || frame_dump_setup.force_first_door ||
+       frame_dump_setup.look_at_first_door || frame_dump_setup.look_at_first_transparent_wall ||
+       frame_dump_setup.force_level_transition) &&
+      !apply_frame_dump_setup(&frame_dump_setup, &state, &wall_textures, &flat_textures, &object_visuals,
+                              previous_zones, render_zones, barrel_projectile_origin, violence_mode,
+                              map_path_buffer, sizeof(map_path_buffer), &resolved_map_path)) {
+    runtime_renderer_destroy(&runtime_renderer);
     SDL_DestroyWindow(window);
     audio_shutdown(&g_audio);
     gamepad_shutdown();
@@ -28810,6 +29851,18 @@ int main(int argc, char **argv) {
     return 1;
   }
 #ifdef GLOOM_DOS_SDL3
+  dos_logf("DOS checkpoint: SDL_CreateRenderer ok");
+  fprintf(stderr, "DOS checkpoint: SDL_CreateRenderer ok\n");
+  fflush(stderr);
+#endif
+  runtime_emscripten_install_pointer_lock_listener();
+  runtime_emscripten_install_fullscreen_listeners();
+
+#ifdef GLOOM_DOS_SDL3
+  dos_runtime_set_mouse_pump_enabled(false);
+  apply_dos_index_palette_to_window(window);
+#endif
+#ifdef GLOOM_DOS_SDL3
   dos_logf("DOS checkpoint: render framebuffer ok");
   fprintf(stderr, "DOS checkpoint: render framebuffer ok\n");
   fflush(stderr);
@@ -28824,8 +29877,7 @@ int main(int argc, char **argv) {
 
     if (!load_menu_assets(&menu_assets)) {
       fprintf(stderr, "Failed to load original menu assets\n");
-      free_render_framebuffer(&framebuffer);
-      runtime_destroy_sdl_renderer(&renderer);
+      runtime_renderer_destroy(&runtime_renderer);
       SDL_DestroyWindow(window);
       audio_shutdown(&g_audio);
       gamepad_shutdown();
@@ -28847,11 +29899,10 @@ int main(int argc, char **argv) {
     fflush(stderr);
 #endif
 
-    if (run_start_menu(renderer, &framebuffer, &menu_assets, render_width, render_height, &menu_game_mode,
+    if (run_start_menu(&runtime_renderer, &menu_assets, render_width, render_height, &menu_game_mode,
                        &menu_violence_mode, &g_control_config) != 0) {
       free_menu_assets(&menu_assets);
-      free_render_framebuffer(&framebuffer);
-      runtime_destroy_sdl_renderer(&renderer);
+      runtime_renderer_destroy(&runtime_renderer);
       SDL_DestroyWindow(window);
       audio_shutdown(&g_audio);
       gamepad_shutdown();
@@ -28869,7 +29920,7 @@ int main(int argc, char **argv) {
     }
 
 #ifdef GLOOM_DOS_SDL3
-    refresh_dos_index_palette(&framebuffer, window);
+    refresh_dos_index_palette(framebuffer, window);
 #endif
     free_menu_assets(&menu_assets);
     two_player_mode = menu_game_mode != GLOOM_GAME_MODE_ONE_PLAYER;
@@ -28882,13 +29933,12 @@ int main(int argc, char **argv) {
     if (menu_game_mode == GLOOM_GAME_MODE_LOAD_ONE_PLAYER || menu_game_mode == GLOOM_GAME_MODE_LOAD_TWO_PLAYER) {
       bool load_two_player = menu_game_mode == GLOOM_GAME_MODE_LOAD_TWO_PLAYER;
 
-      if (!load_autosaved_runtime_game(load_two_player, renderer, &framebuffer, render_width, render_height, &state,
+      if (!load_autosaved_runtime_game(load_two_player, &runtime_renderer, render_width, render_height, &state,
                                        &wall_textures, &flat_textures, &object_visuals, previous_zones, render_zones,
                                        &two_player_mode, &combat_mode, &violence_mode, map_path_buffer,
                                        sizeof(map_path_buffer), &resolved_map_path)) {
         fprintf(stderr, "Failed to load autosave from menu\n");
-        free_render_framebuffer(&framebuffer);
-        runtime_destroy_sdl_renderer(&renderer);
+        runtime_renderer_destroy(&runtime_renderer);
         SDL_DestroyWindow(window);
         audio_shutdown(&g_audio);
         gamepad_shutdown();
@@ -28912,9 +29962,8 @@ int main(int argc, char **argv) {
       uint8_t series = 1u;
       int16_t lives = 3;
 
-      if (run_combat_menu(renderer, &framebuffer, render_width, render_height, &series, &lives) != 0) {
-        free_render_framebuffer(&framebuffer);
-        runtime_destroy_sdl_renderer(&renderer);
+      if (run_combat_menu(&runtime_renderer, render_width, render_height, &series, &lives) != 0) {
+        runtime_renderer_destroy(&runtime_renderer);
         SDL_DestroyWindow(window);
         audio_shutdown(&g_audio);
         gamepad_shutdown();
@@ -28931,13 +29980,12 @@ int main(int argc, char **argv) {
         return 0;
       }
 #ifdef GLOOM_DOS_SDL3
-      refresh_dos_index_palette(&framebuffer, window);
+      refresh_dos_index_palette(framebuffer, window);
 #endif
       initialize_combat_rotation_state(&state, series, lives);
       if (!resolve_next_combat_map(&state, selected_map_path, sizeof(selected_map_path))) {
         fprintf(stderr, "Failed to pick original combat map\n");
-        free_render_framebuffer(&framebuffer);
-        runtime_destroy_sdl_renderer(&renderer);
+        runtime_renderer_destroy(&runtime_renderer);
         SDL_DestroyWindow(window);
         audio_shutdown(&g_audio);
         gamepad_shutdown();
@@ -28959,9 +30007,8 @@ int main(int argc, char **argv) {
       ScriptLevelIntro intro;
 
       if (!resolve_script_level_intro_for_map(selected_map_path, &intro) ||
-          !run_script_intro_screen(renderer, &framebuffer, &intro, render_width, render_height)) {
-        free_render_framebuffer(&framebuffer);
-        runtime_destroy_sdl_renderer(&renderer);
+          !run_script_intro_screen(&runtime_renderer, &intro, render_width, render_height)) {
+        runtime_renderer_destroy(&runtime_renderer);
         SDL_DestroyWindow(window);
         audio_shutdown(&g_audio);
         gamepad_shutdown();
@@ -28978,7 +30025,7 @@ int main(int argc, char **argv) {
         return 1;
       }
 #ifdef GLOOM_DOS_SDL3
-      refresh_dos_index_palette(&framebuffer, window);
+      refresh_dos_index_palette(framebuffer, window);
 #endif
     }
     {
@@ -28988,8 +30035,7 @@ int main(int argc, char **argv) {
                               barrel_projectile_origin, two_player_mode, violence_mode, map_path_buffer,
                               sizeof(map_path_buffer))) {
         fprintf(stderr, "Failed to load original selected menu map\n");
-        free_render_framebuffer(&framebuffer);
-        runtime_destroy_sdl_renderer(&renderer);
+        runtime_renderer_destroy(&runtime_renderer);
         SDL_DestroyWindow(window);
         audio_shutdown(&g_audio);
         gamepad_shutdown();
@@ -29144,7 +30190,7 @@ int main(int argc, char **argv) {
       render_alpha = (float)(accumulator / dt);
       render_state =
           interpolate_render_state(&previous_state, &state, render_alpha, render_zones, state.map.zone_count);
-      render(renderer, &framebuffer, &render_state, &grid_offsets, &wall_textures, &flat_textures, &object_visuals,
+      render(&runtime_renderer, &render_state, &grid_offsets, &wall_textures, &flat_textures, &object_visuals,
              &weapon_visuals, &hud_font, render_width, render_height,
 #if GLOOM_RUNTIME_HAS_AUTOSAVE
              autosave_notice_timer > 0.0 ? autosave_notice : NULL
@@ -29156,7 +30202,7 @@ int main(int argc, char **argv) {
       );
 
       PauseMenuResult pause_result =
-          run_pause_menu(window, renderer, &framebuffer, render_width, render_height, &mouse_captured, &mouse_dx_accum,
+          run_pause_menu(window, &runtime_renderer, render_width, render_height, &mouse_captured, &mouse_dx_accum,
                          &suppress_mouse_fire_until_button_up, state.two_player_mode);
 
       perf_prev = SDL_GetPerformanceCounter();
@@ -29177,7 +30223,7 @@ int main(int argc, char **argv) {
           suppress_mouse_fire_until_button_up = false;
           SDL_FlushEvent(SDL_MOUSEMOTION);
         }
-        if (!run_menu_and_restart_game(renderer, &framebuffer, render_width, render_height, &state, &wall_textures,
+        if (!run_menu_and_restart_game(&runtime_renderer, render_width, render_height, &state, &wall_textures,
                                        &flat_textures, &object_visuals, previous_zones, render_zones,
                                        barrel_projectile_origin, &two_player_mode, &combat_mode, &violence_mode,
                                        map_path_buffer, sizeof(map_path_buffer), &resolved_map_path)) {
@@ -29189,7 +30235,7 @@ int main(int argc, char **argv) {
         autosave_notice_timer = 0.0;
 #endif
 #ifdef GLOOM_DOS_SDL3
-        refresh_dos_index_palette(&framebuffer, window);
+        refresh_dos_index_palette(framebuffer, window);
 #endif
         mouse_captured = set_gameplay_start_mouse_capture(window);
         previous_state = state;
@@ -29207,7 +30253,7 @@ int main(int argc, char **argv) {
           suppress_mouse_fire_until_button_up = false;
           SDL_FlushEvent(SDL_MOUSEMOTION);
         }
-        if (!load_autosaved_runtime_game(state.two_player_mode, renderer, &framebuffer, render_width, render_height,
+        if (!load_autosaved_runtime_game(state.two_player_mode, &runtime_renderer, render_width, render_height,
                                          &state, &wall_textures, &flat_textures, &object_visuals, previous_zones,
                                          render_zones, &two_player_mode, &combat_mode, &violence_mode,
                                          map_path_buffer, sizeof(map_path_buffer), &resolved_map_path)) {
@@ -29217,7 +30263,7 @@ int main(int argc, char **argv) {
         autosave_notice[0] = '\0';
         autosave_notice_timer = 0.0;
 #ifdef GLOOM_DOS_SDL3
-        refresh_dos_index_palette(&framebuffer, window);
+        refresh_dos_index_palette(framebuffer, window);
 #endif
         mouse_captured = set_gameplay_start_mouse_capture(window);
         previous_state = state;
@@ -29298,7 +30344,7 @@ int main(int argc, char **argv) {
     render_alpha = (float)(accumulator / dt);
     render_state = interpolate_render_state(&previous_state, &state, render_alpha, render_zones, state.map.zone_count);
     profile_add_elapsed(&g_profiler.interpolate_ms, profile_start_ms);
-    render(renderer, &framebuffer, &render_state, &grid_offsets, &wall_textures, &flat_textures, &object_visuals,
+    render(&runtime_renderer, &render_state, &grid_offsets, &wall_textures, &flat_textures, &object_visuals,
            &weapon_visuals, &hud_font, render_width, render_height,
 #if GLOOM_RUNTIME_HAS_AUTOSAVE
            autosave_notice_timer > 0.0 ? autosave_notice : NULL
@@ -29322,11 +30368,11 @@ int main(int argc, char **argv) {
           suppress_mouse_fire_until_button_up = false;
           SDL_FlushEvent(SDL_MOUSEMOTION);
         }
-        if (!run_combat_result_screen(renderer, &framebuffer, render_width, render_height, message)) {
+        if (!run_combat_result_screen(&runtime_renderer, render_width, render_height, message)) {
           running = false;
           continue;
         }
-        if (!run_menu_and_restart_game(renderer, &framebuffer, render_width, render_height, &state, &wall_textures,
+        if (!run_menu_and_restart_game(&runtime_renderer, render_width, render_height, &state, &wall_textures,
                                        &flat_textures, &object_visuals, previous_zones, render_zones,
                                        barrel_projectile_origin, &two_player_mode, &combat_mode, &violence_mode,
                                        map_path_buffer, sizeof(map_path_buffer), &resolved_map_path)) {
@@ -29334,7 +30380,7 @@ int main(int argc, char **argv) {
           continue;
         }
 #ifdef GLOOM_DOS_SDL3
-        refresh_dos_index_palette(&framebuffer, window);
+        refresh_dos_index_palette(framebuffer, window);
 #endif
         mouse_captured = set_gameplay_start_mouse_capture(window);
         previous_state = state;
@@ -29361,7 +30407,7 @@ int main(int argc, char **argv) {
       }
       resolved_map_path = map_path_buffer;
 #ifdef GLOOM_DOS_SDL3
-      refresh_dos_index_palette(&framebuffer, window);
+      refresh_dos_index_palette(framebuffer, window);
 #endif
       previous_state = state;
       if (previous_zones != NULL) {
@@ -29405,11 +30451,11 @@ int main(int argc, char **argv) {
           suppress_mouse_fire_until_button_up = false;
           SDL_FlushEvent(SDL_MOUSEMOTION);
         }
-        if (!run_completion_screen(renderer, &framebuffer, &completion, render_width, render_height)) {
+        if (!run_completion_screen(&runtime_renderer, &completion, render_width, render_height)) {
           running = false;
           continue;
         }
-        if (!run_menu_and_restart_game(renderer, &framebuffer, render_width, render_height, &state, &wall_textures,
+        if (!run_menu_and_restart_game(&runtime_renderer, render_width, render_height, &state, &wall_textures,
                                        &flat_textures, &object_visuals, previous_zones, render_zones,
                                        barrel_projectile_origin, &two_player_mode, &combat_mode, &violence_mode,
                                        map_path_buffer, sizeof(map_path_buffer), &resolved_map_path)) {
@@ -29417,7 +30463,7 @@ int main(int argc, char **argv) {
           continue;
         }
 #ifdef GLOOM_DOS_SDL3
-        refresh_dos_index_palette(&framebuffer, window);
+        refresh_dos_index_palette(framebuffer, window);
 #endif
         mouse_captured = set_gameplay_start_mouse_capture(window);
         previous_state = state;
@@ -29437,7 +30483,7 @@ int main(int argc, char **argv) {
         ScriptLevelIntro intro;
 
         if (!resolve_script_level_intro_for_map(next_map_path, &intro) ||
-            !run_script_intro_screen(renderer, &framebuffer, &intro, render_width, render_height)) {
+            !run_script_intro_screen(&runtime_renderer, &intro, render_width, render_height)) {
           running = false;
           continue;
         }
@@ -29447,7 +30493,7 @@ int main(int argc, char **argv) {
         }
       }
 #ifdef GLOOM_DOS_SDL3
-      refresh_dos_index_palette(&framebuffer, window);
+      refresh_dos_index_palette(framebuffer, window);
 #endif
 #if GLOOM_RUNTIME_HAS_AUTOSAVE
       {
@@ -29478,7 +30524,7 @@ int main(int argc, char **argv) {
 
       resolved_map_path = map_path_buffer;
 #ifdef GLOOM_DOS_SDL3
-      refresh_dos_index_palette(&framebuffer, window);
+      refresh_dos_index_palette(framebuffer, window);
 #endif
       mouse_captured = set_gameplay_start_mouse_capture(window);
       previous_state = state;
@@ -29519,8 +30565,8 @@ int main(int argc, char **argv) {
   }
 #else
   if (frame_dump_path != NULL) {
-    if (framebuffer.last_frame_pixels == NULL ||
-        !write_argb_bmp_file(frame_dump_path, framebuffer.last_frame_pixels, render_width, render_height,
+    if (framebuffer == NULL || framebuffer->last_frame_pixels == NULL ||
+        !write_argb_bmp_file(frame_dump_path, framebuffer->last_frame_pixels, render_width, render_height,
                              render_width)) {
       fprintf(stderr, "Frame dump failed writing %s\n", frame_dump_path);
       exit_code = 1;
@@ -29537,12 +30583,11 @@ int main(int argc, char **argv) {
   free_menu_assets(&menu_assets);
   free_hud_font(&hud_font);
   free_weapon_visual_set(&weapon_visuals);
-  free_render_framebuffer(&framebuffer);
+  runtime_renderer_destroy(&runtime_renderer);
   free_grid_offset_set(&grid_offsets);
   free_object_visual_set(&object_visuals);
   free_flat_texture_set(&flat_textures);
   free_wall_texture_set(&wall_textures);
-  runtime_destroy_sdl_renderer(&renderer);
   SDL_DestroyWindow(window);
   audio_shutdown(&g_audio);
   gamepad_shutdown();

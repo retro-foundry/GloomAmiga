@@ -31,6 +31,9 @@ HD art packs may be partial: any wall, flat, sprite, weapon, menu image, or font
 falls back to the original SD asset at runtime.
 HD wall replacement PNGs may use different dimensions per `texture_##.png` slot, as long as each replacement is at
 least the original 64x64 wall texture size.
+HD sprite, billboard, weapon, and chunk replacement PNGs may also use different dimensions per frame; each replacement
+must be at least as large as the original logical frame, and OpenGL/WebGL samples it through the original frame
+coordinates so presentation resolution does not change gameplay handles, scale, or frame choice.
 
 `GLOOM.INI` controls the software framebuffer size with `resolution=WIDTHxHEIGHT`, the OpenGL/WebGL logical
 render target with `hardware_resolution=WIDTHxHEIGHT` (default 1920x1080), `renderer=auto|opengl|software`, plus
@@ -40,12 +43,19 @@ On desktop/web, the OpenGL/WebGL backend owns source-backed menu, script, pause,
 `flat` texture draws, and SD wall-column draws from original 16-band wall atlases with transparent-column alpha.
 It also draws HD floor/ceiling and wall presentation pixels from the same source-backed layout, blending PNG alpha
 over the original source texel without adding non-Amiga wall holes, draws SD and HD `drawshapes` billboards/effects
-as GPU column quads using the existing source-backed sprite layout and depth mask, draws represented `drawblood`
+as GPU column quads using the existing source-backed sprite layout and source-derived drawshape mask, draws represented `drawblood`
 one-pixel splots on the GPU, and applies the original red-palette injury feedback and pixelate transition as GPU
 post-processes.
 Use `--frame-dump out.bmp --renderer software|opengl` for one-frame gameplay captures from the selected renderer.
+Diagnostic frame dumps can also use `--frame-dump-ticks`, `--force-first-door`,
+`--frame-dump-look-at-first-door`, `--frame-dump-look-at-transparent-wall`, and
+`--force-level-transition` to capture represented `doanims`/`dodoors`/transparent-column/scriptplay states.
+Use `--screen-frame-dump start_menu|combat_menu|pause|script_intro|completion out.bmp --renderer software|opengl`
+for deterministic menu/screen captures from the real runtime renderer.
 Use `python scripts/compare_renderer_frames.py --build-dir build --config Debug` on a machine with an OpenGL-capable
-SDL video driver for a fixed `map1_1` software/OpenGL frame comparison.
+SDL video driver for software/OpenGL frame comparisons across base gameplay, red flash, pixelate, blood, combat,
+two-player split, animated walls, doors, transparent walls, level transitions, menus, pause, script-intro, and
+completion scenarios.
 Windows reads `GLOOM.INI` from the game/executable directory and writes the loaded INI path plus final
 framebuffer/window size to `GLOOM.LOG` next to `gloom_pc.exe`.
 
