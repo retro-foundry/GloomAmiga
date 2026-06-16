@@ -884,6 +884,10 @@ typedef struct {
   uint8_t *column_flags;
   uint32_t *hd_argb_texels;
   uint8_t *hd_texture_loaded;
+  int *hd_texture_widths;
+  int *hd_texture_heights;
+  size_t *hd_texture_offsets;
+  size_t hd_argb_texel_count;
   int hd_width;
   int hd_height;
   size_t texture_count;
@@ -894,6 +898,9 @@ typedef struct {
   GLuint gpu_hd_mask_texture;
   bool gpu_hd_atlas_texture_valid;
   bool gpu_hd_mask_texture_valid;
+  int *gpu_hd_atlas_x;
+  int gpu_hd_atlas_width;
+  int gpu_hd_atlas_height;
 #endif
 } WallTextureScreen;
 
@@ -1830,6 +1837,10 @@ static bool runtime_opengl_draw_backend_active(void) {
   return g_runtime_opengl_draw_backend;
 }
 
+static bool hd_art_opengl_render_enabled(void) {
+  return hd_art_render_enabled() && runtime_opengl_draw_backend_active();
+}
+
 static SDL_Renderer *g_runtime_gpu_resource_renderer = NULL;
 
 static void runtime_gpu_set_resource_renderer(SDL_Renderer *renderer) {
@@ -2172,11 +2183,12 @@ static void runtime_gpu_destroy_flat_texture(FlatTexture *texture) {
 }
 
 static void runtime_gpu_destroy_wall_texture_screen(WallTextureScreen *screen) {
-  if (screen == NULL || (screen->gpu_shaded_atlas_texture == 0u && screen->gpu_hd_atlas_texture == 0u &&
-                         screen->gpu_hd_mask_texture == 0u)) {
+  if (screen == NULL) {
     return;
   }
-  if (runtime_gpu_renderer_resources_alive() && g_runtime_gl.loaded && g_runtime_gl.DeleteTextures != NULL) {
+  if ((screen->gpu_shaded_atlas_texture != 0u || screen->gpu_hd_atlas_texture != 0u ||
+       screen->gpu_hd_mask_texture != 0u) &&
+      runtime_gpu_renderer_resources_alive() && g_runtime_gl.loaded && g_runtime_gl.DeleteTextures != NULL) {
     if (screen->gpu_shaded_atlas_texture != 0u) {
       GLuint id = screen->gpu_shaded_atlas_texture;
 
@@ -2199,6 +2211,10 @@ static void runtime_gpu_destroy_wall_texture_screen(WallTextureScreen *screen) {
   screen->gpu_hd_mask_texture = 0u;
   screen->gpu_hd_atlas_texture_valid = false;
   screen->gpu_hd_mask_texture_valid = false;
+  free(screen->gpu_hd_atlas_x);
+  screen->gpu_hd_atlas_x = NULL;
+  screen->gpu_hd_atlas_width = 0;
+  screen->gpu_hd_atlas_height = 0;
 }
 
 static void runtime_gpu_destroy_object_frame_gl_texture(ObjectFrame *frame) {
@@ -2760,12 +2776,14 @@ static bool runtime_gpu_init_wall_renderer(void) {
       "attribute float a_atlas_y_base;\n"
       "attribute float a_hd_tex_x;\n"
       "attribute float a_hd_slot_u;\n"
+      "attribute float a_hd_height;\n"
       "attribute float a_subtract;\n"
       "varying float v_tex_x;\n"
       "varying float v_wall_v;\n"
       "varying float v_atlas_y_base;\n"
       "varying float v_hd_tex_x;\n"
       "varying float v_hd_slot_u;\n"
+      "varying float v_hd_height;\n"
       "varying float v_subtract;\n"
       "void main(void) {\n"
       "  gl_Position = vec4(a_pos, 0.0, 1.0);\n"
@@ -2774,6 +2792,7 @@ static bool runtime_gpu_init_wall_renderer(void) {
       "  v_atlas_y_base = a_atlas_y_base;\n"
       "  v_hd_tex_x = a_hd_tex_x;\n"
       "  v_hd_slot_u = a_hd_slot_u;\n"
+      "  v_hd_height = a_hd_height;\n"
       "  v_subtract = a_subtract;\n"
       "}\n";
   static const GLchar *fragment_shader_source =
@@ -2794,6 +2813,7 @@ static bool runtime_gpu_init_wall_renderer(void) {
       "varying float v_atlas_y_base;\n"
       "varying float v_hd_tex_x;\n"
       "varying float v_hd_slot_u;\n"
+      "varying float v_hd_height;\n"
       "varying float v_subtract;\n"
       "void main(void) {\n"
       "  float wall_v = clamp(v_wall_v, 0.0, 1.0);\n"
@@ -2804,7 +2824,8 @@ static bool runtime_gpu_init_wall_renderer(void) {
       "    discard;\n"
       "  }\n"
       "  if (u_hd_enabled > 0.5 && texture2D(u_wall_hd_mask_tex, vec2(v_hd_slot_u, 0.5)).r > 0.5) {\n"
-      "    float hd_ty = clamp(floor(wall_v * u_hd_size.y), 0.0, u_hd_size.y - 1.0);\n"
+      "    float hd_height = max(v_hd_height, 1.0);\n"
+      "    float hd_ty = clamp(floor(wall_v * hd_height), 0.0, hd_height - 1.0);\n"
       "    vec4 hd = texture2D(u_wall_hd_tex, vec2(v_hd_tex_x, (hd_ty + 0.5) / u_hd_size.y));\n"
       "    hd.rgb = max(hd.rgb - vec3(v_subtract), vec3(0.0));\n"
       "    color.rgb = mix(color.rgb, hd.rgb, hd.a);\n"
@@ -2850,7 +2871,8 @@ static bool runtime_gpu_init_wall_renderer(void) {
   g_runtime_gl.BindAttribLocation(program, 3u, "a_atlas_y_base");
   g_runtime_gl.BindAttribLocation(program, 4u, "a_hd_tex_x");
   g_runtime_gl.BindAttribLocation(program, 5u, "a_hd_slot_u");
-  g_runtime_gl.BindAttribLocation(program, 6u, "a_subtract");
+  g_runtime_gl.BindAttribLocation(program, 6u, "a_hd_height");
+  g_runtime_gl.BindAttribLocation(program, 7u, "a_subtract");
   g_runtime_gl.LinkProgram(program);
   g_runtime_gl.GetProgramiv(program, GL_LINK_STATUS, &ok);
   g_runtime_gl.DeleteShader(vertex_shader);
@@ -3764,62 +3786,163 @@ static bool runtime_gpu_prepare_flat_hd_texture(FlatTexture *texture) {
                                          texture->source_name[0] != '\0' ? texture->source_name : "flat HD");
 }
 
+static bool wall_screen_hd_texture_info(const WallTextureScreen *screen, size_t local_index,
+                                        const uint32_t **out_pixels, int *out_width, int *out_height) {
+  const uint32_t *pixels = NULL;
+  int width = 0;
+  int height = 0;
+  size_t offset = 0u;
+  size_t pixel_count = 0u;
+
+  if (out_pixels != NULL) *out_pixels = NULL;
+  if (out_width != NULL) *out_width = 0;
+  if (out_height != NULL) *out_height = 0;
+  if (screen == NULL || screen->hd_argb_texels == NULL || local_index >= screen->texture_count) {
+    return false;
+  }
+  if (screen->hd_texture_loaded != NULL && screen->hd_texture_loaded[local_index] == 0u) {
+    return false;
+  }
+
+  if (screen->hd_texture_widths != NULL && screen->hd_texture_heights != NULL &&
+      screen->hd_texture_offsets != NULL) {
+    width = screen->hd_texture_widths[local_index];
+    height = screen->hd_texture_heights[local_index];
+    offset = screen->hd_texture_offsets[local_index];
+    if (width <= 0 || height <= 0 || (size_t)width > SIZE_MAX / (size_t)height) {
+      return false;
+    }
+    pixel_count = (size_t)width * (size_t)height;
+    if (screen->hd_argb_texel_count == 0u || offset > screen->hd_argb_texel_count ||
+        pixel_count > screen->hd_argb_texel_count - offset) {
+      return false;
+    }
+  } else {
+    width = screen->hd_width;
+    height = screen->hd_height;
+    if (width <= 0 || height <= 0 || (size_t)width > SIZE_MAX / (size_t)height) {
+      return false;
+    }
+    pixel_count = (size_t)width * (size_t)height;
+    if (local_index > SIZE_MAX / pixel_count) {
+      return false;
+    }
+    offset = local_index * pixel_count;
+    if (screen->hd_argb_texel_count != 0u &&
+        (offset > screen->hd_argb_texel_count || pixel_count > screen->hd_argb_texel_count - offset)) {
+      return false;
+    }
+  }
+
+  pixels = screen->hd_argb_texels + offset;
+  if (out_pixels != NULL) *out_pixels = pixels;
+  if (out_width != NULL) *out_width = width;
+  if (out_height != NULL) *out_height = height;
+  return true;
+}
+
 static bool runtime_gpu_prepare_wall_hd_texture_screen(WallTextureScreen *screen) {
   enum { ATLAS_TEXTURES = GLOOM_TEXTURES_PER_SCREEN };
   uint32_t *atlas = NULL;
   uint32_t mask[ATLAS_TEXTURES];
+  int *atlas_x = NULL;
   int atlas_width = 0;
+  int atlas_height = 0;
   size_t texture_index = 0u;
   bool ok = false;
 
-  if (screen == NULL || screen->hd_argb_texels == NULL || screen->hd_width <= 0 ||
-      screen->hd_height <= 0 || screen->texture_count == 0u) {
+  if (screen == NULL || screen->hd_argb_texels == NULL || screen->texture_count == 0u) {
     return false;
   }
   if (screen->gpu_hd_atlas_texture_valid && screen->gpu_hd_atlas_texture != 0u &&
-      screen->gpu_hd_mask_texture_valid && screen->gpu_hd_mask_texture != 0u) {
+      screen->gpu_hd_mask_texture_valid && screen->gpu_hd_mask_texture != 0u &&
+      screen->gpu_hd_atlas_x != NULL && screen->gpu_hd_atlas_width > 0 &&
+      screen->gpu_hd_atlas_height > 0) {
     return true;
   }
 
-  atlas_width = ATLAS_TEXTURES * screen->hd_width;
-  atlas = (uint32_t *)calloc((size_t)atlas_width * (size_t)screen->hd_height, sizeof(*atlas));
-  if (atlas == NULL) {
+  atlas_x = (int *)calloc((size_t)ATLAS_TEXTURES, sizeof(*atlas_x));
+  if (atlas_x == NULL) {
     runtime_logf("OpenGL wall HD texture upload failed: out of memory building atlas for %s",
                  screen->source_name[0] != '\0' ? screen->source_name : "(unnamed)");
     return false;
   }
+
   for (texture_index = 0u; texture_index < (size_t)ATLAS_TEXTURES; ++texture_index) {
+    const uint32_t *slot_pixels = NULL;
+    int slot_width = 0;
+    int slot_height = 0;
     bool loaded = texture_index < screen->texture_count &&
-                  (screen->hd_texture_loaded == NULL || screen->hd_texture_loaded[texture_index] != 0u);
-    int row = 0;
+                  wall_screen_hd_texture_info(screen, texture_index, &slot_pixels, &slot_width, &slot_height);
 
     mask[texture_index] = loaded ? 0xffffffffu : 0xff000000u;
     if (!loaded) {
       continue;
     }
-    for (row = 0; row < screen->hd_height; ++row) {
-      const uint32_t *src =
-          screen->hd_argb_texels + texture_index * (size_t)screen->hd_width * (size_t)screen->hd_height +
-          (size_t)row * (size_t)screen->hd_width;
-      uint32_t *dst = atlas + (size_t)row * (size_t)atlas_width + texture_index * (size_t)screen->hd_width;
+    (void)slot_pixels;
+    if (slot_width <= 0 || slot_height <= 0 || atlas_width > INT_MAX - slot_width) {
+      runtime_logf("OpenGL wall HD texture upload failed: atlas too large for %s",
+                   screen->source_name[0] != '\0' ? screen->source_name : "(unnamed)");
+      free(atlas_x);
+      return false;
+    }
+    atlas_x[texture_index] = atlas_width;
+    atlas_width += slot_width;
+    if (slot_height > atlas_height) {
+      atlas_height = slot_height;
+    }
+  }
 
-      memcpy(dst, src, (size_t)screen->hd_width * sizeof(*dst));
+  if (atlas_width <= 0 || atlas_height <= 0 || (size_t)atlas_width > SIZE_MAX / (size_t)atlas_height) {
+    free(atlas_x);
+    return false;
+  }
+  atlas = (uint32_t *)calloc((size_t)atlas_width * (size_t)atlas_height, sizeof(*atlas));
+  if (atlas == NULL) {
+    runtime_logf("OpenGL wall HD texture upload failed: out of memory building atlas for %s",
+                 screen->source_name[0] != '\0' ? screen->source_name : "(unnamed)");
+    free(atlas_x);
+    return false;
+  }
+
+  for (texture_index = 0u; texture_index < (size_t)ATLAS_TEXTURES; ++texture_index) {
+    const uint32_t *slot_pixels = NULL;
+    int slot_width = 0;
+    int slot_height = 0;
+    int row = 0;
+
+    if (texture_index >= screen->texture_count ||
+        !wall_screen_hd_texture_info(screen, texture_index, &slot_pixels, &slot_width, &slot_height)) {
+      continue;
+    }
+    for (row = 0; row < slot_height; ++row) {
+      const uint32_t *src = slot_pixels + (size_t)row * (size_t)slot_width;
+      uint32_t *dst = atlas + (size_t)row * (size_t)atlas_width + (size_t)atlas_x[texture_index];
+
+      memcpy(dst, src, (size_t)slot_width * sizeof(*dst));
     }
   }
 
   ok = runtime_gpu_upload_argb_texture(&screen->gpu_hd_atlas_texture, &screen->gpu_hd_atlas_texture_valid,
-                                       atlas, atlas_width, screen->hd_height,
+                                       atlas, atlas_width, atlas_height,
                                        screen->source_name[0] != '\0' ? screen->source_name : "wall HD atlas") &&
        runtime_gpu_upload_argb_texture(&screen->gpu_hd_mask_texture, &screen->gpu_hd_mask_texture_valid,
                                        mask, ATLAS_TEXTURES, 1,
                                        screen->source_name[0] != '\0' ? screen->source_name : "wall HD mask");
   free(atlas);
   if (!ok) {
+    free(atlas_x);
     runtime_gpu_destroy_wall_texture_screen(screen);
   } else {
+    free(screen->gpu_hd_atlas_x);
+    screen->gpu_hd_atlas_x = atlas_x;
+    atlas_x = NULL;
+    screen->gpu_hd_atlas_width = atlas_width;
+    screen->gpu_hd_atlas_height = atlas_height;
     screen->gpu_hd_atlas_texture_valid = true;
     screen->gpu_hd_mask_texture_valid = true;
   }
+  free(atlas_x);
   return ok;
 }
 
@@ -3900,8 +4023,8 @@ static bool runtime_gpu_prepare_wall_texture_set(SDL_Renderer *renderer, const W
     if (!runtime_gpu_prepare_wall_texture_screen(screen)) {
       return false;
     }
-    if (hd_art_render_enabled() && screen->hd_argb_texels != NULL && screen->hd_width > 0 &&
-        screen->hd_height > 0 && !runtime_gpu_prepare_wall_hd_texture_screen(screen)) {
+    if (hd_art_opengl_render_enabled() && screen->hd_argb_texels != NULL &&
+        !runtime_gpu_prepare_wall_hd_texture_screen(screen)) {
       return false;
     }
     uploaded += 1u;
@@ -3932,7 +4055,7 @@ static bool runtime_gpu_prepare_flat_set(SDL_Renderer *renderer, const FlatTextu
   if (!ok) {
     return false;
   }
-  if (hd_art_render_enabled()) {
+  if (hd_art_opengl_render_enabled()) {
     if (mutable_flats->floor.hd_argb_texels != NULL && mutable_flats->floor.hd_width > 0 &&
         mutable_flats->floor.hd_height > 0 && !runtime_gpu_prepare_flat_hd_texture(&mutable_flats->floor)) {
       return false;
@@ -4021,12 +4144,12 @@ static bool runtime_gpu_render_flat_view(SDL_Renderer *renderer, const AppState 
   g_runtime_gl.Uniform1f(g_runtime_gpu_flat_renderer.uniform_focal, (GLfloat)focal);
   g_runtime_gl.Uniform1f(g_runtime_gpu_flat_renderer.uniform_far_depth, (GLfloat)GLOOM_AMIGA_MAX_Z);
   g_runtime_gl.Uniform1f(g_runtime_gpu_flat_renderer.uniform_floor_hd_enabled,
-                         hd_art_render_enabled() && flats->floor.gpu_hd_texture_valid &&
+                         hd_art_opengl_render_enabled() && flats->floor.gpu_hd_texture_valid &&
                                  flats->floor.gpu_hd_texture != 0u
                              ? 1.0f
                              : 0.0f);
   g_runtime_gl.Uniform1f(g_runtime_gpu_flat_renderer.uniform_roof_hd_enabled,
-                         hd_art_render_enabled() && flats->roof.gpu_hd_texture_valid &&
+                         hd_art_opengl_render_enabled() && flats->roof.gpu_hd_texture_valid &&
                                  flats->roof.gpu_hd_texture != 0u
                              ? 1.0f
                              : 0.0f);
@@ -4083,8 +4206,16 @@ static void runtime_destroy_sdl_renderer(SDL_Renderer **renderer) {
 #endif
 }
 
+static bool hd_art_menu_available(void) {
+#ifndef GLOOM_DOS_SDL3
+  return g_hd_art_enabled && runtime_opengl_draw_backend_active();
+#else
+  return false;
+#endif
+}
+
 static bool toggle_hd_art_render_enabled(void) {
-  if (!g_hd_art_enabled) {
+  if (!hd_art_menu_available()) {
     return false;
   }
 
@@ -5919,6 +6050,9 @@ static void free_wall_texture_set(WallTextureSet *set) {
     free(set->screens[i].column_flags);
     free(set->screens[i].hd_argb_texels);
     free(set->screens[i].hd_texture_loaded);
+    free(set->screens[i].hd_texture_widths);
+    free(set->screens[i].hd_texture_heights);
+    free(set->screens[i].hd_texture_offsets);
 #ifdef GLOOM_DOS_SDL3
     free(set->screens[i].column_texels);
     free(set->screens[i].column_shaded_texels);
@@ -5931,6 +6065,7 @@ static void free_wall_texture_set(WallTextureSet *set) {
 static bool clone_wall_texture_screen(const WallTextureScreen *source, WallTextureScreen *destination) {
   size_t texel_count = 0u;
   size_t flag_count = 0u;
+  size_t hd_count = 0u;
 
   if (source == NULL || destination == NULL || !source->loaded || source->texels == NULL ||
       source->texture_count == 0u) {
@@ -5944,6 +6079,9 @@ static bool clone_wall_texture_screen(const WallTextureScreen *source, WallTextu
   free(destination->column_flags);
   free(destination->hd_argb_texels);
   free(destination->hd_texture_loaded);
+  free(destination->hd_texture_widths);
+  free(destination->hd_texture_heights);
+  free(destination->hd_texture_offsets);
 #ifdef GLOOM_DOS_SDL3
   free(destination->column_texels);
   free(destination->column_shaded_texels);
@@ -5953,6 +6091,10 @@ static bool clone_wall_texture_screen(const WallTextureScreen *source, WallTextu
   destination->column_flags = NULL;
   destination->hd_argb_texels = NULL;
   destination->hd_texture_loaded = NULL;
+  destination->hd_texture_widths = NULL;
+  destination->hd_texture_heights = NULL;
+  destination->hd_texture_offsets = NULL;
+  destination->hd_argb_texel_count = 0u;
 #ifndef GLOOM_DOS_SDL3
   destination->gpu_shaded_atlas_texture = 0u;
   destination->gpu_shaded_atlas_texture_valid = false;
@@ -5960,6 +6102,9 @@ static bool clone_wall_texture_screen(const WallTextureScreen *source, WallTextu
   destination->gpu_hd_mask_texture = 0u;
   destination->gpu_hd_atlas_texture_valid = false;
   destination->gpu_hd_mask_texture_valid = false;
+  destination->gpu_hd_atlas_x = NULL;
+  destination->gpu_hd_atlas_width = 0;
+  destination->gpu_hd_atlas_height = 0;
 #endif
 #ifdef GLOOM_DOS_SDL3
   destination->column_texels = NULL;
@@ -5971,8 +6116,7 @@ static bool clone_wall_texture_screen(const WallTextureScreen *source, WallTextu
 
   destination->texels = (uint8_t *)malloc(texel_count * sizeof(*destination->texels));
   if (destination->texels == NULL) {
-    memset(destination, 0, sizeof(*destination));
-    return false;
+    goto fail;
   }
   memcpy(destination->texels, source->texels, texel_count * sizeof(*destination->texels));
 
@@ -5980,9 +6124,7 @@ static bool clone_wall_texture_screen(const WallTextureScreen *source, WallTextu
   if (source->column_texels != NULL) {
     destination->column_texels = (uint8_t *)malloc(texel_count * sizeof(*destination->column_texels));
     if (destination->column_texels == NULL) {
-      free(destination->texels);
-      memset(destination, 0, sizeof(*destination));
-      return false;
+      goto fail;
     }
     memcpy(destination->column_texels, source->column_texels, texel_count * sizeof(*destination->column_texels));
   }
@@ -5992,10 +6134,7 @@ static bool clone_wall_texture_screen(const WallTextureScreen *source, WallTextu
     destination->column_shaded_texels =
         (uint8_t *)malloc(shaded_texel_count * sizeof(*destination->column_shaded_texels));
     if (destination->column_shaded_texels == NULL) {
-      free(destination->texels);
-      free(destination->column_texels);
-      memset(destination, 0, sizeof(*destination));
-      return false;
+      goto fail;
     }
     memcpy(destination->column_shaded_texels, source->column_shaded_texels,
            shaded_texel_count * sizeof(*destination->column_shaded_texels));
@@ -6005,55 +6144,86 @@ static bool clone_wall_texture_screen(const WallTextureScreen *source, WallTextu
   if (source->column_flags != NULL) {
     destination->column_flags = (uint8_t *)malloc(flag_count * sizeof(*destination->column_flags));
     if (destination->column_flags == NULL) {
-      free(destination->texels);
-      free(destination->hd_argb_texels);
-      free(destination->hd_texture_loaded);
-#ifdef GLOOM_DOS_SDL3
-      free(destination->column_texels);
-      free(destination->column_shaded_texels);
-#endif
-      memset(destination, 0, sizeof(*destination));
-      return false;
+      goto fail;
     }
     memcpy(destination->column_flags, source->column_flags, flag_count * sizeof(*destination->column_flags));
   }
 
-  if (source->hd_argb_texels != NULL && source->hd_width > 0 && source->hd_height > 0) {
-    size_t hd_count = source->texture_count * (size_t)source->hd_width * (size_t)source->hd_height;
+  if (source->hd_argb_texels != NULL) {
+    hd_count = source->hd_argb_texel_count;
+    if (hd_count == 0u && source->hd_width > 0 && source->hd_height > 0) {
+      size_t texture_pixels = 0u;
 
+      if ((size_t)source->hd_width > SIZE_MAX / (size_t)source->hd_height) {
+        goto fail;
+      }
+      texture_pixels = (size_t)source->hd_width * (size_t)source->hd_height;
+      if (texture_pixels == 0u || source->texture_count > SIZE_MAX / texture_pixels) {
+        goto fail;
+      }
+      hd_count = source->texture_count * texture_pixels;
+    }
+    if (hd_count == 0u || hd_count > SIZE_MAX / sizeof(*destination->hd_argb_texels)) {
+      goto fail;
+    }
     destination->hd_argb_texels = (uint32_t *)malloc(hd_count * sizeof(*destination->hd_argb_texels));
     if (destination->hd_argb_texels == NULL) {
-      free(destination->texels);
-      free(destination->column_flags);
-      free(destination->hd_texture_loaded);
-#ifdef GLOOM_DOS_SDL3
-      free(destination->column_texels);
-      free(destination->column_shaded_texels);
-#endif
-      memset(destination, 0, sizeof(*destination));
-      return false;
+      goto fail;
     }
     memcpy(destination->hd_argb_texels, source->hd_argb_texels, hd_count * sizeof(*destination->hd_argb_texels));
+    destination->hd_argb_texel_count = hd_count;
   }
 
   if (source->hd_texture_loaded != NULL) {
     destination->hd_texture_loaded = (uint8_t *)malloc(source->texture_count * sizeof(*destination->hd_texture_loaded));
     if (destination->hd_texture_loaded == NULL) {
-      free(destination->texels);
-      free(destination->column_flags);
-      free(destination->hd_argb_texels);
-#ifdef GLOOM_DOS_SDL3
-      free(destination->column_texels);
-      free(destination->column_shaded_texels);
-#endif
-      memset(destination, 0, sizeof(*destination));
-      return false;
+      goto fail;
     }
     memcpy(destination->hd_texture_loaded, source->hd_texture_loaded,
            source->texture_count * sizeof(*destination->hd_texture_loaded));
   }
+  if (source->hd_texture_widths != NULL) {
+    destination->hd_texture_widths = (int *)malloc(source->texture_count * sizeof(*destination->hd_texture_widths));
+    if (destination->hd_texture_widths == NULL) {
+      goto fail;
+    }
+    memcpy(destination->hd_texture_widths, source->hd_texture_widths,
+           source->texture_count * sizeof(*destination->hd_texture_widths));
+  }
+  if (source->hd_texture_heights != NULL) {
+    destination->hd_texture_heights = (int *)malloc(source->texture_count * sizeof(*destination->hd_texture_heights));
+    if (destination->hd_texture_heights == NULL) {
+      goto fail;
+    }
+    memcpy(destination->hd_texture_heights, source->hd_texture_heights,
+           source->texture_count * sizeof(*destination->hd_texture_heights));
+  }
+  if (source->hd_texture_offsets != NULL) {
+    destination->hd_texture_offsets =
+        (size_t *)malloc(source->texture_count * sizeof(*destination->hd_texture_offsets));
+    if (destination->hd_texture_offsets == NULL) {
+      goto fail;
+    }
+    memcpy(destination->hd_texture_offsets, source->hd_texture_offsets,
+           source->texture_count * sizeof(*destination->hd_texture_offsets));
+  }
 
   return true;
+
+fail:
+  free(destination->texels);
+  free(destination->column_flags);
+  free(destination->hd_argb_texels);
+  free(destination->hd_texture_loaded);
+  free(destination->hd_texture_widths);
+  free(destination->hd_texture_heights);
+  free(destination->hd_texture_offsets);
+#ifdef GLOOM_DOS_SDL3
+  free(destination->column_texels);
+  free(destination->column_shaded_texels);
+#endif
+  memset(destination, 0, sizeof(*destination));
+  return false;
 }
 
 static void set_default_texture_palette(uint32_t palette[256]) {
@@ -7019,8 +7189,16 @@ static bool load_hd_wall_texture_screen(const char *resolved_path, const char *s
   size_t key_count = 0u;
   uint32_t *hd_pixels = NULL;
   uint8_t *hd_texture_loaded = NULL;
-  int hd_width = 0;
-  int hd_height = 0;
+  int *hd_texture_widths = NULL;
+  int *hd_texture_heights = NULL;
+  size_t *hd_texture_offsets = NULL;
+  size_t hd_pixel_count = 0u;
+  size_t hd_pixel_capacity = 0u;
+  int max_hd_width = 0;
+  int max_hd_height = 0;
+  int first_hd_width = 0;
+  int first_hd_height = 0;
+  bool mixed_sizes = false;
   size_t texture_index = 0u;
   size_t loaded_count = 0u;
 
@@ -7048,10 +7226,14 @@ static bool load_hd_wall_texture_screen(const char *resolved_path, const char *s
   }
 
   hd_texture_loaded = (uint8_t *)calloc(screen->texture_count, sizeof(*hd_texture_loaded));
-  if (hd_texture_loaded == NULL) {
+  hd_texture_widths = (int *)calloc(screen->texture_count, sizeof(*hd_texture_widths));
+  hd_texture_heights = (int *)calloc(screen->texture_count, sizeof(*hd_texture_heights));
+  hd_texture_offsets = (size_t *)calloc(screen->texture_count, sizeof(*hd_texture_offsets));
+  if (hd_texture_loaded == NULL || hd_texture_widths == NULL || hd_texture_heights == NULL ||
+      hd_texture_offsets == NULL) {
     fprintf(stderr, "Out of memory while loading HD wall texture screen %s\n",
             source_name != NULL ? source_name : resolved_path);
-    return false;
+    goto fail;
   }
 
   for (texture_index = 0u; texture_index < screen->texture_count; ++texture_index) {
@@ -7066,61 +7248,68 @@ static bool load_hd_wall_texture_screen(const char *resolved_path, const char *s
       continue;
     }
     if (!load_png_file_argb(hd_path, &bitmap)) {
-      free(hd_pixels);
-      free(hd_texture_loaded);
-      return false;
+      goto fail;
     }
     if (bitmap.width < GLOOM_TEXTURE_WIDTH || bitmap.height < GLOOM_TEXTURE_HEIGHT) {
       fprintf(stderr, "HD wall texture %s is %dx%d, smaller than original %dx%d\n", hd_path, bitmap.width,
               bitmap.height, GLOOM_TEXTURE_WIDTH, GLOOM_TEXTURE_HEIGHT);
       free_hd_bitmap(&bitmap);
-      free(hd_pixels);
-      free(hd_texture_loaded);
-      return false;
+      goto fail;
     }
-    if (hd_pixels == NULL) {
-      size_t total_pixels = 0u;
-      size_t texture_pixels = 0u;
+    if ((size_t)bitmap.width > SIZE_MAX / (size_t)bitmap.height) {
+      fprintf(stderr, "HD wall texture %s is too large to allocate\n", hd_path);
+      free_hd_bitmap(&bitmap);
+      goto fail;
+    }
+    bitmap_pixels = (size_t)bitmap.width * (size_t)bitmap.height;
+    if (bitmap_pixels == 0u || hd_pixel_count > SIZE_MAX - bitmap_pixels) {
+      fprintf(stderr, "HD wall texture screen %s is too large to allocate\n",
+              source_name != NULL ? source_name : resolved_path);
+      free_hd_bitmap(&bitmap);
+      goto fail;
+    }
+    if (hd_pixel_count + bitmap_pixels > hd_pixel_capacity) {
+      size_t needed = hd_pixel_count + bitmap_pixels;
+      size_t new_capacity = hd_pixel_capacity > 0u ? hd_pixel_capacity : bitmap_pixels;
+      uint32_t *grown = NULL;
 
-      hd_width = bitmap.width;
-      hd_height = bitmap.height;
-      if ((size_t)hd_width > SIZE_MAX / (size_t)hd_height) {
+      while (new_capacity < needed) {
+        if (new_capacity > SIZE_MAX / 2u) {
+          new_capacity = needed;
+          break;
+        }
+        new_capacity *= 2u;
+      }
+      if (new_capacity > SIZE_MAX / sizeof(*hd_pixels)) {
         fprintf(stderr, "HD wall texture screen %s is too large to allocate\n",
                 source_name != NULL ? source_name : resolved_path);
         free_hd_bitmap(&bitmap);
-        free(hd_texture_loaded);
-        return false;
+        goto fail;
       }
-      texture_pixels = (size_t)hd_width * (size_t)hd_height;
-      if (screen->texture_count > SIZE_MAX / texture_pixels ||
-          screen->texture_count * texture_pixels > SIZE_MAX / sizeof(*hd_pixels)) {
-        fprintf(stderr, "HD wall texture screen %s is too large to allocate\n",
-                source_name != NULL ? source_name : resolved_path);
-        free_hd_bitmap(&bitmap);
-        free(hd_texture_loaded);
-        return false;
-      }
-      total_pixels = screen->texture_count * texture_pixels;
-      hd_pixels = (uint32_t *)calloc(total_pixels, sizeof(*hd_pixels));
-      if (hd_pixels == NULL) {
+      grown = (uint32_t *)realloc(hd_pixels, new_capacity * sizeof(*hd_pixels));
+      if (grown == NULL) {
         fprintf(stderr, "Out of memory while loading HD wall texture screen %s\n",
                 source_name != NULL ? source_name : resolved_path);
         free_hd_bitmap(&bitmap);
-        free(hd_texture_loaded);
-        return false;
+        goto fail;
       }
-    } else if (bitmap.width != hd_width || bitmap.height != hd_height) {
-      fprintf(stderr, "HD wall texture %s is %dx%d, expected %dx%d for the same texture screen\n", hd_path,
-              bitmap.width, bitmap.height, hd_width, hd_height);
-      free_hd_bitmap(&bitmap);
-      free(hd_pixels);
-      free(hd_texture_loaded);
-      return false;
+      hd_pixels = grown;
+      hd_pixel_capacity = new_capacity;
     }
-
-    bitmap_pixels = (size_t)hd_width * (size_t)hd_height;
-    memcpy(hd_pixels + texture_index * bitmap_pixels, bitmap.pixels, bitmap_pixels * sizeof(*hd_pixels));
+    if (loaded_count == 0u) {
+      first_hd_width = bitmap.width;
+      first_hd_height = bitmap.height;
+    } else if (bitmap.width != first_hd_width || bitmap.height != first_hd_height) {
+      mixed_sizes = true;
+    }
+    memcpy(hd_pixels + hd_pixel_count, bitmap.pixels, bitmap_pixels * sizeof(*hd_pixels));
     hd_texture_loaded[texture_index] = 1u;
+    hd_texture_widths[texture_index] = bitmap.width;
+    hd_texture_heights[texture_index] = bitmap.height;
+    hd_texture_offsets[texture_index] = hd_pixel_count;
+    hd_pixel_count += bitmap_pixels;
+    if (bitmap.width > max_hd_width) max_hd_width = bitmap.width;
+    if (bitmap.height > max_hd_height) max_hd_height = bitmap.height;
     loaded_count += 1u;
     free_hd_bitmap(&bitmap);
   }
@@ -7128,10 +7317,20 @@ static bool load_hd_wall_texture_screen(const char *resolved_path, const char *s
   if (loaded_count == 0u) {
     free(hd_pixels);
     free(hd_texture_loaded);
+    free(hd_texture_widths);
+    free(hd_texture_heights);
+    free(hd_texture_offsets);
     free(screen->hd_argb_texels);
     free(screen->hd_texture_loaded);
+    free(screen->hd_texture_widths);
+    free(screen->hd_texture_heights);
+    free(screen->hd_texture_offsets);
     screen->hd_argb_texels = NULL;
     screen->hd_texture_loaded = NULL;
+    screen->hd_texture_widths = NULL;
+    screen->hd_texture_heights = NULL;
+    screen->hd_texture_offsets = NULL;
+    screen->hd_argb_texel_count = 0u;
     screen->hd_width = 0;
     screen->hd_height = 0;
     return true;
@@ -7139,13 +7338,35 @@ static bool load_hd_wall_texture_screen(const char *resolved_path, const char *s
 
   free(screen->hd_argb_texels);
   free(screen->hd_texture_loaded);
+  free(screen->hd_texture_widths);
+  free(screen->hd_texture_heights);
+  free(screen->hd_texture_offsets);
   screen->hd_argb_texels = hd_pixels;
   screen->hd_texture_loaded = hd_texture_loaded;
-  screen->hd_width = hd_width;
-  screen->hd_height = hd_height;
-  printf("Loaded %zu/%zu HD wall textures for %s at %dx%d per texture\n", loaded_count,
-         screen->texture_count, source_name != NULL ? source_name : resolved_path, hd_width, hd_height);
+  screen->hd_texture_widths = hd_texture_widths;
+  screen->hd_texture_heights = hd_texture_heights;
+  screen->hd_texture_offsets = hd_texture_offsets;
+  screen->hd_argb_texel_count = hd_pixel_count;
+  screen->hd_width = max_hd_width;
+  screen->hd_height = max_hd_height;
+  if (mixed_sizes) {
+    printf("Loaded %zu/%zu HD wall textures for %s (mixed sizes up to %dx%d)\n", loaded_count,
+           screen->texture_count, source_name != NULL ? source_name : resolved_path, max_hd_width,
+           max_hd_height);
+  } else {
+    printf("Loaded %zu/%zu HD wall textures for %s at %dx%d per texture\n", loaded_count,
+           screen->texture_count, source_name != NULL ? source_name : resolved_path, max_hd_width,
+           max_hd_height);
+  }
   return true;
+
+fail:
+  free(hd_pixels);
+  free(hd_texture_loaded);
+  free(hd_texture_widths);
+  free(hd_texture_heights);
+  free(hd_texture_offsets);
+  return false;
 }
 
 static bool load_hd_flat_texture(const char *resolved_path, const char *kind, const char *tile_tag,
@@ -7953,6 +8174,9 @@ static bool load_wall_texture_screen(const char *path, const char *source_name, 
     free(out_screen->column_flags);
     free(out_screen->hd_argb_texels);
     free(out_screen->hd_texture_loaded);
+    free(out_screen->hd_texture_widths);
+    free(out_screen->hd_texture_heights);
+    free(out_screen->hd_texture_offsets);
 #ifdef GLOOM_DOS_SDL3
     free(out_screen->column_texels);
     free(out_screen->column_shaded_texels);
@@ -9319,29 +9543,6 @@ static uint32_t sample_wall_texture_argb_ex(const WallTextureSet *set, uint8_t t
     *out_transparent_column = transparent_column;
   }
 
-  {
-    const WallTextureScreen *screen = &set->screens[screen_index];
-    bool hd_texture_available =
-        screen->hd_texture_loaded == NULL || screen->hd_texture_loaded[local_index] != 0u;
-
-    if (hd_art_render_enabled() && screen->hd_argb_texels != NULL && screen->hd_width > 0 &&
-        screen->hd_height > 0 && hd_texture_available) {
-      const uint32_t *hd_pixels = screen->hd_argb_texels +
-                                  local_index * (size_t)screen->hd_width * (size_t)screen->hd_height;
-      size_t hd_tx = wall_texture_coord_from_unit(u, (size_t)screen->hd_width);
-      size_t hd_ty = wall_texture_coord_from_unit(v, (size_t)screen->hd_height);
-      uint32_t argb = hd_pixels[hd_ty * (size_t)screen->hd_width + hd_tx];
-
-      if (transparent_column && ((argb >> 24u) == 0u || palette_index == 0u)) {
-        return 0x00000000u;
-      }
-      if ((argb >> 24u) == 0u) {
-        return 0x00000000u;
-      }
-      return argb;
-    }
-  }
-
   if (transparent_column && palette_index == 0u) {
     return 0x00000000u;
   }
@@ -10066,16 +10267,23 @@ static bool load_weapon_visual_set(WeaponVisualSet *set) {
   return true;
 }
 
-static bool object_frame_hd_active(const ObjectFrame *frame) {
-  return hd_art_render_enabled() && frame != NULL && frame->hd_argb_pixels != NULL &&
+static bool object_frame_software_hd_active(const ObjectFrame *frame) {
+  (void)frame;
+  return false;
+}
+
+#ifndef GLOOM_DOS_SDL3
+static bool object_frame_gpu_hd_active(const ObjectFrame *frame) {
+  return hd_art_opengl_render_enabled() && frame != NULL && frame->hd_argb_pixels != NULL &&
          frame->hd_bitmap_width > 0 && frame->hd_bitmap_height > 0;
 }
+#endif
 
 static int object_frame_bitmap_width(const ObjectFrame *frame) {
   if (frame == NULL) {
     return 0;
   }
-  if (object_frame_hd_active(frame)) {
+  if (object_frame_software_hd_active(frame)) {
     return frame->hd_bitmap_width;
   }
   return frame->bitmap_width > 0 ? frame->bitmap_width : frame->width;
@@ -10085,7 +10293,7 @@ static int object_frame_bitmap_height(const ObjectFrame *frame) {
   if (frame == NULL) {
     return 0;
   }
-  if (object_frame_hd_active(frame)) {
+  if (object_frame_software_hd_active(frame)) {
     return frame->hd_bitmap_height;
   }
   return frame->bitmap_height > 0 ? frame->bitmap_height : frame->height;
@@ -10095,7 +10303,7 @@ static const uint32_t *object_frame_argb_pixels(const ObjectFrame *frame) {
   if (frame == NULL) {
     return NULL;
   }
-  if (object_frame_hd_active(frame)) {
+  if (object_frame_software_hd_active(frame)) {
     return frame->hd_argb_pixels;
   }
   return frame->argb_pixels;
@@ -14058,9 +14266,7 @@ static uint32_t apply_amiga_depth_argb(uint32_t argb, float depth) {
 }
 
 static bool sample_fast_wall_column_argb(const uint8_t *wall_texels, const uint32_t *wall_palette,
-                                         size_t wall_texel_base, bool transparent_wall_column,
-                                         const uint32_t *wall_hd_texels, int wall_hd_width, int wall_hd_height,
-                                         size_t wall_hd_texel_base, float wall_v, int subtract,
+                                         size_t wall_texel_base, bool transparent_wall_column, float wall_v,
                                          uint32_t *out_argb) {
   size_t ty = 0u;
   uint8_t palette_index = 0u;
@@ -14073,17 +14279,6 @@ static bool sample_fast_wall_column_argb(const uint8_t *wall_texels, const uint3
   palette_index = wall_texels[wall_texel_base + (ty * (size_t)GLOOM_TEXTURE_WIDTH)];
   if (transparent_wall_column && palette_index == 0u) {
     return false;
-  }
-
-  if (wall_hd_texels != NULL && wall_hd_width > 0 && wall_hd_height > 0) {
-    size_t hd_ty = wall_texture_coord_from_unit(wall_v, (size_t)wall_hd_height);
-    uint32_t argb = wall_hd_texels[wall_hd_texel_base + hd_ty * (size_t)wall_hd_width];
-
-    if ((argb >> 24u) == 0u) {
-      return false;
-    }
-    *out_argb = shade_argb_subtract(argb, subtract);
-    return true;
   }
 
   *out_argb = wall_palette[palette_index];
@@ -15036,20 +15231,6 @@ static void check_event_triggers(AppState *state) {
   }
 }
 
-static int repeated_hd_texture_coord(float world, int original_size, int hd_size) {
-  int coord = 0;
-
-  if (original_size <= 0 || hd_size <= 0) {
-    return 0;
-  }
-
-  coord = floor_to_int((world * (float)hd_size) / (float)original_size) % hd_size;
-  if (coord < 0) {
-    coord += hd_size;
-  }
-  return coord;
-}
-
 static uint32_t sample_flat_texture_argb(const FlatTexture *texture, float world_x, float world_z) {
   int tx = 0;
   int tz = 0;
@@ -15057,14 +15238,6 @@ static uint32_t sample_flat_texture_argb(const FlatTexture *texture, float world
 
   if (texture == NULL || !texture->loaded || texture->texels == NULL) {
     return 0xFF000000u;
-  }
-
-  if (hd_art_render_enabled() && texture->hd_argb_texels != NULL && texture->hd_width > 0 &&
-      texture->hd_height > 0) {
-    int hd_tx = repeated_hd_texture_coord(world_x, GLOOM_FLAT_TEXTURE_SIZE, texture->hd_width);
-    int hd_tz = repeated_hd_texture_coord(world_z, GLOOM_FLAT_TEXTURE_SIZE, texture->hd_height);
-
-    return texture->hd_argb_texels[(size_t)hd_tz * (size_t)texture->hd_width + (size_t)hd_tx];
   }
 
   tx = floor_to_int(world_x) & (GLOOM_FLAT_TEXTURE_SIZE - 1);
@@ -15799,7 +15972,6 @@ static void render_flat_textures(RenderFramebuffer *framebuffer, const AppState 
     float world_x_step = 0.0f;
     float world_z_step = 0.0f;
     int col = 0;
-    int hd_subtract = 0;
 
     if (centered_y > 0.5f) {
       texture = &flats->floor;
@@ -15827,26 +15999,13 @@ static void render_flat_textures(RenderFramebuffer *framebuffer, const AppState 
     world_x_step = view_x_step * view_cos;
     world_z_step = -view_x_step * view_sin;
     palette = texture->shaded_palette[amiga_depth_dark_index(depth)];
-    hd_subtract = depth_subtract_for_depth(depth);
 
     for (col = 0; col < w; ++col) {
       size_t dst = (size_t)(y + row) * (size_t)framebuffer->pitch_pixels + (size_t)(x + col);
-      uint32_t argb = 0u;
-
-      if (hd_art_render_enabled() && texture->hd_argb_texels != NULL && texture->hd_width > 0 &&
-          texture->hd_height > 0) {
-        int hd_tx = repeated_hd_texture_coord(world_x, GLOOM_FLAT_TEXTURE_SIZE, texture->hd_width);
-        int hd_tz = repeated_hd_texture_coord(world_z, GLOOM_FLAT_TEXTURE_SIZE, texture->hd_height);
-
-        argb = texture->hd_argb_texels[(size_t)hd_tz * (size_t)texture->hd_width + (size_t)hd_tx];
-        argb = shade_argb_subtract(argb, hd_subtract);
-      } else {
-        int tx = floor_to_int(world_x) & (GLOOM_FLAT_TEXTURE_SIZE - 1);
-        int tz = floor_to_int(world_z) & (GLOOM_FLAT_TEXTURE_SIZE - 1);
-        uint8_t palette_index = texels[(tx * GLOOM_FLAT_TEXTURE_SIZE) + tz];
-
-        argb = palette[palette_index];
-      }
+      int tx = floor_to_int(world_x) & (GLOOM_FLAT_TEXTURE_SIZE - 1);
+      int tz = floor_to_int(world_z) & (GLOOM_FLAT_TEXTURE_SIZE - 1);
+      uint8_t palette_index = texels[(tx * GLOOM_FLAT_TEXTURE_SIZE) + tz];
+      uint32_t argb = palette[palette_index];
 
       framebuffer->pixels[dst] = 0xFF000000u | (argb & 0x00FFFFFFu);
       world_x += world_x_step;
@@ -15865,11 +16024,11 @@ typedef struct {
   int hd_width;
   int hd_height;
   GLsizei vertex_count;
-  GLfloat vertices[2048u * 6u * 8u];
+  GLfloat vertices[2048u * 6u * 9u];
 } RuntimeGpuWallBatch;
 
 static bool runtime_gpu_wall_flush_batch(RuntimeGpuWallBatch *batch) {
-  enum { FLOATS_PER_VERTEX = 8 };
+  enum { FLOATS_PER_VERTEX = 9 };
   GLsizei stride = (GLsizei)(FLOATS_PER_VERTEX * (int)sizeof(GLfloat));
 
   if (batch == NULL || batch->vertex_count <= 0) {
@@ -15905,6 +16064,7 @@ static bool runtime_gpu_wall_flush_batch(RuntimeGpuWallBatch *batch) {
   g_runtime_gl.EnableVertexAttribArray(4u);
   g_runtime_gl.EnableVertexAttribArray(5u);
   g_runtime_gl.EnableVertexAttribArray(6u);
+  g_runtime_gl.EnableVertexAttribArray(7u);
   g_runtime_gl.VertexAttribPointer(0u, 2, GL_FLOAT, GL_FALSE, stride, (const void *)0);
   g_runtime_gl.VertexAttribPointer(1u, 1, GL_FLOAT, GL_FALSE, stride,
                                    (const void *)(2u * sizeof(GLfloat)));
@@ -15918,6 +16078,8 @@ static bool runtime_gpu_wall_flush_batch(RuntimeGpuWallBatch *batch) {
                                    (const void *)(6u * sizeof(GLfloat)));
   g_runtime_gl.VertexAttribPointer(6u, 1, GL_FLOAT, GL_FALSE, stride,
                                    (const void *)(7u * sizeof(GLfloat)));
+  g_runtime_gl.VertexAttribPointer(7u, 1, GL_FLOAT, GL_FALSE, stride,
+                                   (const void *)(8u * sizeof(GLfloat)));
   g_runtime_gl.DrawArrays(GL_TRIANGLES, 0, batch->vertex_count);
   batch->vertex_count = 0;
   return true;
@@ -15926,10 +16088,10 @@ static bool runtime_gpu_wall_flush_batch(RuntimeGpuWallBatch *batch) {
 static bool runtime_gpu_wall_add_quad(RuntimeGpuWallBatch *batch, GLuint texture_id, int screen_x, int y0, int y1,
                                       float wall_top, float wall_height, size_t local_index, size_t texture_x,
                                       int dark_index, float local_u, GLuint hd_texture_id, GLuint hd_mask_texture_id,
-                                      bool hd_enabled, int hd_width, int hd_height, int render_width,
-                                      int render_height) {
+                                      bool hd_enabled, int hd_atlas_width, int hd_atlas_height, int hd_slot_x,
+                                      int hd_slot_width, int hd_slot_height, int render_width, int render_height) {
   enum {
-    FLOATS_PER_VERTEX = 8,
+    FLOATS_PER_VERTEX = 9,
     VERTICES_PER_QUAD = 6,
     BATCH_VERTEX_CAPACITY = 2048 * VERTICES_PER_QUAD,
     WALL_ATLAS_WIDTH = GLOOM_TEXTURES_PER_SCREEN * GLOOM_TEXTURE_WIDTH
@@ -15944,6 +16106,7 @@ static bool runtime_gpu_wall_add_quad(RuntimeGpuWallBatch *batch, GLuint texture
   GLfloat atlas_y_base = 0.0f;
   GLfloat hd_tex_x = 0.0f;
   GLfloat hd_slot_u = 0.0f;
+  GLfloat hd_height = 1.0f;
   GLfloat subtract = 0.0f;
   GLfloat quad[VERTICES_PER_QUAD][FLOATS_PER_VERTEX];
   int v = 0;
@@ -15956,7 +16119,7 @@ static bool runtime_gpu_wall_add_quad(RuntimeGpuWallBatch *batch, GLuint texture
 
   if (batch->texture_id != texture_id || batch->hd_texture_id != hd_texture_id ||
       batch->hd_mask_texture_id != hd_mask_texture_id || batch->hd_enabled != hd_enabled ||
-      batch->hd_width != hd_width || batch->hd_height != hd_height) {
+      batch->hd_width != hd_atlas_width || batch->hd_height != hd_atlas_height) {
     if (!runtime_gpu_wall_flush_batch(batch)) {
       return false;
     }
@@ -15964,8 +16127,8 @@ static bool runtime_gpu_wall_add_quad(RuntimeGpuWallBatch *batch, GLuint texture
     batch->hd_texture_id = hd_texture_id;
     batch->hd_mask_texture_id = hd_mask_texture_id;
     batch->hd_enabled = hd_enabled;
-    batch->hd_width = hd_width;
-    batch->hd_height = hd_height;
+    batch->hd_width = hd_atlas_width;
+    batch->hd_height = hd_atlas_height;
   } else if (batch->vertex_count + (GLsizei)VERTICES_PER_QUAD > (GLsizei)BATCH_VERTEX_CAPACITY) {
     if (!runtime_gpu_wall_flush_batch(batch)) {
       return false;
@@ -15974,8 +16137,8 @@ static bool runtime_gpu_wall_add_quad(RuntimeGpuWallBatch *batch, GLuint texture
     batch->hd_texture_id = hd_texture_id;
     batch->hd_mask_texture_id = hd_mask_texture_id;
     batch->hd_enabled = hd_enabled;
-    batch->hd_width = hd_width;
-    batch->hd_height = hd_height;
+    batch->hd_width = hd_atlas_width;
+    batch->hd_height = hd_atlas_height;
   }
 
   left = ((GLfloat)screen_x / (GLfloat)render_width) * 2.0f - 1.0f;
@@ -15987,11 +16150,11 @@ static bool runtime_gpu_wall_add_quad(RuntimeGpuWallBatch *batch, GLuint texture
   wall_v_top = (GLfloat)(((float)y0 - wall_top) / wall_height);
   wall_v_bottom = (GLfloat)(((float)(y1 + 1) - wall_top) / wall_height);
   atlas_y_base = (GLfloat)(dark_index * GLOOM_TEXTURE_HEIGHT);
-  if (hd_enabled && hd_width > 0) {
-    size_t hd_tx = wall_texture_coord_from_unit(local_u, (size_t)hd_width);
+  if (hd_enabled && hd_atlas_width > 0 && hd_slot_width > 0 && hd_slot_height > 0) {
+    size_t hd_tx = wall_texture_coord_from_unit(local_u, (size_t)hd_slot_width);
 
-    hd_tex_x = (GLfloat)((local_index * (size_t)hd_width) + hd_tx + 0.5f) /
-               (GLfloat)(GLOOM_TEXTURES_PER_SCREEN * hd_width);
+    hd_tex_x = (GLfloat)((size_t)hd_slot_x + hd_tx + 0.5f) / (GLfloat)hd_atlas_width;
+    hd_height = (GLfloat)hd_slot_height;
   }
   hd_slot_u = (GLfloat)(local_index + 0.5f) / (GLfloat)GLOOM_TEXTURES_PER_SCREEN;
   subtract = (GLfloat)(dark_index * 17) / 255.0f;
@@ -16003,7 +16166,8 @@ static bool runtime_gpu_wall_add_quad(RuntimeGpuWallBatch *batch, GLuint texture
   quad[0][4] = atlas_y_base;
   quad[0][5] = hd_tex_x;
   quad[0][6] = hd_slot_u;
-  quad[0][7] = subtract;
+  quad[0][7] = hd_height;
+  quad[0][8] = subtract;
   quad[1][0] = right;
   quad[1][1] = top;
   quad[1][2] = tex_x;
@@ -16011,7 +16175,8 @@ static bool runtime_gpu_wall_add_quad(RuntimeGpuWallBatch *batch, GLuint texture
   quad[1][4] = atlas_y_base;
   quad[1][5] = hd_tex_x;
   quad[1][6] = hd_slot_u;
-  quad[1][7] = subtract;
+  quad[1][7] = hd_height;
+  quad[1][8] = subtract;
   quad[2][0] = left;
   quad[2][1] = bottom;
   quad[2][2] = tex_x;
@@ -16019,7 +16184,8 @@ static bool runtime_gpu_wall_add_quad(RuntimeGpuWallBatch *batch, GLuint texture
   quad[2][4] = atlas_y_base;
   quad[2][5] = hd_tex_x;
   quad[2][6] = hd_slot_u;
-  quad[2][7] = subtract;
+  quad[2][7] = hd_height;
+  quad[2][8] = subtract;
   quad[3][0] = right;
   quad[3][1] = top;
   quad[3][2] = tex_x;
@@ -16027,7 +16193,8 @@ static bool runtime_gpu_wall_add_quad(RuntimeGpuWallBatch *batch, GLuint texture
   quad[3][4] = atlas_y_base;
   quad[3][5] = hd_tex_x;
   quad[3][6] = hd_slot_u;
-  quad[3][7] = subtract;
+  quad[3][7] = hd_height;
+  quad[3][8] = subtract;
   quad[4][0] = right;
   quad[4][1] = bottom;
   quad[4][2] = tex_x;
@@ -16035,7 +16202,8 @@ static bool runtime_gpu_wall_add_quad(RuntimeGpuWallBatch *batch, GLuint texture
   quad[4][4] = atlas_y_base;
   quad[4][5] = hd_tex_x;
   quad[4][6] = hd_slot_u;
-  quad[4][7] = subtract;
+  quad[4][7] = hd_height;
+  quad[4][8] = subtract;
   quad[5][0] = left;
   quad[5][1] = bottom;
   quad[5][2] = tex_x;
@@ -16043,7 +16211,8 @@ static bool runtime_gpu_wall_add_quad(RuntimeGpuWallBatch *batch, GLuint texture
   quad[5][4] = atlas_y_base;
   quad[5][5] = hd_tex_x;
   quad[5][6] = hd_slot_u;
-  quad[5][7] = subtract;
+  quad[5][7] = hd_height;
+  quad[5][8] = subtract;
 
   for (v = 0; v < VERTICES_PER_QUAD; ++v) {
     memcpy(batch->vertices + ((size_t)batch->vertex_count * (size_t)FLOATS_PER_VERTEX), quad[v],
@@ -16245,6 +16414,11 @@ static bool runtime_gpu_render_wall_view(SDL_Renderer *renderer, const AppState 
       size_t texture_x = 0u;
       float local_u = 0.0f;
       bool screen_hd_ready = false;
+      int hd_atlas_width = 0;
+      int hd_atlas_height = 0;
+      int hd_slot_x = 0;
+      int hd_slot_width = 0;
+      int hd_slot_height = 0;
       const WallTextureScreen *screen = NULL;
 
       if (wall_height < 1.0f) {
@@ -16274,14 +16448,28 @@ static bool runtime_gpu_render_wall_view(SDL_Renderer *renderer, const AppState 
           screen->gpu_shaded_atlas_texture == 0u || local_index >= screen->texture_count) {
         continue;
       }
-      screen_hd_ready = hd_art_render_enabled() && screen->gpu_hd_atlas_texture_valid &&
+      screen_hd_ready = hd_art_opengl_render_enabled() && screen->gpu_hd_atlas_texture_valid &&
                         screen->gpu_hd_atlas_texture != 0u && screen->gpu_hd_mask_texture_valid &&
-                        screen->gpu_hd_mask_texture != 0u && screen->hd_width > 0 && screen->hd_height > 0;
+                        screen->gpu_hd_mask_texture != 0u && screen->gpu_hd_atlas_x != NULL &&
+                        screen->gpu_hd_atlas_width > 0 && screen->gpu_hd_atlas_height > 0;
+      if (screen_hd_ready) {
+        const uint32_t *slot_pixels = NULL;
+
+        screen_hd_ready = wall_screen_hd_texture_info(screen, local_index, &slot_pixels, &hd_slot_width,
+                                                      &hd_slot_height);
+        if (screen_hd_ready) {
+          (void)slot_pixels;
+          hd_atlas_width = screen->gpu_hd_atlas_width;
+          hd_atlas_height = screen->gpu_hd_atlas_height;
+          hd_slot_x = screen->gpu_hd_atlas_x[local_index];
+        }
+      }
 
       ok = runtime_gpu_wall_add_quad(&batch, screen->gpu_shaded_atlas_texture, screen_x, y0, y1, wall_top,
                                      wall_height, local_index, texture_x, dark_index, local_u,
                                      screen->gpu_hd_atlas_texture, screen->gpu_hd_mask_texture, screen_hd_ready,
-                                     screen->hd_width, screen->hd_height, render_width, render_height);
+                                     hd_atlas_width, hd_atlas_height, hd_slot_x, hd_slot_width, hd_slot_height,
+                                     render_width, render_height);
     }
   }
 
@@ -16298,6 +16486,7 @@ static bool runtime_gpu_render_wall_view(SDL_Renderer *renderer, const AppState 
   g_runtime_gl.DisableVertexAttribArray(4u);
   g_runtime_gl.DisableVertexAttribArray(5u);
   g_runtime_gl.DisableVertexAttribArray(6u);
+  g_runtime_gl.DisableVertexAttribArray(7u);
   g_runtime_gl.BindBuffer(GL_ARRAY_BUFFER, 0u);
   g_runtime_gl.ActiveTexture(GL_TEXTURE2);
   g_runtime_gl.BindTexture(GL_TEXTURE_2D, 0u);
@@ -17130,12 +17319,8 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
       bool fast_wall_column = false;
       bool transparent_wall_column = false;
       const uint8_t *wall_texels = NULL;
-      const uint32_t *wall_hd_texels = NULL;
       const uint32_t *wall_palette = NULL;
       size_t wall_texel_base = 0u;
-      size_t wall_hd_texel_base = 0u;
-      int wall_hd_width = 0;
-      int wall_hd_height = 0;
 
       if (wall_height < 1.0f) {
         float center_y = (wall_top + wall_bottom) * 0.5f;
@@ -17156,7 +17341,6 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
       subtract = dark_index * 17;
       {
         const GloomZone *zone = hit->wall->zone;
-        float local_u = 0.0f;
         int tile_index = 0;
         uint8_t texture_index = 0u;
         size_t screen_index = 0u;
@@ -17164,7 +17348,7 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
         size_t tx = 0u;
 
         if (zone != NULL) {
-          zone_wall_texture_coordinates(zone, hit->wall_u, &tile_index, &local_u, &tx);
+          zone_wall_texture_coordinates(zone, hit->wall_u, &tile_index, NULL, &tx);
           texture_index = remap_wall_texture_index(state, zone->textures[tile_index]);
           screen_index = texture_index / (uint8_t)GLOOM_TEXTURES_PER_SCREEN;
           local_index = texture_index % (uint8_t)GLOOM_TEXTURES_PER_SCREEN;
@@ -17176,16 +17360,6 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
             wall_texels = screen->texels;
             wall_palette = screen->shaded_palette[dark_index];
             wall_texel_base = local_index * ((size_t)GLOOM_TEXTURE_WIDTH * (size_t)GLOOM_TEXTURE_HEIGHT) + tx;
-            if (hd_art_render_enabled() && screen->hd_argb_texels != NULL && screen->hd_width > 0 &&
-                screen->hd_height > 0 &&
-                (screen->hd_texture_loaded == NULL || screen->hd_texture_loaded[local_index] != 0u)) {
-              size_t hd_tx = wall_texture_coord_from_unit(local_u, (size_t)screen->hd_width);
-              wall_hd_texels = screen->hd_argb_texels;
-              wall_hd_width = screen->hd_width;
-              wall_hd_height = screen->hd_height;
-              wall_hd_texel_base =
-                  local_index * (size_t)screen->hd_width * (size_t)screen->hd_height + hd_tx;
-            }
             transparent_wall_column =
                 screen->column_flags != NULL &&
                 screen->column_flags[(local_index * (size_t)GLOOM_TEXTURE_WIDTH) + tx] != 0u;
@@ -17198,24 +17372,9 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
         bool column_visible = false;
 
         if (fast_wall_column) {
-          if (wall_hd_texels == NULL) {
-            column_visible =
-                wall_column_span_has_visible_sd_texel(wall_texels, wall_texel_base, transparent_wall_column,
-                                                      wall_top, wall_height, y0, y1);
-          } else {
-            for (draw_y = y0; draw_y <= y1; ++draw_y) {
-              float wall_v = ((float)draw_y + 0.5f - wall_top) / wall_height;
-              uint32_t argb = 0u;
-
-              if (sample_fast_wall_column_argb(wall_texels, wall_palette, wall_texel_base,
-                                               transparent_wall_column, wall_hd_texels, wall_hd_width,
-                                               wall_hd_height, wall_hd_texel_base, wall_v, subtract, &argb) &&
-                  (argb >> 24u) != 0u) {
-                column_visible = true;
-                break;
-              }
-            }
-          }
+          column_visible =
+              wall_column_span_has_visible_sd_texel(wall_texels, wall_texel_base, transparent_wall_column,
+                                                    wall_top, wall_height, y0, y1);
         } else {
           for (draw_y = y0; draw_y <= y1; ++draw_y) {
             float wall_v = ((float)draw_y + 0.5f - wall_top) / wall_height;
@@ -17293,8 +17452,7 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
 
         if (fast_wall_column) {
           if (!sample_fast_wall_column_argb(wall_texels, wall_palette, wall_texel_base, transparent_wall_column,
-                                            wall_hd_texels, wall_hd_width, wall_hd_height, wall_hd_texel_base,
-                                            wall_v, subtract, &argb)) {
+                                            wall_v, &argb)) {
             continue;
           }
         } else {
@@ -18138,7 +18296,7 @@ static bool runtime_gpu_prepare_debug_sprite_textures(SDL_Renderer *renderer, co
       continue;
     }
 
-    use_hd_texture = object_frame_hd_active(frame);
+    use_hd_texture = object_frame_gpu_hd_active(frame);
     if (!runtime_gpu_prepare_object_frame_gl_texture(mutable_frame, use_hd_texture, NULL, NULL, NULL)) {
       return false;
     }
@@ -18191,7 +18349,7 @@ static bool runtime_gpu_render_debug_sprites(SDL_Renderer *renderer, const Debug
         frame->height <= 0 || sp->screen_w < 1.0f || sp->screen_h < 1.0f) {
       continue;
     }
-    use_hd_texture = object_frame_hd_active(frame);
+    use_hd_texture = object_frame_gpu_hd_active(frame);
     g_runtime_gl.UseProgram(0u);
     if (!runtime_gpu_prepare_object_frame_gl_texture(mutable_frame, use_hd_texture, &texture,
                                                      &texture_width, &texture_height)) {
@@ -18383,81 +18541,6 @@ static void render_argb_pixels_scaled(RenderFramebuffer *framebuffer, const uint
         }
 #endif
       }
-    }
-  }
-}
-
-static void render_argb_pixels_resized_brightness(RenderFramebuffer *framebuffer, const uint32_t *pixels,
-                                                  int src_width, int src_height, int dst_x, int dst_y, int dst_width,
-                                                  int dst_height, uint8_t brightness) {
-  int y0 = 0;
-  int y1 = 0;
-  int draw_y = 0;
-
-  if (framebuffer == NULL || pixels == NULL || src_width <= 0 || src_height <= 0 || dst_width <= 0 ||
-      dst_height <= 0) {
-    return;
-  }
-#ifdef GLOOM_DOS_SDL3
-  if (framebuffer->index_pixels == NULL || framebuffer->index_pitch_pixels < framebuffer->width) {
-    return;
-  }
-#else
-  if (framebuffer->pixels == NULL || framebuffer->pitch_pixels < framebuffer->width) {
-    return;
-  }
-#endif
-
-  if (dst_x + dst_width <= 0 || dst_y + dst_height <= 0 || dst_x >= framebuffer->width ||
-      dst_y >= framebuffer->height) {
-    return;
-  }
-
-  y0 = dst_y < 0 ? 0 : dst_y;
-  y1 = dst_y + dst_height;
-  if (y1 > framebuffer->height) {
-    y1 = framebuffer->height;
-  }
-
-  for (draw_y = y0; draw_y < y1; ++draw_y) {
-    int rel_y = draw_y - dst_y;
-    int src_y = (int)(((int64_t)rel_y * (int64_t)src_height) / (int64_t)dst_height);
-    int x0 = dst_x < 0 ? 0 : dst_x;
-    int x1 = dst_x + dst_width;
-    int draw_x = 0;
-
-    if (src_y < 0) src_y = 0;
-    if (src_y >= src_height) src_y = src_height - 1;
-    if (x1 > framebuffer->width) {
-      x1 = framebuffer->width;
-    }
-
-    for (draw_x = x0; draw_x < x1; ++draw_x) {
-      int rel_x = draw_x - dst_x;
-      int src_x = (int)(((int64_t)rel_x * (int64_t)src_width) / (int64_t)dst_width);
-      uint32_t argb = 0u;
-      uint32_t alpha = 0u;
-      uint32_t r = 0u;
-      uint32_t g = 0u;
-      uint32_t b = 0u;
-
-      if (src_x < 0) src_x = 0;
-      if (src_x >= src_width) src_x = src_width - 1;
-      argb = pixels[(size_t)src_y * (size_t)src_width + (size_t)src_x];
-      alpha = argb >> 24u;
-      if (alpha == 0u) {
-        continue;
-      }
-      r = ((argb >> 16u) & 0xffu) * (uint32_t)brightness / 255u;
-      g = ((argb >> 8u) & 0xffu) * (uint32_t)brightness / 255u;
-      b = (argb & 0xffu) * (uint32_t)brightness / 255u;
-#ifdef GLOOM_DOS_SDL3
-      framebuffer->index_pixels[(size_t)draw_y * (size_t)framebuffer->index_pitch_pixels + (size_t)draw_x] =
-          dos_argb_to_opaque_index(0xFF000000u | (r << 16u) | (g << 8u) | b);
-#else
-      framebuffer->pixels[(size_t)draw_y * (size_t)framebuffer->pitch_pixels + (size_t)draw_x] =
-          0xFF000000u | (r << 16u) | (g << 8u) | b;
-#endif
     }
   }
 }
@@ -18735,13 +18818,6 @@ static void render_hud_glyph_scaled(RenderFramebuffer *framebuffer, const HudGly
     return;
   }
 
-  if (hd_art_render_enabled() && glyph->hd_argb_pixels != NULL && glyph->hd_width > 0 && glyph->hd_height > 0 &&
-      glyph->width > 0 && glyph->height > 0) {
-    render_argb_pixels_resized_brightness(framebuffer, glyph->hd_argb_pixels, glyph->hd_width, glyph->hd_height, x,
-                                          y, glyph->width * scale, glyph->height * scale, 255u);
-    return;
-  }
-
 #ifdef GLOOM_DOS_SDL3
   if (g_dos_menu_palette_active && glyph->indexed_pixels != NULL && glyph->coverage != NULL) {
     render_hud_glyph_scaled_dos_indexed(framebuffer, glyph, x, y, scale);
@@ -18770,13 +18846,6 @@ static void render_hud_glyph_scaled_brightness(RenderFramebuffer *framebuffer, c
 
   if (brightness >= 255u) {
     render_hud_glyph_scaled(framebuffer, glyph, x, y, scale);
-    return;
-  }
-
-  if (hd_art_render_enabled() && glyph->hd_argb_pixels != NULL && glyph->hd_width > 0 && glyph->hd_height > 0 &&
-      glyph->width > 0 && glyph->height > 0) {
-    render_argb_pixels_resized_brightness(framebuffer, glyph->hd_argb_pixels, glyph->hd_width, glyph->hd_height, x,
-                                          y, glyph->width * scale, glyph->height * scale, brightness);
     return;
   }
 
@@ -19371,10 +19440,45 @@ static int menu_pixel_scale_for_viewport(int render_width, int render_height) {
   return power;
 }
 
-static bool menu_image_hd_active(const MenuImage *image) {
-  return hd_art_render_enabled() && image != NULL && image->hd_pixels != NULL && image->hd_width > 0 &&
+static bool menu_image_software_hd_active(const MenuImage *image) {
+  (void)image;
+  return false;
+}
+
+#ifndef GLOOM_DOS_SDL3
+static bool menu_image_gpu_hd_active(const MenuImage *image) {
+  return hd_art_opengl_render_enabled() && image != NULL && image->hd_pixels != NULL && image->hd_width > 0 &&
          image->hd_height > 0;
 }
+
+static const uint32_t *menu_image_gpu_argb_pixels(const MenuImage *image, int *out_width, int *out_height) {
+  if (out_width != NULL) {
+    *out_width = 0;
+  }
+  if (out_height != NULL) {
+    *out_height = 0;
+  }
+  if (image == NULL) {
+    return NULL;
+  }
+  if (menu_image_gpu_hd_active(image)) {
+    if (out_width != NULL) {
+      *out_width = image->hd_width;
+    }
+    if (out_height != NULL) {
+      *out_height = image->hd_height;
+    }
+    return image->hd_pixels;
+  }
+  if (out_width != NULL) {
+    *out_width = image->width;
+  }
+  if (out_height != NULL) {
+    *out_height = image->height;
+  }
+  return image->pixels;
+}
+#endif
 
 static const uint32_t *menu_image_argb_pixels(const MenuImage *image, int *out_width, int *out_height) {
   if (out_width != NULL) {
@@ -19386,7 +19490,7 @@ static const uint32_t *menu_image_argb_pixels(const MenuImage *image, int *out_w
   if (image == NULL) {
     return NULL;
   }
-  if (menu_image_hd_active(image)) {
+  if (menu_image_software_hd_active(image)) {
     if (out_width != NULL) {
       *out_width = image->hd_width;
     }
@@ -19414,7 +19518,7 @@ static void menu_image_active_dimensions(const MenuImage *image, int *out_width,
   if (image == NULL) {
     return;
   }
-  if (menu_image_hd_active(image)) {
+  if (menu_image_software_hd_active(image)) {
     if (out_width != NULL) {
       *out_width = image->hd_width;
     }
@@ -19492,7 +19596,7 @@ static void render_menu_image(RenderFramebuffer *framebuffer, const MenuImage *i
   }
 #endif
 
-  using_hd_image = menu_image_hd_active(image);
+  using_hd_image = menu_image_software_hd_active(image);
 #ifndef GLOOM_DOS_SDL3
   (void)using_hd_image;
 #endif
@@ -19617,11 +19721,11 @@ static SDL_Texture *runtime_gpu_menu_image_texture(SDL_Renderer *renderer, const
     return NULL;
   }
 
-  pixels = menu_image_argb_pixels(image, &width, &height);
+  pixels = menu_image_gpu_argb_pixels(image, &width, &height);
   if (pixels == NULL || width <= 0 || height <= 0) {
     return NULL;
   }
-  texture_slot = menu_image_hd_active(image) ? &mutable_image->gpu_hd_texture : &mutable_image->gpu_texture;
+  texture_slot = menu_image_gpu_hd_active(image) ? &mutable_image->gpu_hd_texture : &mutable_image->gpu_texture;
   if (out_width != NULL) *out_width = width;
   if (out_height != NULL) *out_height = height;
   return runtime_gpu_argb_texture(renderer, texture_slot, pixels, width, height, true, false);
@@ -19641,7 +19745,7 @@ static SDL_Texture *runtime_gpu_hud_glyph_texture(SDL_Renderer *renderer, const 
     return NULL;
   }
 
-  if (hd_art_render_enabled() && glyph->hd_argb_pixels != NULL && glyph->hd_width > 0 && glyph->hd_height > 0 &&
+  if (hd_art_opengl_render_enabled() && glyph->hd_argb_pixels != NULL && glyph->hd_width > 0 && glyph->hd_height > 0 &&
       glyph->width > 0 && glyph->height > 0) {
     pixels = glyph->hd_argb_pixels;
     width = glyph->hd_width;
@@ -19676,13 +19780,17 @@ static SDL_Texture *runtime_gpu_object_frame_texture(SDL_Renderer *renderer, con
     return NULL;
   }
 
-  pixels = object_frame_argb_pixels(frame);
-  width = object_frame_bitmap_width(frame);
-  height = object_frame_bitmap_height(frame);
-  texture_slot = (hd_art_render_enabled() && frame->hd_argb_pixels != NULL && frame->hd_bitmap_width > 0 &&
-                  frame->hd_bitmap_height > 0)
-                     ? &mutable_frame->gpu_hd_texture
-                     : &mutable_frame->gpu_texture;
+  if (object_frame_gpu_hd_active(frame)) {
+    pixels = frame->hd_argb_pixels;
+    width = frame->hd_bitmap_width;
+    height = frame->hd_bitmap_height;
+    texture_slot = &mutable_frame->gpu_hd_texture;
+  } else {
+    pixels = frame->argb_pixels;
+    width = frame->bitmap_width > 0 ? frame->bitmap_width : frame->width;
+    height = frame->bitmap_height > 0 ? frame->bitmap_height : frame->height;
+    texture_slot = &mutable_frame->gpu_texture;
+  }
   if (pixels == NULL || width <= 0 || height <= 0) {
     return NULL;
   }
@@ -21594,14 +21702,14 @@ static int pause_menu_item_count(bool two_player_mode) {
   (void)two_player_mode;
   count = 2;
 #endif
-  if (g_hd_art_enabled) {
+  if (hd_art_menu_available()) {
     count += 1;
   }
   return count;
 }
 
 static bool pause_menu_index_is_hd_toggle(int selected_index) {
-  return g_hd_art_enabled && selected_index == 1;
+  return hd_art_menu_available() && selected_index == 1;
 }
 
 static PauseMenuResult pause_menu_result_for_index(int selected_index, bool two_player_mode) {
@@ -21613,7 +21721,7 @@ static PauseMenuResult pause_menu_result_for_index(int selected_index, bool two_
   if (pause_menu_index_is_hd_toggle(selected_index)) {
     return PAUSE_MENU_TOGGLE_HD_ART;
   }
-  if (g_hd_art_enabled && selected_index > 1) {
+  if (hd_art_menu_available() && selected_index > 1) {
     action_index -= 1;
   }
 
@@ -21690,7 +21798,7 @@ static void render_pause_menu_frame(RenderFramebuffer *framebuffer, const HudFon
   }
 #endif
   items[item_index++] = "CONTINUE";
-  if (g_hd_art_enabled) {
+  if (hd_art_menu_available()) {
     items[item_index++] = hd_art_render_enabled() ? "HD TEXTURES: ON" : "HD TEXTURES: OFF";
   }
 #if GLOOM_RUNTIME_HAS_AUTOSAVE
@@ -21738,7 +21846,7 @@ static void runtime_gpu_render_pause_menu_frame(SDL_Renderer *renderer, const Hu
   }
 
   items[item_index++] = "CONTINUE";
-  if (g_hd_art_enabled) {
+  if (hd_art_menu_available()) {
     items[item_index++] = hd_art_render_enabled() ? "HD TEXTURES: ON" : "HD TEXTURES: OFF";
   }
 #if GLOOM_RUNTIME_HAS_AUTOSAVE
@@ -21912,7 +22020,7 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, SDL_Renderer *renderer
           free_hud_font(&font);
           return result;
         } else if (sym == SDLK_F10) {
-          if (g_hd_art_enabled) {
+          if (hd_art_menu_available()) {
             audio_play_ui_activate();
             (void)pause_menu_apply_hd_toggle(PAUSE_MENU_TOGGLE_HD_ART, &redraw, &selected_visible, &flash_ticks);
           }
@@ -24590,6 +24698,9 @@ static int run_menu_selftest(void) {
     uint32_t rendered_pixels[64];
     bool old_hd_art_enabled = g_hd_art_enabled;
     bool old_hd_art_render_enabled = g_hd_art_render_enabled;
+#ifndef GLOOM_DOS_SDL3
+    bool old_opengl_draw_backend = g_runtime_opengl_draw_backend;
+#endif
     int y = 0;
 
     memset(&hd_sample_image, 0, sizeof(hd_sample_image));
@@ -24621,12 +24732,32 @@ static int run_menu_selftest(void) {
     g_hd_art_enabled = old_hd_art_enabled;
     g_hd_art_render_enabled = old_hd_art_render_enabled;
 
-    if ((rendered_pixels[(size_t)2 * 8u + 2u] & 0x00FF0000u) != 0x00400000u ||
-        (rendered_pixels[(size_t)2 * 8u + 4u] & 0x00FF0000u) != 0x00800000u) {
-      fprintf(stderr, "Menu selftest failed: HD menu image sampling collapsed through logical pixels\n");
+    if (rendered_pixels[(size_t)2 * 8u + 2u] != 0xFF000000u ||
+        rendered_pixels[(size_t)2 * 8u + 4u] != 0xFFFFFFFFu) {
+      fprintf(stderr, "Menu selftest failed: software menu image sampling used HD art outside OpenGL\n");
       free_menu_assets(&assets);
       return 1;
     }
+#ifndef GLOOM_DOS_SDL3
+    {
+      const uint32_t *gpu_pixels = NULL;
+      int gpu_width = 0;
+      int gpu_height = 0;
+
+      g_hd_art_enabled = true;
+      g_hd_art_render_enabled = true;
+      g_runtime_opengl_draw_backend = true;
+      gpu_pixels = menu_image_gpu_argb_pixels(&hd_sample_image, &gpu_width, &gpu_height);
+      g_runtime_opengl_draw_backend = old_opengl_draw_backend;
+      g_hd_art_enabled = old_hd_art_enabled;
+      g_hd_art_render_enabled = old_hd_art_render_enabled;
+      if (gpu_pixels != hd_pixels || gpu_width != 4 || gpu_height != 4) {
+        fprintf(stderr, "Menu selftest failed: OpenGL menu image selector did not choose HD art\n");
+        free_menu_assets(&assets);
+        return 1;
+      }
+    }
+#endif
   }
   if (g_hd_art_enabled) {
     MenuImage script_picture;
@@ -24701,6 +24832,9 @@ static int run_menu_selftest(void) {
       uint32_t dummy_pixel = 0xFF000000u;
       bool old_hd_art_enabled = g_hd_art_enabled;
       bool old_hd_art_render_enabled = g_hd_art_render_enabled;
+#ifndef GLOOM_DOS_SDL3
+      bool old_opengl_draw_backend = g_runtime_opengl_draw_backend;
+#endif
 
       hd_canvas_title.hd_pixels = &dummy_pixel;
       hd_canvas_title.hd_width = 3840;
@@ -24708,6 +24842,19 @@ static int run_menu_selftest(void) {
       g_hd_art_enabled = true;
       g_hd_art_render_enabled = true;
       hd_canvas_title_rect = menu_image_fit_rect(&hd_canvas_title, 3840, 2160);
+#ifndef GLOOM_DOS_SDL3
+      {
+        int gpu_width = 0;
+        int gpu_height = 0;
+
+        g_runtime_opengl_draw_backend = true;
+        (void)menu_image_gpu_argb_pixels(&hd_canvas_title, &gpu_width, &gpu_height);
+        if (gpu_width > 0 && gpu_height > 0) {
+          hd_canvas_title_rect = menu_image_fit_rect_for_dimensions(gpu_width, gpu_height, 3840, 2160);
+        }
+        g_runtime_opengl_draw_backend = old_opengl_draw_backend;
+      }
+#endif
       g_hd_art_enabled = old_hd_art_enabled;
       g_hd_art_render_enabled = old_hd_art_render_enabled;
     }
@@ -24731,13 +24878,23 @@ static int run_menu_selftest(void) {
       free_menu_assets(&assets);
       return 1;
     }
-    if (hd_canvas_title_rect.x != 0 || hd_canvas_title_rect.y != 0 || hd_canvas_title_rect.w != 3840 ||
-        hd_canvas_title_rect.h != 2160) {
+    {
+#ifndef GLOOM_DOS_SDL3
+      const int expected_hd_canvas_x = 0;
+      const int expected_hd_canvas_w = 3840;
+#else
+      const int expected_hd_canvas_x = 570;
+      const int expected_hd_canvas_w = 2700;
+#endif
+      if (hd_canvas_title_rect.x != expected_hd_canvas_x || hd_canvas_title_rect.y != 0 ||
+          hd_canvas_title_rect.w != expected_hd_canvas_w || hd_canvas_title_rect.h != 2160) {
       fprintf(stderr,
-              "Menu selftest failed: HD canvas title image fit was %d,%d %dx%d, expected 0,0 3840x2160\n",
-              hd_canvas_title_rect.x, hd_canvas_title_rect.y, hd_canvas_title_rect.w, hd_canvas_title_rect.h);
-      free_menu_assets(&assets);
-      return 1;
+                "Menu selftest failed: HD canvas title image fit was %d,%d %dx%d, expected %d,0 %dx2160\n",
+                hd_canvas_title_rect.x, hd_canvas_title_rect.y, hd_canvas_title_rect.w, hd_canvas_title_rect.h,
+                expected_hd_canvas_x, expected_hd_canvas_w);
+        free_menu_assets(&assets);
+        return 1;
+      }
     }
     if (layout.menu_y != expected_menu_y || layout.title_y < 0 ||
         layout.title_y + (GLOOM_MENU_BIG_FONT_HEIGHT * layout.title_scale) > layout.menu_y ||
@@ -25314,38 +25471,75 @@ static int run_wall_selftest(void) {
     if ((argb >> 24u) != 0u) {
       g_hd_art_enabled = old_hd_art_enabled;
       g_hd_art_render_enabled = old_hd_art_render_enabled;
-      fprintf(stderr, "Wall selftest failed: HD wall sampler ignored Amiga transparent-column mask\n");
+      fprintf(stderr, "Wall selftest failed: software wall sampler ignored Amiga transparent-column mask\n");
       return 1;
     }
-    if (sample_fast_wall_column_argb(texels, screen->shaded_palette[0], 0u, true, hd_texels, GLOOM_TEXTURE_WIDTH,
-                                     GLOOM_TEXTURE_HEIGHT, 0u, 0.5f, 0, &argb)) {
+    if (sample_fast_wall_column_argb(texels, screen->shaded_palette[0], 0u, true, 0.5f, &argb)) {
       g_hd_art_enabled = old_hd_art_enabled;
       g_hd_art_render_enabled = old_hd_art_render_enabled;
-      fprintf(stderr, "Wall selftest failed: fast HD wall column ignored Amiga transparent-column mask\n");
+      fprintf(stderr, "Wall selftest failed: fast software wall column ignored Amiga transparent-column mask\n");
       return 1;
     }
 
     texels[half_y * (size_t)GLOOM_TEXTURE_WIDTH] = 1u;
-    hd_texels[half_y * (size_t)GLOOM_TEXTURE_WIDTH] = 0x00000000u;
-    if (sample_fast_wall_column_argb(texels, screen->shaded_palette[0], 0u, true, hd_texels, GLOOM_TEXTURE_WIDTH,
-                                     GLOOM_TEXTURE_HEIGHT, 0u, 0.5f, 0, &argb)) {
+    hd_texels[half_y * (size_t)GLOOM_TEXTURE_WIDTH] = 0xffabcdefu;
+    argb = sample_wall_texture_argb_ex(&wall_textures, 0u, 0.0f, 0.5f, NULL);
+    if (argb != 0xff123456u) {
       g_hd_art_enabled = old_hd_art_enabled;
       g_hd_art_render_enabled = old_hd_art_render_enabled;
-      fprintf(stderr, "Wall selftest failed: fast HD wall column ignored PNG alpha transparency\n");
+      fprintf(stderr, "Wall selftest failed: software wall sampler used HD art outside OpenGL\n");
       return 1;
     }
-
-    hd_texels[half_y * (size_t)GLOOM_TEXTURE_WIDTH] = 0xffabcdefu;
-    if (!sample_fast_wall_column_argb(texels, screen->shaded_palette[0], 0u, true, hd_texels, GLOOM_TEXTURE_WIDTH,
-                                      GLOOM_TEXTURE_HEIGHT, 0u, 0.5f, 0, &argb) ||
-        argb != 0xffabcdefu) {
+    if (!sample_fast_wall_column_argb(texels, screen->shaded_palette[0], 0u, true, 0.5f, &argb) ||
+        argb != 0xff123456u) {
       g_hd_art_enabled = old_hd_art_enabled;
       g_hd_art_render_enabled = old_hd_art_render_enabled;
-      fprintf(stderr, "Wall selftest failed: fast HD wall column did not draw an opaque replacement texel\n");
+      fprintf(stderr, "Wall selftest failed: fast software wall column used HD art outside OpenGL\n");
       return 1;
     }
 
 #ifndef GLOOM_DOS_SDL3
+    {
+      enum {
+        MIXED_SLOT0_WIDTH = GLOOM_TEXTURE_WIDTH,
+        MIXED_SLOT0_HEIGHT = GLOOM_TEXTURE_HEIGHT,
+        MIXED_SLOT1_WIDTH = GLOOM_TEXTURE_WIDTH * 2,
+        MIXED_SLOT1_HEIGHT = GLOOM_TEXTURE_HEIGHT,
+        MIXED_SLOT0_PIXELS = MIXED_SLOT0_WIDTH * MIXED_SLOT0_HEIGHT,
+        MIXED_SLOT1_PIXELS = MIXED_SLOT1_WIDTH * MIXED_SLOT1_HEIGHT,
+        MIXED_PIXELS = MIXED_SLOT0_PIXELS + MIXED_SLOT1_PIXELS
+      };
+      WallTextureScreen mixed_screen;
+      uint32_t mixed_hd_texels[MIXED_PIXELS];
+      uint8_t mixed_loaded[2] = {1u, 1u};
+      int mixed_widths[2] = {MIXED_SLOT0_WIDTH, MIXED_SLOT1_WIDTH};
+      int mixed_heights[2] = {MIXED_SLOT0_HEIGHT, MIXED_SLOT1_HEIGHT};
+      size_t mixed_offsets[2] = {0u, (size_t)MIXED_SLOT0_PIXELS};
+      const uint32_t *slot_pixels = NULL;
+      int slot_width = 0;
+      int slot_height = 0;
+
+      memset(&mixed_screen, 0, sizeof(mixed_screen));
+      memset(mixed_hd_texels, 0, sizeof(mixed_hd_texels));
+      mixed_screen.hd_argb_texels = mixed_hd_texels;
+      mixed_screen.hd_texture_loaded = mixed_loaded;
+      mixed_screen.hd_texture_widths = mixed_widths;
+      mixed_screen.hd_texture_heights = mixed_heights;
+      mixed_screen.hd_texture_offsets = mixed_offsets;
+      mixed_screen.hd_argb_texel_count = (size_t)MIXED_PIXELS;
+      mixed_screen.hd_width = MIXED_SLOT1_WIDTH;
+      mixed_screen.hd_height = MIXED_SLOT0_HEIGHT;
+      mixed_screen.texture_count = 2u;
+      if (!wall_screen_hd_texture_info(&mixed_screen, 1u, &slot_pixels, &slot_width, &slot_height) ||
+          slot_pixels != mixed_hd_texels + MIXED_SLOT0_PIXELS || slot_width != MIXED_SLOT1_WIDTH ||
+          slot_height != MIXED_SLOT1_HEIGHT) {
+        g_hd_art_enabled = old_hd_art_enabled;
+        g_hd_art_render_enabled = old_hd_art_render_enabled;
+        fprintf(stderr, "Wall selftest failed: mixed-size HD wall slot metadata resolved incorrectly\n");
+        return 1;
+      }
+    }
+
     {
       enum {
         WALL_ATLAS_WIDTH = GLOOM_TEXTURES_PER_SCREEN * GLOOM_TEXTURE_WIDTH,
@@ -28578,6 +28772,9 @@ int main(int argc, char **argv) {
 #ifndef GLOOM_DOS_SDL3
   g_runtime_opengl_draw_backend = renderer_using_opengl;
   runtime_gpu_set_resource_renderer(renderer);
+  if (g_hd_art_enabled && !renderer_using_opengl) {
+    runtime_logf("HD presentation art is disabled for the software renderer; using original source assets");
+  }
 #endif
   report_runtime_renderer_backend(renderer, renderer_preference, renderer_using_opengl);
   log_runtime_sdl_window_metrics(window, renderer, window_width, window_height, render_width, render_height);

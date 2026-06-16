@@ -16,19 +16,21 @@ cmake --build build --config Debug
 cmake --build build --config Release
 ```
 
-Optional upscaled presentation art can be enabled on Windows native builds:
+Optional upscaled presentation art can be enabled for the OpenGL/WebGL renderer on Windows native builds:
 
 ```powershell
 .\build\Debug\gloom_pc.exe --hd-art D:\art-HD-v1
 ```
 
 The same path can be set in `GLOOM.INI` with `hd_art_path=D:\art-HD-v1`; the command-line option overrides the INI value.
-Once HD art is loaded, press `F10` during gameplay or use the pause menu's `HD TEXTURES` item to switch it on or off without reloading the level.
+When the active renderer is OpenGL/WebGL, press `F10` during gameplay or use the pause menu's `HD TEXTURES` item to switch it on or off without reloading the level. The software renderer always presents the original source assets even if an HD art root is configured.
 
 The original Amiga assets remain required and authoritative; HD art only replaces sampled presentation pixels for
-walls, flats, sprites, weapon art, menu/screen artwork, and fonts.
+OpenGL/WebGL walls, flats, sprites, weapon art, menu/screen artwork, and fonts.
 HD art packs may be partial: any wall, flat, sprite, weapon, menu image, or font replacement that is not present
 falls back to the original SD asset at runtime.
+HD wall replacement PNGs may use different dimensions per `texture_##.png` slot, as long as each replacement is at
+least the original 64x64 wall texture size.
 
 `GLOOM.INI` controls the software framebuffer size with `resolution=WIDTHxHEIGHT`, the OpenGL/WebGL logical
 render target with `hardware_resolution=WIDTHxHEIGHT` (default 1920x1080), `renderer=auto|opengl|software`, plus
