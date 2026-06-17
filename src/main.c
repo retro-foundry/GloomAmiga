@@ -1865,6 +1865,7 @@ static char g_live_menu_frame_dump_path[1024];
 static bool g_live_menu_frame_dump_written = false;
 #ifndef GLOOM_DOS_SDL3
 static bool g_runtime_opengl_draw_backend = false;
+static bool g_runtime_gpu_direct_world_disabled = false;
 static SDL_Texture *g_runtime_gpu_start_logo_texture = NULL;
 static SDL_Texture *g_runtime_gpu_menu_image_texture = NULL;
 static SDL_Texture *g_runtime_gpu_pause_background_texture = NULL;
@@ -1879,6 +1880,20 @@ static bool hd_art_render_enabled(void) {
 #ifndef GLOOM_DOS_SDL3
 static bool runtime_opengl_draw_backend_active(void) {
   return g_runtime_opengl_draw_backend;
+}
+
+static bool runtime_gpu_direct_world_active(void) {
+  return runtime_opengl_draw_backend_active() && !g_runtime_gpu_direct_world_disabled;
+}
+
+static void runtime_gpu_disable_direct_world(const char *reason) {
+  if (g_runtime_gpu_direct_world_disabled) {
+    return;
+  }
+
+  g_runtime_gpu_direct_world_disabled = true;
+  runtime_logf("OpenGL direct world renderer disabled after %s; using source framebuffer world path",
+               reason != NULL ? reason : "draw failure");
 }
 
 static bool hd_art_opengl_render_enabled(void) {
@@ -2209,6 +2224,34 @@ static void runtime_gpu_prepare_sdl_texture_draw_state(bool blend) {
   } else {
     g_runtime_gl.Disable(GL_BLEND);
   }
+}
+
+static void runtime_gpu_clear_gl_errors(void) {
+  int i = 0;
+
+  if (!g_runtime_gl.loaded || g_runtime_gl.GetError == NULL) {
+    return;
+  }
+  for (i = 0; i < 16; ++i) {
+    if (g_runtime_gl.GetError() == GL_NO_ERROR) {
+      break;
+    }
+  }
+}
+
+static bool runtime_gpu_log_gl_error(const char *context) {
+  GLenum error = GL_NO_ERROR;
+
+  if (!g_runtime_gl.loaded || g_runtime_gl.GetError == NULL) {
+    return true;
+  }
+  error = g_runtime_gl.GetError();
+  if (error == GL_NO_ERROR) {
+    return true;
+  }
+
+  runtime_logf("OpenGL %s failed (gl=0x%x)", context != NULL ? context : "direct draw", (unsigned)error);
+  return false;
 }
 
 static void runtime_gpu_finish_direct_draw_for_readback(const char *context) {
@@ -3189,6 +3232,7 @@ static bool runtime_gpu_render_blood_view(SDL_Renderer *renderer, const AppState
   float focal = 0.0f;
   float far_depth = (float)GLOOM_AMIGA_MAX_Z;
   int horizon_y = y + (h / 2);
+  bool ok = true;
 
   if (renderer == NULL || state == NULL || w <= 0 || h <= 0 || render_width <= 0 || render_height <= 0 ||
       !runtime_opengl_draw_backend_active()) {
@@ -3264,6 +3308,7 @@ static bool runtime_gpu_render_blood_view(SDL_Renderer *renderer, const AppState
   }
 
   runtime_gpu_prepare_direct_draw_state(render_width, render_height);
+  runtime_gpu_clear_gl_errors();
   g_runtime_gl.UseProgram(g_runtime_gpu_blood_renderer.program);
   g_runtime_gl.BindBuffer(GL_ARRAY_BUFFER, g_runtime_gpu_blood_renderer.vbo);
   g_runtime_gl.BufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(vertex_float_count * sizeof(GLfloat)), vertices,
@@ -3275,11 +3320,12 @@ static bool runtime_gpu_render_blood_view(SDL_Renderer *renderer, const AppState
   g_runtime_gl.VertexAttribPointer(1u, 4, GL_FLOAT, GL_FALSE, (GLsizei)(FLOATS_PER_VERTEX * sizeof(GLfloat)),
                                    (const void *)(2u * sizeof(GLfloat)));
   g_runtime_gl.DrawArrays(GL_TRIANGLES, 0, (GLsizei)(vertex_float_count / FLOATS_PER_VERTEX));
+  ok = runtime_gpu_log_gl_error("blood renderer draw");
   g_runtime_gl.DisableVertexAttribArray(0u);
   g_runtime_gl.DisableVertexAttribArray(1u);
   g_runtime_gl.BindBuffer(GL_ARRAY_BUFFER, 0u);
   g_runtime_gl.UseProgram(0u);
-  return true;
+  return ok;
 }
 
 static bool runtime_gpu_init_red_renderer(void) {
@@ -4143,6 +4189,7 @@ static bool runtime_gpu_render_flat_view(SDL_Renderer *renderer, const AppState 
   GLfloat right = 0.0f;
   GLfloat top = 0.0f;
   GLfloat bottom = 0.0f;
+  bool ok = true;
 
   if (renderer == NULL || state == NULL || flats == NULL || w <= 0 || h <= 0 || render_width <= 0 ||
       render_height <= 0 || !runtime_gpu_prepare_flat_set(renderer, flats)) {
@@ -4181,6 +4228,7 @@ static bool runtime_gpu_render_flat_view(SDL_Renderer *renderer, const AppState 
   }
 
   runtime_gpu_prepare_direct_draw_state(render_width, render_height);
+  runtime_gpu_clear_gl_errors();
   g_runtime_gl.UseProgram(g_runtime_gpu_flat_renderer.program);
   g_runtime_gl.ActiveTexture(GL_TEXTURE0);
   g_runtime_gl.BindTexture(GL_TEXTURE_2D, flats->floor.gpu_shaded_texture);
@@ -4232,6 +4280,7 @@ static bool runtime_gpu_render_flat_view(SDL_Renderer *renderer, const AppState 
   g_runtime_gl.VertexAttribPointer(1u, 2, GL_FLOAT, GL_FALSE, (GLsizei)(4u * sizeof(GLfloat)),
                                    (const void *)(2u * sizeof(GLfloat)));
   g_runtime_gl.DrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+  ok = runtime_gpu_log_gl_error("flat renderer draw");
   g_runtime_gl.DisableVertexAttribArray(0u);
   g_runtime_gl.DisableVertexAttribArray(1u);
   g_runtime_gl.BindBuffer(GL_ARRAY_BUFFER, 0u);
@@ -4244,7 +4293,7 @@ static bool runtime_gpu_render_flat_view(SDL_Renderer *renderer, const AppState 
   g_runtime_gl.ActiveTexture(GL_TEXTURE0);
   g_runtime_gl.BindTexture(GL_TEXTURE_2D, 0u);
   g_runtime_gl.UseProgram(0u);
-  return true;
+  return ok;
 }
 #endif
 
@@ -4262,6 +4311,7 @@ static void runtime_destroy_sdl_renderer(SDL_Renderer **renderer) {
   runtime_gpu_destroy_red_renderer();
   runtime_gpu_destroy_pixelate_renderer();
   g_runtime_opengl_draw_backend = false;
+  g_runtime_gpu_direct_world_disabled = false;
 #endif
   SDL_DestroyRenderer(*renderer);
   *renderer = NULL;
@@ -16163,6 +16213,7 @@ static bool runtime_gpu_wall_flush_batch(RuntimeGpuWallBatch *batch) {
     return false;
   }
 
+  runtime_gpu_clear_gl_errors();
   g_runtime_gl.ActiveTexture(GL_TEXTURE0);
   g_runtime_gl.BindTexture(GL_TEXTURE_2D, batch->texture_id);
   g_runtime_gl.Uniform1i(g_runtime_gpu_wall_renderer.uniform_wall_texture, 0);
@@ -16205,6 +16256,10 @@ static bool runtime_gpu_wall_flush_batch(RuntimeGpuWallBatch *batch) {
   g_runtime_gl.VertexAttribPointer(7u, 1, GL_FLOAT, GL_FALSE, stride,
                                    (const void *)(8u * sizeof(GLfloat)));
   g_runtime_gl.DrawArrays(GL_TRIANGLES, 0, batch->vertex_count);
+  if (!runtime_gpu_log_gl_error("wall renderer batch draw")) {
+    batch->vertex_count = 0;
+    return false;
+  }
   batch->vertex_count = 0;
   return true;
 }
@@ -18357,6 +18412,7 @@ static bool runtime_gpu_sprite_flush_batch(RuntimeGpuSpriteBatch *batch) {
     return false;
   }
 
+  runtime_gpu_clear_gl_errors();
   g_runtime_gl.BindBuffer(GL_ARRAY_BUFFER, g_runtime_gpu_sprite_renderer.vbo);
   g_runtime_gl.BufferData(GL_ARRAY_BUFFER,
                           (GLsizeiptr)((size_t)batch->vertex_count * (size_t)FLOATS_PER_VERTEX *
@@ -19305,6 +19361,48 @@ static void render_scene_contents(RenderFramebuffer *framebuffer, const AppState
   audio_dos_pump(&g_audio);
 #endif
 }
+
+#ifndef GLOOM_DOS_SDL3
+static bool render_source_world_for_gpu_overlay(RenderFramebuffer *framebuffer, const AppState *state,
+                                                const GridOffsetSet *grid_offsets,
+                                                const WallTextureSet *wall_textures,
+                                                const FlatTextureSet *flat_textures,
+                                                const ObjectVisualSet *object_visuals,
+                                                const WeaponVisualSet *weapon_visuals, int render_width,
+                                                int render_height) {
+  if (framebuffer == NULL || state == NULL || grid_offsets == NULL || wall_textures == NULL ||
+      wall_textures->loaded_count == 0u || flat_textures == NULL || !flat_textures->floor.loaded ||
+      !flat_textures->roof.loaded || render_width <= 0 || render_height <= 0) {
+    return false;
+  }
+  if (!begin_render_framebuffer(framebuffer)) {
+    return false;
+  }
+
+  framebuffer_clear(framebuffer, 0xFF000000u);
+  if (state->two_player_mode) {
+    AppState player2_state = *state;
+    RuntimePlayerState player1_state;
+    int left_w = render_width / 2;
+    int right_w = render_width - left_w;
+
+    capture_primary_player_state(state, &player1_state);
+    render_wall_debug(framebuffer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals,
+                      0, 0, left_w, render_height, true, true, true, NULL, 0u, NULL, true);
+    apply_primary_player_state(&player2_state, &state->player2);
+    player2_state.player2 = player1_state;
+    player2_state.active_player_index = 1u;
+    render_wall_debug(framebuffer, &player2_state, grid_offsets, wall_textures, flat_textures, object_visuals,
+                      weapon_visuals, left_w, 0, right_w, render_height, true, true, true, NULL, 0u, NULL, true);
+  } else {
+    render_wall_debug(framebuffer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals,
+                      0, 0, render_width, render_height, true, true, true, NULL, 0u, NULL, true);
+  }
+
+  end_render_framebuffer(framebuffer);
+  return true;
+}
+#endif
 
 static void runtime_gpu_destroy_menu_image_textures(MenuImage *image) {
   if (image == NULL) {
@@ -23140,6 +23238,7 @@ static void render(RuntimeRenderer *runtime_renderer, const AppState *state, con
   bool use_gpu_gameplay_overlays =
       runtime_renderer_uses_opengl(runtime_renderer) && runtime_opengl_draw_backend_active() && state != NULL &&
       !gameplay_viewport.active;
+  bool use_gpu_direct_world = false;
   bool use_gpu_world_flats = false;
   bool use_gpu_world_walls = false;
   bool use_gpu_world_blood = false;
@@ -23153,6 +23252,7 @@ static void render(RuntimeRenderer *runtime_renderer, const AppState *state, con
   bool gpu_sprite_textures_ready = true;
   bool gpu_world_depth_prepared = false;
   bool skip_gpu_framebuffer_overlay = false;
+  bool gpu_direct_world_draw_failed = false;
 #endif
 
   if (framebuffer == NULL || framebuffer->texture == NULL || framebuffer->width != render_width ||
@@ -23162,7 +23262,8 @@ static void render(RuntimeRenderer *runtime_renderer, const AppState *state, con
   }
 
 #ifndef GLOOM_DOS_SDL3
-  use_gpu_world_flats = use_gpu_gameplay_overlays &&
+  use_gpu_direct_world = use_gpu_gameplay_overlays && runtime_gpu_direct_world_active();
+  use_gpu_world_flats = use_gpu_direct_world &&
                         flat_textures != NULL && flat_textures->floor.loaded && flat_textures->roof.loaded &&
                         runtime_gpu_prepare_flat_set(renderer, flat_textures);
   use_gpu_world_walls = use_gpu_world_flats &&
@@ -23373,6 +23474,7 @@ static void render(RuntimeRenderer *runtime_renderer, const AppState *state, con
   SDL_RenderClear(renderer);
   if (use_gpu_world_flats) {
     double gpu_flat_start_ms = profile_now_ms();
+    bool gpu_flat_ok = true;
 
     if (state != NULL && state->two_player_mode) {
       AppState player2_state = *state;
@@ -23381,20 +23483,31 @@ static void render(RuntimeRenderer *runtime_renderer, const AppState *state, con
       int right_w = render_width - left_w;
 
       capture_primary_player_state(state, &player1_state);
-      (void)runtime_gpu_render_flat_view(renderer, state, flat_textures, 0, 0, left_w, render_height, render_width,
-                                         render_height);
+      gpu_flat_ok = runtime_gpu_render_flat_view(renderer, state, flat_textures, 0, 0, left_w, render_height,
+                                                 render_width, render_height);
       apply_primary_player_state(&player2_state, &state->player2);
       player2_state.player2 = player1_state;
       player2_state.active_player_index = 1u;
-      (void)runtime_gpu_render_flat_view(renderer, &player2_state, flat_textures, left_w, 0, right_w, render_height,
-                                         render_width, render_height);
+      if (gpu_flat_ok) {
+        gpu_flat_ok = runtime_gpu_render_flat_view(renderer, &player2_state, flat_textures, left_w, 0, right_w,
+                                                   render_height, render_width, render_height);
+      }
     } else {
-      (void)runtime_gpu_render_flat_view(renderer, state, flat_textures, 0, 0, render_width, render_height,
-                                         render_width, render_height);
+      gpu_flat_ok = runtime_gpu_render_flat_view(renderer, state, flat_textures, 0, 0, render_width, render_height,
+                                                 render_width, render_height);
+    }
+    if (!gpu_flat_ok) {
+      runtime_gpu_disable_direct_world("flat draw failure");
+      gpu_direct_world_draw_failed = true;
+      use_gpu_world_walls = false;
+      use_gpu_world_blood = false;
+      use_gpu_world_sprites = false;
     }
     profile_add_elapsed(&g_profiler.render_flat_ms, gpu_flat_start_ms);
   }
-  if (use_gpu_world_walls) {
+  if (use_gpu_world_walls && !gpu_direct_world_draw_failed) {
+    bool gpu_wall_ok = true;
+
     if (state != NULL && state->two_player_mode) {
       AppState player2_state = *state;
       RuntimePlayerState player1_state;
@@ -23402,19 +23515,29 @@ static void render(RuntimeRenderer *runtime_renderer, const AppState *state, con
       int right_w = render_width - left_w;
 
       capture_primary_player_state(state, &player1_state);
-      (void)runtime_gpu_render_wall_view(renderer, state, grid_offsets, wall_textures, 0, 0, left_w,
-                                         render_height, render_width, render_height);
+      gpu_wall_ok = runtime_gpu_render_wall_view(renderer, state, grid_offsets, wall_textures, 0, 0, left_w,
+                                                 render_height, render_width, render_height);
       apply_primary_player_state(&player2_state, &state->player2);
       player2_state.player2 = player1_state;
       player2_state.active_player_index = 1u;
-      (void)runtime_gpu_render_wall_view(renderer, &player2_state, grid_offsets, wall_textures, left_w, 0,
-                                         right_w, render_height, render_width, render_height);
+      if (gpu_wall_ok) {
+        gpu_wall_ok = runtime_gpu_render_wall_view(renderer, &player2_state, grid_offsets, wall_textures, left_w, 0,
+                                                   right_w, render_height, render_width, render_height);
+      }
     } else {
-      (void)runtime_gpu_render_wall_view(renderer, state, grid_offsets, wall_textures, 0, 0, render_width,
-                                         render_height, render_width, render_height);
+      gpu_wall_ok = runtime_gpu_render_wall_view(renderer, state, grid_offsets, wall_textures, 0, 0, render_width,
+                                                 render_height, render_width, render_height);
+    }
+    if (!gpu_wall_ok) {
+      runtime_gpu_disable_direct_world("wall draw failure");
+      gpu_direct_world_draw_failed = true;
+      use_gpu_world_blood = false;
+      use_gpu_world_sprites = false;
     }
   }
-  if (use_gpu_world_blood) {
+  if (use_gpu_world_blood && !gpu_direct_world_draw_failed) {
+    bool gpu_blood_ok = true;
+
     if (state != NULL && state->two_player_mode) {
       AppState player2_state = *state;
       RuntimePlayerState player1_state;
@@ -23422,19 +23545,26 @@ static void render(RuntimeRenderer *runtime_renderer, const AppState *state, con
       int right_w = render_width - left_w;
 
       capture_primary_player_state(state, &player1_state);
-      (void)runtime_gpu_render_blood_view(renderer, state, 0, 0, left_w, render_height, render_width,
-                                          render_height);
+      gpu_blood_ok = runtime_gpu_render_blood_view(renderer, state, 0, 0, left_w, render_height, render_width,
+                                                   render_height);
       apply_primary_player_state(&player2_state, &state->player2);
       player2_state.player2 = player1_state;
       player2_state.active_player_index = 1u;
-      (void)runtime_gpu_render_blood_view(renderer, &player2_state, left_w, 0, right_w, render_height,
-                                          render_width, render_height);
+      if (gpu_blood_ok) {
+        gpu_blood_ok = runtime_gpu_render_blood_view(renderer, &player2_state, left_w, 0, right_w, render_height,
+                                                     render_width, render_height);
+      }
     } else {
-      (void)runtime_gpu_render_blood_view(renderer, state, 0, 0, render_width, render_height, render_width,
-                                          render_height);
+      gpu_blood_ok = runtime_gpu_render_blood_view(renderer, state, 0, 0, render_width, render_height, render_width,
+                                                   render_height);
+    }
+    if (!gpu_blood_ok) {
+      runtime_gpu_disable_direct_world("blood draw failure");
+      gpu_direct_world_draw_failed = true;
+      use_gpu_world_sprites = false;
     }
   }
-  if (use_gpu_world_sprites) {
+  if (use_gpu_world_sprites && !gpu_direct_world_draw_failed) {
     if (state != NULL && state->two_player_mode) {
       int left_w = render_width / 2;
       int right_w = render_width - left_w;
@@ -23443,19 +23573,39 @@ static void render(RuntimeRenderer *runtime_renderer, const AppState *state, con
           !runtime_gpu_render_debug_sprites(renderer, gpu_sprites_left, gpu_sprite_count_left,
                                             framebuffer->gpu_sprite_depth_buffer, 0, 0, left_w, render_height,
                                             render_width, render_height)) {
-        runtime_logf("OpenGL sprite renderer: player-one draw failed after CPU sprite overlay was skipped");
+        runtime_logf("OpenGL sprite renderer: player-one draw failed after source sprite overlay was skipped");
+        runtime_gpu_disable_direct_world("sprite draw failure");
+        gpu_direct_world_draw_failed = true;
       }
-      if (gpu_sprite_right_active && gpu_sprite_count_right > 0u &&
+      if (!gpu_direct_world_draw_failed && gpu_sprite_right_active && gpu_sprite_count_right > 0u &&
           !runtime_gpu_render_debug_sprites(renderer, gpu_sprites_right, gpu_sprite_count_right,
                                             framebuffer->sprite_depth_buffer, left_w, 0, right_w, render_height,
                                             render_width, render_height)) {
-        runtime_logf("OpenGL sprite renderer: player-two draw failed after CPU sprite overlay was skipped");
+        runtime_logf("OpenGL sprite renderer: player-two draw failed after source sprite overlay was skipped");
+        runtime_gpu_disable_direct_world("sprite draw failure");
+        gpu_direct_world_draw_failed = true;
       }
     } else if (gpu_sprite_left_active && gpu_sprite_count_left > 0u &&
                !runtime_gpu_render_debug_sprites(renderer, gpu_sprites_left, gpu_sprite_count_left,
                                                  framebuffer->sprite_depth_buffer, 0, 0, render_width, render_height,
                                                  render_width, render_height)) {
-      runtime_logf("OpenGL sprite renderer: draw failed after CPU sprite overlay was skipped");
+      runtime_logf("OpenGL sprite renderer: draw failed after source sprite overlay was skipped");
+      runtime_gpu_disable_direct_world("sprite draw failure");
+      gpu_direct_world_draw_failed = true;
+    }
+  }
+  if (gpu_direct_world_draw_failed) {
+    if (render_source_world_for_gpu_overlay(framebuffer, state, grid_offsets, wall_textures, flat_textures,
+                                            object_visuals, weapon_visuals, render_width, render_height)) {
+      use_gpu_world_flats = false;
+      use_gpu_world_walls = false;
+      use_gpu_world_blood = false;
+      use_gpu_world_sprites = false;
+      skip_gpu_framebuffer_overlay = false;
+      SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
+      SDL_RenderClear(renderer);
+    } else {
+      runtime_logf("OpenGL direct world renderer: source framebuffer recovery failed");
     }
   }
 #endif
@@ -28650,6 +28800,7 @@ static bool runtime_renderer_create_for_window(RuntimeRenderer *renderer, SDL_Wi
 #ifndef GLOOM_DOS_SDL3
   renderer->backend = using_opengl ? RUNTIME_RENDERER_BACKEND_OPENGL : RUNTIME_RENDERER_BACKEND_SOFTWARE;
   g_runtime_opengl_draw_backend = using_opengl;
+  g_runtime_gpu_direct_world_disabled = false;
   runtime_gpu_set_resource_renderer(renderer->sdl);
   if (g_hd_art_enabled && !using_opengl) {
     runtime_logf("HD presentation art is disabled for the software renderer; using original source assets");
