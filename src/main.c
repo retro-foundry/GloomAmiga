@@ -10690,7 +10690,7 @@ static int run_iff_preview(const char *path) {
 
   renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
   if (renderer == NULL) {
-    renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+    renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE | SDL_RENDERER_PRESENTVSYNC);
   }
   if (renderer == NULL) {
     fprintf(stderr, "SDL_CreateRenderer failed: %s\n", SDL_GetError());
@@ -28642,6 +28642,7 @@ static SDL_Renderer *create_runtime_renderer(SDL_Window *window, RuntimeRenderer
   (void)SDL_SetHint(SDL_HINT_RENDER_DRIVER, "software");
   return SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
 #else
+  (void)SDL_SetHint(SDL_HINT_RENDER_VSYNC, "1");
   if (preference != GLOOM_RENDERER_SOFTWARE) {
     SDL_RendererInfo info;
 
@@ -28650,7 +28651,7 @@ static SDL_Renderer *create_runtime_renderer(SDL_Window *window, RuntimeRenderer
 #else
     (void)SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
 #endif
-    renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED);
+    renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
     memset(&info, 0, sizeof(info));
     if (renderer != NULL && SDL_GetRendererInfo(renderer, &info) == 0 && sdl_renderer_info_is_opengl(&info)) {
       if (out_using_opengl != NULL) {
@@ -28671,7 +28672,7 @@ static SDL_Renderer *create_runtime_renderer(SDL_Window *window, RuntimeRenderer
   }
 
   (void)SDL_SetHint(SDL_HINT_RENDER_DRIVER, "software");
-  renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE);
+  renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_SOFTWARE | SDL_RENDERER_PRESENTVSYNC);
   if (renderer == NULL) {
     fprintf(stderr, "SDL could not create software renderer: %s\n", SDL_GetError());
   }
@@ -28745,8 +28746,9 @@ static void report_runtime_renderer_backend(SDL_Renderer *renderer, RuntimeRende
 
   memset(&info, 0, sizeof(info));
   if (renderer != NULL && SDL_GetRendererInfo(renderer, &info) == 0 && info.name != NULL) {
-    runtime_logf("Presentation backend: SDL %s renderer (requested=%s opengl=%s gpu=%s world_overlay=%s)",
+    runtime_logf("Presentation backend: SDL %s renderer (requested=%s opengl=%s vsync=%s gpu=%s world_overlay=%s)",
                  info.name, runtime_renderer_preference_name(preference), using_opengl ? "yes" : "no",
+                 (info.flags & SDL_RENDERER_PRESENTVSYNC) != 0u ? "yes" : "no",
                  using_opengl ? "flats(sd+hd)/walls(sd+hd)/sprites(sd+hd)/blood/red/pixelate/menus/hud/weapon" : "no",
                  using_opengl ? "gpu world with source drawshape mask" : "software framebuffer");
   } else {
