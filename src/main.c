@@ -2200,12 +2200,64 @@ static bool runtime_gl_load_api(void) {
   return true;
 }
 
-static void runtime_gpu_prepare_direct_draw_state(int render_width, int render_height) {
+typedef struct {
+  GLint x;
+  GLint y;
+  GLsizei width;
+  GLsizei height;
+  GLfloat scale_x;
+  GLfloat scale_y;
+} RuntimeGpuDirectViewport;
+
+static RuntimeGpuDirectViewport runtime_gpu_direct_viewport(SDL_Renderer *renderer, int render_width,
+                                                            int render_height) {
+  RuntimeGpuDirectViewport viewport;
+
+  viewport.x = 0;
+  viewport.y = 0;
+  viewport.width = render_width > 0 ? (GLsizei)render_width : 1;
+  viewport.height = render_height > 0 ? (GLsizei)render_height : 1;
+  viewport.scale_x = 1.0f;
+  viewport.scale_y = 1.0f;
+
+  if (renderer != NULL && render_width > 0 && render_height > 0) {
+    int output_width = 0;
+    int output_height = 0;
+    int x0 = 0;
+    int y0 = 0;
+    int x1 = 0;
+    int y1 = 0;
+
+    if (SDL_GetRendererOutputSize(renderer, &output_width, &output_height) == 0 &&
+        output_width > 0 && output_height > 0) {
+      SDL_RenderLogicalToWindow(renderer, 0.0f, 0.0f, &x0, &y0);
+      SDL_RenderLogicalToWindow(renderer, (float)render_width, (float)render_height, &x1, &y1);
+      if (x1 > x0 && y1 > y0) {
+        int width = x1 - x0;
+        int height = y1 - y0;
+
+        viewport.x = (GLint)x0;
+        viewport.y = (GLint)(output_height - y1);
+        viewport.width = (GLsizei)width;
+        viewport.height = (GLsizei)height;
+        viewport.scale_x = (GLfloat)width / (GLfloat)render_width;
+        viewport.scale_y = (GLfloat)height / (GLfloat)render_height;
+      }
+    }
+  }
+
+  return viewport;
+}
+
+static void runtime_gpu_prepare_direct_draw_state(SDL_Renderer *renderer, int render_width, int render_height) {
+  RuntimeGpuDirectViewport viewport;
+
   if (!g_runtime_gl.loaded) {
     return;
   }
 
-  g_runtime_gl.Viewport(0, 0, (GLsizei)render_width, (GLsizei)render_height);
+  viewport = runtime_gpu_direct_viewport(renderer, render_width, render_height);
+  g_runtime_gl.Viewport(viewport.x, viewport.y, viewport.width, viewport.height);
   g_runtime_gl.Disable(GL_BLEND);
   g_runtime_gl.Disable(GL_SCISSOR_TEST);
   g_runtime_gl.Disable(GL_DEPTH_TEST);
@@ -3307,7 +3359,7 @@ static bool runtime_gpu_render_blood_view(SDL_Renderer *renderer, const AppState
     return false;
   }
 
-  runtime_gpu_prepare_direct_draw_state(render_width, render_height);
+  runtime_gpu_prepare_direct_draw_state(renderer, render_width, render_height);
   runtime_gpu_clear_gl_errors();
   g_runtime_gl.UseProgram(g_runtime_gpu_blood_renderer.program);
   g_runtime_gl.BindBuffer(GL_ARRAY_BUFFER, g_runtime_gpu_blood_renderer.vbo);
@@ -3471,6 +3523,7 @@ static bool runtime_gpu_apply_red_palette_rect(SDL_Renderer *renderer, int x, in
   GLfloat u1 = 0.0f;
   GLfloat v_top = 0.0f;
   GLfloat v_bottom = 0.0f;
+  RuntimeGpuDirectViewport viewport;
 
   if (renderer == NULL || w <= 0 || h <= 0 || render_width <= 0 || render_height <= 0 ||
       !runtime_opengl_draw_backend_active()) {
@@ -3493,7 +3546,9 @@ static bool runtime_gpu_apply_red_palette_rect(SDL_Renderer *renderer, int x, in
   if (w <= 0 || h <= 0) {
     return true;
   }
-  if (!runtime_gpu_init_red_renderer() || !runtime_gpu_red_prepare_source_texture(render_width, render_height)) {
+  viewport = runtime_gpu_direct_viewport(renderer, render_width, render_height);
+  if (!runtime_gpu_init_red_renderer() ||
+      !runtime_gpu_red_prepare_source_texture((int)viewport.width, (int)viewport.height)) {
     return false;
   }
   if (SDL_RenderFlush(renderer) != 0) {
@@ -3501,19 +3556,20 @@ static bool runtime_gpu_apply_red_palette_rect(SDL_Renderer *renderer, int x, in
     return false;
   }
 
-  runtime_gpu_prepare_direct_draw_state(render_width, render_height);
+  runtime_gpu_prepare_direct_draw_state(renderer, render_width, render_height);
   g_runtime_gl.ActiveTexture(GL_TEXTURE0);
   g_runtime_gl.BindTexture(GL_TEXTURE_2D, g_runtime_gpu_red_renderer.source_texture);
-  g_runtime_gl.CopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, render_width, render_height);
+  g_runtime_gl.CopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, viewport.x, viewport.y, viewport.width,
+                                 viewport.height);
 
   left = ((GLfloat)x / (GLfloat)render_width) * 2.0f - 1.0f;
   right = ((GLfloat)(x + w) / (GLfloat)render_width) * 2.0f - 1.0f;
   top = 1.0f - (((GLfloat)y / (GLfloat)render_height) * 2.0f);
   bottom = 1.0f - (((GLfloat)(y + h) / (GLfloat)render_height) * 2.0f);
-  u0 = (GLfloat)x / (GLfloat)render_width;
-  u1 = (GLfloat)(x + w) / (GLfloat)render_width;
-  v_top = 1.0f - ((GLfloat)y / (GLfloat)render_height);
-  v_bottom = 1.0f - ((GLfloat)(y + h) / (GLfloat)render_height);
+  u0 = ((GLfloat)x * viewport.scale_x) / (GLfloat)viewport.width;
+  u1 = ((GLfloat)(x + w) * viewport.scale_x) / (GLfloat)viewport.width;
+  v_top = 1.0f - (((GLfloat)y * viewport.scale_y) / (GLfloat)viewport.height);
+  v_bottom = 1.0f - (((GLfloat)(y + h) * viewport.scale_y) / (GLfloat)viewport.height);
 
   vertices[0] = left;
   vertices[1] = top;
@@ -3700,13 +3756,20 @@ static bool runtime_gpu_pixelate_prepare_source_texture(int render_width, int re
 
 static bool runtime_gpu_apply_pixelate(SDL_Renderer *renderer, int render_width, int render_height, int pixsize) {
   GLfloat vertices[16];
+  RuntimeGpuDirectViewport viewport;
+  GLfloat scaled_pixsize = 1.0f;
 
   if (renderer == NULL || render_width <= 0 || render_height <= 0 || pixsize <= 1 ||
       !runtime_opengl_draw_backend_active()) {
     return false;
   }
+  viewport = runtime_gpu_direct_viewport(renderer, render_width, render_height);
+  scaled_pixsize = (GLfloat)pixsize * ((viewport.scale_x + viewport.scale_y) * 0.5f);
+  if (scaled_pixsize < 1.0f) {
+    scaled_pixsize = 1.0f;
+  }
   if (!runtime_gpu_init_pixelate_renderer() ||
-      !runtime_gpu_pixelate_prepare_source_texture(render_width, render_height)) {
+      !runtime_gpu_pixelate_prepare_source_texture((int)viewport.width, (int)viewport.height)) {
     return false;
   }
   if (SDL_RenderFlush(renderer) != 0) {
@@ -3714,10 +3777,11 @@ static bool runtime_gpu_apply_pixelate(SDL_Renderer *renderer, int render_width,
     return false;
   }
 
-  runtime_gpu_prepare_direct_draw_state(render_width, render_height);
+  runtime_gpu_prepare_direct_draw_state(renderer, render_width, render_height);
   g_runtime_gl.ActiveTexture(GL_TEXTURE0);
   g_runtime_gl.BindTexture(GL_TEXTURE_2D, g_runtime_gpu_pixelate_renderer.source_texture);
-  g_runtime_gl.CopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, 0, 0, render_width, render_height);
+  g_runtime_gl.CopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, viewport.x, viewport.y, viewport.width,
+                                 viewport.height);
 
   vertices[0] = -1.0f;
   vertices[1] = 1.0f;
@@ -3725,22 +3789,22 @@ static bool runtime_gpu_apply_pixelate(SDL_Renderer *renderer, int render_width,
   vertices[3] = 0.0f;
   vertices[4] = 1.0f;
   vertices[5] = 1.0f;
-  vertices[6] = (GLfloat)render_width;
+  vertices[6] = (GLfloat)viewport.width;
   vertices[7] = 0.0f;
   vertices[8] = -1.0f;
   vertices[9] = -1.0f;
   vertices[10] = 0.0f;
-  vertices[11] = (GLfloat)render_height;
+  vertices[11] = (GLfloat)viewport.height;
   vertices[12] = 1.0f;
   vertices[13] = -1.0f;
-  vertices[14] = (GLfloat)render_width;
-  vertices[15] = (GLfloat)render_height;
+  vertices[14] = (GLfloat)viewport.width;
+  vertices[15] = (GLfloat)viewport.height;
 
   g_runtime_gl.UseProgram(g_runtime_gpu_pixelate_renderer.program);
   g_runtime_gl.Uniform1i(g_runtime_gpu_pixelate_renderer.uniform_source_texture, 0);
-  g_runtime_gl.Uniform2f(g_runtime_gpu_pixelate_renderer.uniform_render_size, (GLfloat)render_width,
-                         (GLfloat)render_height);
-  g_runtime_gl.Uniform1f(g_runtime_gpu_pixelate_renderer.uniform_pixsize, (GLfloat)pixsize);
+  g_runtime_gl.Uniform2f(g_runtime_gpu_pixelate_renderer.uniform_render_size, (GLfloat)viewport.width,
+                         (GLfloat)viewport.height);
+  g_runtime_gl.Uniform1f(g_runtime_gpu_pixelate_renderer.uniform_pixsize, scaled_pixsize);
   g_runtime_gl.BindBuffer(GL_ARRAY_BUFFER, g_runtime_gpu_pixelate_renderer.vbo);
   g_runtime_gl.BufferData(GL_ARRAY_BUFFER, (GLsizeiptr)sizeof(vertices), vertices, GL_STREAM_DRAW);
   g_runtime_gl.EnableVertexAttribArray(0u);
@@ -4227,7 +4291,7 @@ static bool runtime_gpu_render_flat_view(SDL_Renderer *renderer, const AppState 
     return false;
   }
 
-  runtime_gpu_prepare_direct_draw_state(render_width, render_height);
+  runtime_gpu_prepare_direct_draw_state(renderer, render_width, render_height);
   runtime_gpu_clear_gl_errors();
   g_runtime_gl.UseProgram(g_runtime_gpu_flat_renderer.program);
   g_runtime_gl.ActiveTexture(GL_TEXTURE0);
@@ -16507,7 +16571,7 @@ static bool runtime_gpu_render_wall_view(SDL_Renderer *renderer, const AppState 
   profile_add_elapsed(&g_profiler.render_wall_search_ms, profile_phase_start_ms);
 
   memset(&batch, 0, sizeof(batch));
-  runtime_gpu_prepare_direct_draw_state(render_width, render_height);
+  runtime_gpu_prepare_direct_draw_state(renderer, render_width, render_height);
   g_runtime_gl.UseProgram(g_runtime_gpu_wall_renderer.program);
 
   profile_phase_start_ms = profile_now_ms();
@@ -18545,7 +18609,7 @@ static bool runtime_gpu_render_debug_sprites(SDL_Renderer *renderer, const Debug
     return false;
   }
   profile_start_ms = profile_now_ms();
-  runtime_gpu_prepare_direct_draw_state(render_width, render_height);
+  runtime_gpu_prepare_direct_draw_state(renderer, render_width, render_height);
   g_runtime_gl.Enable(GL_BLEND);
   g_runtime_gl.BlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
   g_runtime_gl.ActiveTexture(GL_TEXTURE0);
@@ -28702,7 +28766,13 @@ static void log_runtime_sdl_window_metrics(SDL_Window *window, SDL_Renderer *ren
   int window_height = 0;
   int output_width = 0;
   int output_height = 0;
+  int logical_width = 0;
+  int logical_height = 0;
   int display_index = -1;
+  SDL_Rect viewport_rect;
+  float scale_x = 0.0f;
+  float scale_y = 0.0f;
+  RuntimeGpuDirectViewport direct_viewport;
   float ddpi = 0.0f;
   float hdpi = 0.0f;
   float vdpi = 0.0f;
@@ -28712,13 +28782,20 @@ static void log_runtime_sdl_window_metrics(SDL_Window *window, SDL_Renderer *ren
   }
   SDL_GetWindowSize(window, &window_width, &window_height);
   (void)SDL_GetRendererOutputSize(renderer, &output_width, &output_height);
+  SDL_RenderGetLogicalSize(renderer, &logical_width, &logical_height);
+  SDL_RenderGetViewport(renderer, &viewport_rect);
+  SDL_RenderGetScale(renderer, &scale_x, &scale_y);
+  direct_viewport = runtime_gpu_direct_viewport(renderer, render_width, render_height);
   display_index = SDL_GetWindowDisplayIndex(window);
   if (display_index >= 0) {
     (void)SDL_GetDisplayDPI(display_index, &ddpi, &hdpi, &vdpi);
   }
-  runtime_logf("Window metrics: requested_window=%dx%d actual_window=%dx%d render=%dx%d renderer_output=%dx%d display=%d dpi=%.1f/%.1f/%.1f",
+  runtime_logf("Window metrics: requested_window=%dx%d actual_window=%dx%d render=%dx%d logical=%dx%d renderer_output=%dx%d viewport=%d,%d %dx%d scale=%.3fx%.3f direct_gl_viewport=%d,%d %dx%d display=%d dpi=%.1f/%.1f/%.1f",
                requested_window_width, requested_window_height, window_width, window_height, render_width,
-               render_height, output_width, output_height, display_index, ddpi, hdpi, vdpi);
+               render_height, logical_width, logical_height, output_width, output_height, viewport_rect.x,
+               viewport_rect.y, viewport_rect.w, viewport_rect.h, scale_x, scale_y, (int)direct_viewport.x,
+               (int)direct_viewport.y, (int)direct_viewport.width, (int)direct_viewport.height, display_index,
+               ddpi, hdpi, vdpi);
 #else
   (void)window;
   (void)renderer;
@@ -28812,9 +28889,9 @@ static bool runtime_renderer_create_for_window(RuntimeRenderer *renderer, SDL_Wi
 #endif
 
   report_runtime_renderer_backend(renderer->sdl, preference, using_opengl);
-  log_runtime_sdl_window_metrics(window, renderer->sdl, window_width, window_height, render_width, render_height);
   (void)SDL_RenderSetIntegerScale(renderer->sdl, integer_scale ? SDL_TRUE : SDL_FALSE);
   (void)SDL_RenderSetLogicalSize(renderer->sdl, render_width, render_height);
+  log_runtime_sdl_window_metrics(window, renderer->sdl, window_width, window_height, render_width, render_height);
 
   if (!ensure_render_framebuffer(renderer->sdl, &renderer->framebuffer, render_width, render_height)) {
     runtime_renderer_destroy(renderer);
