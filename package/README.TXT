@@ -66,7 +66,8 @@
        controls the software/DOS framebuffer size. renderer accepts auto,
        opengl, or software; auto prefers OpenGL/WebGL on desktop/web and
        uses software on DOS. hardware_resolution controls the OpenGL/WebGL
-       logical render target and defaults to 1920x1080.
+       internal presentation target, defaults to 1920x1080, and is stretched
+       to the window with its aspect ratio preserved.
        The OpenGL/WebGL path renders SD and HD floors/walls,
        sprites/effects, blood, gun, HUD, menus, red flash, and pixelate
        transitions on the GPU.

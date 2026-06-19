@@ -740,6 +740,11 @@ typedef enum {
 typedef struct {
   SDL_Renderer *sdl;
   RenderFramebuffer framebuffer;
+#ifndef GLOOM_DOS_SDL3
+  SDL_Texture *presentation_target;
+  int presentation_target_width;
+  int presentation_target_height;
+#endif
   RuntimeRendererPreference preference;
   RuntimeRendererBackend backend;
   int render_width;
@@ -2112,6 +2117,7 @@ typedef struct {
   GLint uniform_source_texture;
   GLint uniform_render_size;
   GLint uniform_pixsize;
+  GLint uniform_source_y_inverted;
 } RuntimeGpuPixelateRenderer;
 
 static RuntimeGLApi g_runtime_gl;
@@ -2221,12 +2227,27 @@ static RuntimeGpuDirectViewport runtime_gpu_direct_viewport(SDL_Renderer *render
   viewport.scale_y = 1.0f;
 
   if (renderer != NULL && render_width > 0 && render_height > 0) {
+    SDL_Texture *target = SDL_GetRenderTarget(renderer);
     int output_width = 0;
     int output_height = 0;
     int x0 = 0;
     int y0 = 0;
     int x1 = 0;
     int y1 = 0;
+
+    if (target != NULL) {
+      int target_width = 0;
+      int target_height = 0;
+
+      if (SDL_QueryTexture(target, NULL, NULL, &target_width, &target_height) == 0 &&
+          target_width > 0 && target_height > 0) {
+        viewport.width = (GLsizei)target_width;
+        viewport.height = (GLsizei)target_height;
+        viewport.scale_x = (GLfloat)target_width / (GLfloat)render_width;
+        viewport.scale_y = (GLfloat)target_height / (GLfloat)render_height;
+      }
+      return viewport;
+    }
 
     if (SDL_GetRendererOutputSize(renderer, &output_width, &output_height) == 0 &&
         output_width > 0 && output_height > 0) {
@@ -2247,6 +2268,16 @@ static RuntimeGpuDirectViewport runtime_gpu_direct_viewport(SDL_Renderer *render
   }
 
   return viewport;
+}
+
+static bool runtime_gpu_direct_draw_target_y_is_inverted(SDL_Renderer *renderer) {
+  return renderer != NULL && SDL_GetRenderTarget(renderer) != NULL;
+}
+
+static GLfloat runtime_gpu_screen_y_to_ndc(bool target_y_inverted, GLfloat screen_y, int render_height) {
+  GLfloat y = 1.0f - ((screen_y / (GLfloat)render_height) * 2.0f);
+
+  return target_y_inverted ? -y : y;
 }
 
 static void runtime_gpu_prepare_direct_draw_state(SDL_Renderer *renderer, int render_width, int render_height) {
@@ -3284,6 +3315,7 @@ static bool runtime_gpu_render_blood_view(SDL_Renderer *renderer, const AppState
   float focal = 0.0f;
   float far_depth = (float)GLOOM_AMIGA_MAX_Z;
   int horizon_y = y + (h / 2);
+  bool target_y_inverted = false;
   bool ok = true;
 
   if (renderer == NULL || state == NULL || w <= 0 || h <= 0 || render_width <= 0 || render_height <= 0 ||
@@ -3294,6 +3326,7 @@ static bool runtime_gpu_render_blood_view(SDL_Renderer *renderer, const AppState
   view_cos = SDL_cosf(state->camera_angle);
   view_sin = SDL_sinf(state->camera_angle);
   focal = projection_focal_for_viewport(w, h);
+  target_y_inverted = runtime_gpu_direct_draw_target_y_is_inverted(renderer);
 
   for (i = 0u; i < GLOOM_MAX_RUNTIME_BLOOD; ++i) {
     const RuntimeBlood *blood = &state->blood[i];
@@ -3337,8 +3370,8 @@ static bool runtime_gpu_render_blood_view(SDL_Renderer *renderer, const AppState
     argb = amiga_blood_argb(blood->color_mask, svz);
     left = ((GLfloat)screen_x / (GLfloat)render_width) * 2.0f - 1.0f;
     right = ((GLfloat)(screen_x + 1) / (GLfloat)render_width) * 2.0f - 1.0f;
-    top = 1.0f - (((GLfloat)screen_y / (GLfloat)render_height) * 2.0f);
-    bottom = 1.0f - (((GLfloat)(screen_y + 1) / (GLfloat)render_height) * 2.0f);
+    top = runtime_gpu_screen_y_to_ndc(target_y_inverted, (GLfloat)screen_y, render_height);
+    bottom = runtime_gpu_screen_y_to_ndc(target_y_inverted, (GLfloat)(screen_y + 1), render_height);
 
     runtime_gpu_append_blood_vertex(vertices, &vertex_float_count, left, top, argb);
     runtime_gpu_append_blood_vertex(vertices, &vertex_float_count, right, top, argb);
@@ -3524,6 +3557,7 @@ static bool runtime_gpu_apply_red_palette_rect(SDL_Renderer *renderer, int x, in
   GLfloat v_top = 0.0f;
   GLfloat v_bottom = 0.0f;
   RuntimeGpuDirectViewport viewport;
+  bool target_y_inverted = false;
 
   if (renderer == NULL || w <= 0 || h <= 0 || render_width <= 0 || render_height <= 0 ||
       !runtime_opengl_draw_backend_active()) {
@@ -3562,14 +3596,20 @@ static bool runtime_gpu_apply_red_palette_rect(SDL_Renderer *renderer, int x, in
   g_runtime_gl.CopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, viewport.x, viewport.y, viewport.width,
                                  viewport.height);
 
+  target_y_inverted = runtime_gpu_direct_draw_target_y_is_inverted(renderer);
   left = ((GLfloat)x / (GLfloat)render_width) * 2.0f - 1.0f;
   right = ((GLfloat)(x + w) / (GLfloat)render_width) * 2.0f - 1.0f;
-  top = 1.0f - (((GLfloat)y / (GLfloat)render_height) * 2.0f);
-  bottom = 1.0f - (((GLfloat)(y + h) / (GLfloat)render_height) * 2.0f);
+  top = runtime_gpu_screen_y_to_ndc(target_y_inverted, (GLfloat)y, render_height);
+  bottom = runtime_gpu_screen_y_to_ndc(target_y_inverted, (GLfloat)(y + h), render_height);
   u0 = ((GLfloat)x * viewport.scale_x) / (GLfloat)viewport.width;
   u1 = ((GLfloat)(x + w) * viewport.scale_x) / (GLfloat)viewport.width;
-  v_top = 1.0f - (((GLfloat)y * viewport.scale_y) / (GLfloat)viewport.height);
-  v_bottom = 1.0f - (((GLfloat)(y + h) * viewport.scale_y) / (GLfloat)viewport.height);
+  if (target_y_inverted) {
+    v_top = ((GLfloat)y * viewport.scale_y) / (GLfloat)viewport.height;
+    v_bottom = ((GLfloat)(y + h) * viewport.scale_y) / (GLfloat)viewport.height;
+  } else {
+    v_top = 1.0f - (((GLfloat)y * viewport.scale_y) / (GLfloat)viewport.height);
+    v_bottom = 1.0f - (((GLfloat)(y + h) * viewport.scale_y) / (GLfloat)viewport.height);
+  }
 
   vertices[0] = left;
   vertices[1] = top;
@@ -3635,6 +3675,7 @@ static bool runtime_gpu_init_pixelate_renderer(void) {
       "uniform sampler2D u_source_tex;\n"
       "uniform vec2 u_render_size;\n"
       "uniform float u_pixsize;\n"
+      "uniform float u_source_y_inverted;\n"
       "varying vec2 v_local;\n"
       "void main(void) {\n"
       "  vec2 coord = floor(v_local);\n"
@@ -3642,7 +3683,11 @@ static bool runtime_gpu_init_pixelate_renderer(void) {
       "  vec2 origin = floor(coord / block) * block;\n"
       "  vec2 block_size = min(block, u_render_size - origin);\n"
       "  vec2 sample_pos = origin + floor(block_size * 0.5) + vec2(0.5);\n"
-      "  vec2 uv = vec2(sample_pos.x / u_render_size.x, 1.0 - (sample_pos.y / u_render_size.y));\n"
+      "  float source_y = sample_pos.y / u_render_size.y;\n"
+      "  if (u_source_y_inverted < 0.5) {\n"
+      "    source_y = 1.0 - source_y;\n"
+      "  }\n"
+      "  vec2 uv = vec2(sample_pos.x / u_render_size.x, source_y);\n"
       "  gl_FragColor = texture2D(u_source_tex, uv);\n"
       "}\n";
   GLuint vertex_shader = 0u;
@@ -3707,6 +3752,8 @@ static bool runtime_gpu_init_pixelate_renderer(void) {
   g_runtime_gpu_pixelate_renderer.uniform_source_texture = g_runtime_gl.GetUniformLocation(program, "u_source_tex");
   g_runtime_gpu_pixelate_renderer.uniform_render_size = g_runtime_gl.GetUniformLocation(program, "u_render_size");
   g_runtime_gpu_pixelate_renderer.uniform_pixsize = g_runtime_gl.GetUniformLocation(program, "u_pixsize");
+  g_runtime_gpu_pixelate_renderer.uniform_source_y_inverted =
+      g_runtime_gl.GetUniformLocation(program, "u_source_y_inverted");
   g_runtime_gpu_pixelate_renderer.initialized = true;
   runtime_logf("OpenGL pixelate renderer: initialized shader path for amiga/gloom2.s pixelate transition");
   return true;
@@ -3758,6 +3805,9 @@ static bool runtime_gpu_apply_pixelate(SDL_Renderer *renderer, int render_width,
   GLfloat vertices[16];
   RuntimeGpuDirectViewport viewport;
   GLfloat scaled_pixsize = 1.0f;
+  GLfloat top = 1.0f;
+  GLfloat bottom = -1.0f;
+  bool target_y_inverted = false;
 
   if (renderer == NULL || render_width <= 0 || render_height <= 0 || pixsize <= 1 ||
       !runtime_opengl_draw_backend_active()) {
@@ -3783,20 +3833,24 @@ static bool runtime_gpu_apply_pixelate(SDL_Renderer *renderer, int render_width,
   g_runtime_gl.CopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, viewport.x, viewport.y, viewport.width,
                                  viewport.height);
 
+  target_y_inverted = runtime_gpu_direct_draw_target_y_is_inverted(renderer);
+  top = runtime_gpu_screen_y_to_ndc(target_y_inverted, 0.0f, render_height);
+  bottom = runtime_gpu_screen_y_to_ndc(target_y_inverted, (GLfloat)render_height, render_height);
+
   vertices[0] = -1.0f;
-  vertices[1] = 1.0f;
+  vertices[1] = top;
   vertices[2] = 0.0f;
   vertices[3] = 0.0f;
   vertices[4] = 1.0f;
-  vertices[5] = 1.0f;
+  vertices[5] = top;
   vertices[6] = (GLfloat)viewport.width;
   vertices[7] = 0.0f;
   vertices[8] = -1.0f;
-  vertices[9] = -1.0f;
+  vertices[9] = bottom;
   vertices[10] = 0.0f;
   vertices[11] = (GLfloat)viewport.height;
   vertices[12] = 1.0f;
-  vertices[13] = -1.0f;
+  vertices[13] = bottom;
   vertices[14] = (GLfloat)viewport.width;
   vertices[15] = (GLfloat)viewport.height;
 
@@ -3805,6 +3859,8 @@ static bool runtime_gpu_apply_pixelate(SDL_Renderer *renderer, int render_width,
   g_runtime_gl.Uniform2f(g_runtime_gpu_pixelate_renderer.uniform_render_size, (GLfloat)viewport.width,
                          (GLfloat)viewport.height);
   g_runtime_gl.Uniform1f(g_runtime_gpu_pixelate_renderer.uniform_pixsize, scaled_pixsize);
+  g_runtime_gl.Uniform1f(g_runtime_gpu_pixelate_renderer.uniform_source_y_inverted,
+                         target_y_inverted ? 1.0f : 0.0f);
   g_runtime_gl.BindBuffer(GL_ARRAY_BUFFER, g_runtime_gpu_pixelate_renderer.vbo);
   g_runtime_gl.BufferData(GL_ARRAY_BUFFER, (GLsizeiptr)sizeof(vertices), vertices, GL_STREAM_DRAW);
   g_runtime_gl.EnableVertexAttribArray(0u);
@@ -4253,6 +4309,7 @@ static bool runtime_gpu_render_flat_view(SDL_Renderer *renderer, const AppState 
   GLfloat right = 0.0f;
   GLfloat top = 0.0f;
   GLfloat bottom = 0.0f;
+  bool target_y_inverted = false;
   bool ok = true;
 
   if (renderer == NULL || state == NULL || flats == NULL || w <= 0 || h <= 0 || render_width <= 0 ||
@@ -4263,11 +4320,12 @@ static bool runtime_gpu_render_flat_view(SDL_Renderer *renderer, const AppState 
   view_cos = SDL_cosf(state->camera_angle);
   view_sin = SDL_sinf(state->camera_angle);
   focal = projection_focal_for_viewport(w, h);
+  target_y_inverted = runtime_gpu_direct_draw_target_y_is_inverted(renderer);
 
   left = ((GLfloat)x / (GLfloat)render_width) * 2.0f - 1.0f;
   right = ((GLfloat)(x + w) / (GLfloat)render_width) * 2.0f - 1.0f;
-  top = 1.0f - (((GLfloat)y / (GLfloat)render_height) * 2.0f);
-  bottom = 1.0f - (((GLfloat)(y + h) / (GLfloat)render_height) * 2.0f);
+  top = runtime_gpu_screen_y_to_ndc(target_y_inverted, (GLfloat)y, render_height);
+  bottom = runtime_gpu_screen_y_to_ndc(target_y_inverted, (GLfloat)(y + h), render_height);
 
   vertices[0] = left;
   vertices[1] = top;
@@ -15685,7 +15743,7 @@ static void end_render_framebuffer(RenderFramebuffer *framebuffer) {
 }
 
 static bool blit_framebuffer_texture(SDL_Renderer *renderer, const RenderFramebuffer *framebuffer, int render_width,
-                                     int render_height) {
+                                      int render_height) {
 #ifdef GLOOM_DOS_SDL3
   (void)render_width;
   (void)render_height;
@@ -15726,6 +15784,124 @@ static bool blit_framebuffer_texture(SDL_Renderer *renderer, const RenderFramebu
   return true;
 }
 
+#ifndef GLOOM_DOS_SDL3
+static bool runtime_renderer_uses_presentation_target(const RuntimeRenderer *renderer) {
+  return renderer != NULL && renderer->backend == RUNTIME_RENDERER_BACKEND_OPENGL;
+}
+
+static void runtime_renderer_destroy_presentation_target(RuntimeRenderer *renderer) {
+  if (renderer == NULL || renderer->presentation_target == NULL) {
+    return;
+  }
+
+  if (renderer->sdl != NULL && SDL_GetRenderTarget(renderer->sdl) == renderer->presentation_target) {
+    (void)SDL_SetRenderTarget(renderer->sdl, NULL);
+  }
+  runtime_gpu_flush_before_resource_teardown("OpenGL presentation target");
+  SDL_DestroyTexture(renderer->presentation_target);
+  renderer->presentation_target = NULL;
+  renderer->presentation_target_width = 0;
+  renderer->presentation_target_height = 0;
+}
+
+static bool runtime_renderer_create_presentation_target(RuntimeRenderer *renderer, int width, int height) {
+  SDL_Texture *target = NULL;
+
+  if (!runtime_renderer_uses_presentation_target(renderer)) {
+    return true;
+  }
+  if (renderer->sdl == NULL || width <= 0 || height <= 0) {
+    return false;
+  }
+  if (renderer->presentation_target != NULL &&
+      renderer->presentation_target_width == width &&
+      renderer->presentation_target_height == height) {
+    return true;
+  }
+
+  runtime_renderer_destroy_presentation_target(renderer);
+  target = SDL_CreateTexture(renderer->sdl, SDL_PIXELFORMAT_ARGB8888, SDL_TEXTUREACCESS_TARGET, width, height);
+  if (target == NULL) {
+    fprintf(stderr, "Cannot create OpenGL presentation target %dx%d: %s\n", width, height, SDL_GetError());
+    return false;
+  }
+  (void)SDL_SetTextureScaleMode(target, SDL_ScaleModeNearest);
+  (void)SDL_SetTextureBlendMode(target, SDL_BLENDMODE_NONE);
+
+  renderer->presentation_target = target;
+  renderer->presentation_target_width = width;
+  renderer->presentation_target_height = height;
+  runtime_logf("OpenGL presentation target: hardware_resolution=%dx%d, front buffer uses SDL logical letterbox",
+               width, height);
+  return true;
+}
+
+static bool runtime_renderer_begin_presentation_target(RuntimeRenderer *renderer) {
+  if (!runtime_renderer_uses_presentation_target(renderer)) {
+    return true;
+  }
+  if (renderer->sdl == NULL || renderer->presentation_target == NULL) {
+    runtime_logf("OpenGL presentation target is not available for frame rendering");
+    return false;
+  }
+  if (SDL_SetRenderTarget(renderer->sdl, renderer->presentation_target) != 0) {
+    runtime_logf("OpenGL presentation target bind failed: %s", SDL_GetError());
+    return false;
+  }
+  return true;
+}
+
+static bool runtime_renderer_present_presentation_target(RuntimeRenderer *renderer) {
+  static bool logged_present_target = false;
+  SDL_Renderer *sdl = NULL;
+  int output_width = 0;
+  int output_height = 0;
+  int logical_width = 0;
+  int logical_height = 0;
+  SDL_Rect viewport;
+  float scale_x = 0.0f;
+  float scale_y = 0.0f;
+
+  if (!runtime_renderer_uses_presentation_target(renderer)) {
+    return true;
+  }
+  sdl = renderer->sdl;
+  if (sdl == NULL || renderer->presentation_target == NULL) {
+    runtime_logf("OpenGL presentation target is not available for front-buffer presentation");
+    return false;
+  }
+  if (SDL_RenderFlush(sdl) != 0) {
+    runtime_logf("OpenGL presentation target flush failed: %s", SDL_GetError());
+    return false;
+  }
+  if (SDL_SetRenderTarget(sdl, NULL) != 0) {
+    runtime_logf("OpenGL front-buffer target bind failed: %s", SDL_GetError());
+    return false;
+  }
+
+  SDL_SetRenderDrawColor(sdl, 0, 0, 0, 255);
+  SDL_RenderClear(sdl);
+  if (SDL_RenderCopy(sdl, renderer->presentation_target, NULL, NULL) != 0) {
+    runtime_logf("OpenGL presentation target copy failed: %s", SDL_GetError());
+    return false;
+  }
+
+  if (!logged_present_target) {
+    memset(&viewport, 0, sizeof(viewport));
+    (void)SDL_GetRendererOutputSize(sdl, &output_width, &output_height);
+    SDL_RenderGetLogicalSize(sdl, &logical_width, &logical_height);
+    SDL_RenderGetViewport(sdl, &viewport);
+    SDL_RenderGetScale(sdl, &scale_x, &scale_y);
+    runtime_logf("OpenGL presentation: target=%dx%d logical=%dx%d output=%dx%d viewport=%d,%d %dx%d scale=%.3fx%.3f",
+                 renderer->presentation_target_width, renderer->presentation_target_height,
+                 logical_width, logical_height, output_width, output_height,
+                 viewport.x, viewport.y, viewport.w, viewport.h, scale_x, scale_y);
+    logged_present_target = true;
+  }
+  return true;
+}
+#endif
+
 static SDL_Renderer *runtime_renderer_sdl(RuntimeRenderer *renderer) {
   return renderer != NULL ? renderer->sdl : NULL;
 }
@@ -15735,8 +15911,19 @@ static RenderFramebuffer *runtime_renderer_framebuffer(RuntimeRenderer *renderer
 }
 
 static bool runtime_renderer_ready(const RuntimeRenderer *renderer, int render_width, int render_height) {
-  return renderer != NULL && renderer->sdl != NULL && renderer->framebuffer.texture != NULL &&
-         renderer->framebuffer.width == render_width && renderer->framebuffer.height == render_height;
+  if (renderer == NULL || renderer->sdl == NULL || renderer->framebuffer.texture == NULL ||
+      renderer->framebuffer.width != render_width || renderer->framebuffer.height != render_height) {
+    return false;
+  }
+#ifndef GLOOM_DOS_SDL3
+  if (runtime_renderer_uses_presentation_target(renderer) &&
+      (renderer->presentation_target == NULL ||
+       renderer->presentation_target_width != render_width ||
+       renderer->presentation_target_height != render_height)) {
+    return false;
+  }
+#endif
+  return true;
 }
 
 static bool runtime_renderer_begin_framebuffer(RuntimeRenderer *renderer) {
@@ -15751,6 +15938,11 @@ static bool runtime_renderer_blit_framebuffer(RuntimeRenderer *renderer) {
   if (renderer == NULL) {
     return false;
   }
+#ifndef GLOOM_DOS_SDL3
+  if (!runtime_renderer_begin_presentation_target(renderer)) {
+    return false;
+  }
+#endif
   return blit_framebuffer_texture(renderer->sdl, &renderer->framebuffer, renderer->render_width,
                                   renderer->render_height);
 }
@@ -15761,6 +15953,11 @@ static void runtime_renderer_present(RuntimeRenderer *renderer) {
   if (sdl == NULL) {
     return;
   }
+#ifndef GLOOM_DOS_SDL3
+  if (!runtime_renderer_present_presentation_target(renderer)) {
+    return;
+  }
+#endif
   SDL_RenderPresent(sdl);
 #ifdef GLOOM_DOS_SDL3
   audio_dos_pump(&g_audio);
@@ -16332,7 +16529,8 @@ static bool runtime_gpu_wall_add_quad(RuntimeGpuWallBatch *batch, GLuint texture
                                       float wall_top, float wall_height, size_t local_index, size_t texture_x,
                                       int dark_index, float local_u, GLuint hd_texture_id, GLuint hd_mask_texture_id,
                                       bool hd_enabled, int hd_atlas_width, int hd_atlas_height, int hd_slot_x,
-                                      int hd_slot_width, int hd_slot_height, int render_width, int render_height) {
+                                      int hd_slot_width, int hd_slot_height, int render_width, int render_height,
+                                      bool target_y_inverted) {
   enum {
     FLOATS_PER_VERTEX = 9,
     VERTICES_PER_QUAD = 6,
@@ -16386,8 +16584,8 @@ static bool runtime_gpu_wall_add_quad(RuntimeGpuWallBatch *batch, GLuint texture
 
   left = ((GLfloat)screen_x / (GLfloat)render_width) * 2.0f - 1.0f;
   right = ((GLfloat)(screen_x + 1) / (GLfloat)render_width) * 2.0f - 1.0f;
-  top = 1.0f - (((GLfloat)y0 / (GLfloat)render_height) * 2.0f);
-  bottom = 1.0f - (((GLfloat)(y1 + 1) / (GLfloat)render_height) * 2.0f);
+  top = runtime_gpu_screen_y_to_ndc(target_y_inverted, (GLfloat)y0, render_height);
+  bottom = runtime_gpu_screen_y_to_ndc(target_y_inverted, (GLfloat)(y1 + 1), render_height);
   tex_x = (GLfloat)(((local_index * (size_t)GLOOM_TEXTURE_WIDTH) + texture_x) + 0.5f) /
           (GLfloat)WALL_ATLAS_WIDTH;
   wall_v_top = (GLfloat)(((float)y0 - wall_top) / wall_height);
@@ -16486,6 +16684,7 @@ static bool runtime_gpu_render_wall_view(SDL_Renderer *renderer, const AppState 
   RuntimeGpuWallBatch batch;
   double profile_start_ms = 0.0;
   double profile_phase_start_ms = 0.0;
+  bool target_y_inverted = false;
   bool ok = true;
 
   if (renderer == NULL || state == NULL || grid_offsets == NULL || wall_textures == NULL ||
@@ -16507,6 +16706,7 @@ static bool runtime_gpu_render_wall_view(SDL_Renderer *renderer, const AppState 
   view_cos = SDL_cosf(state->camera_angle);
   view_sin = SDL_sinf(state->camera_angle);
   focal = projection_focal_for_viewport(w, h);
+  target_y_inverted = runtime_gpu_direct_draw_target_y_is_inverted(renderer);
 
   profile_phase_start_ms = profile_now_ms();
   wall_candidate_count =
@@ -16712,7 +16912,7 @@ static bool runtime_gpu_render_wall_view(SDL_Renderer *renderer, const AppState 
                                      wall_height, local_index, texture_x, dark_index, local_u,
                                      screen->gpu_hd_atlas_texture, screen->gpu_hd_mask_texture, screen_hd_ready,
                                      hd_atlas_width, hd_atlas_height, hd_slot_x, hd_slot_width, hd_slot_height,
-                                     render_width, render_height);
+                                     render_width, render_height, target_y_inverted);
     }
   }
 
@@ -18503,7 +18703,7 @@ static bool runtime_gpu_sprite_flush_batch(RuntimeGpuSpriteBatch *batch) {
 
 static bool runtime_gpu_sprite_add_column_quad(RuntimeGpuSpriteBatch *batch, int screen_x, int y0, int y1,
                                                float src_x, float src_y0, float src_y1, int render_width,
-                                               int render_height) {
+                                               int render_height, bool target_y_inverted) {
   enum {
     FLOATS_PER_VERTEX = 4,
     VERTICES_PER_QUAD = 6,
@@ -18526,8 +18726,8 @@ static bool runtime_gpu_sprite_add_column_quad(RuntimeGpuSpriteBatch *batch, int
 
   left = ((GLfloat)screen_x / (GLfloat)render_width) * 2.0f - 1.0f;
   right = ((GLfloat)(screen_x + 1) / (GLfloat)render_width) * 2.0f - 1.0f;
-  top = 1.0f - (((GLfloat)y0 / (GLfloat)render_height) * 2.0f);
-  bottom = 1.0f - (((GLfloat)(y1 + 1) / (GLfloat)render_height) * 2.0f);
+  top = runtime_gpu_screen_y_to_ndc(target_y_inverted, (GLfloat)y0, render_height);
+  bottom = runtime_gpu_screen_y_to_ndc(target_y_inverted, (GLfloat)(y1 + 1), render_height);
 
   quad[0][0] = left;
   quad[0][1] = top;
@@ -18598,6 +18798,7 @@ static bool runtime_gpu_render_debug_sprites(SDL_Renderer *renderer, const Debug
                                              int render_width, int render_height) {
   size_t i = 0u;
   double profile_start_ms = 0.0;
+  bool target_y_inverted = false;
   bool ok = true;
 
   if (renderer == NULL || sprites == NULL || sprite_depth_buffer == NULL || sprite_count == 0u || w <= 0 ||
@@ -18609,6 +18810,7 @@ static bool runtime_gpu_render_debug_sprites(SDL_Renderer *renderer, const Debug
     return false;
   }
   profile_start_ms = profile_now_ms();
+  target_y_inverted = runtime_gpu_direct_draw_target_y_is_inverted(renderer);
   runtime_gpu_prepare_direct_draw_state(renderer, render_width, render_height);
   g_runtime_gl.Enable(GL_BLEND);
   g_runtime_gl.BlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
@@ -18719,7 +18921,7 @@ static bool runtime_gpu_render_debug_sprites(SDL_Renderer *renderer, const Debug
         float src_y1 = debug_sprite_source_y_coord_for_screen_position(sp, frame, (float)(last_y + 1));
 
         if (!runtime_gpu_sprite_add_column_quad(batch, screen_x, first_y, last_y, src_x, src_y0, src_y1,
-                                                render_width, render_height)) {
+                                                render_width, render_height, target_y_inverted)) {
           ok = false;
           break;
         }
@@ -21362,8 +21564,10 @@ static int menu_row_at_point(int render_width, int render_height, int item_count
 
 static int menu_row_at_event_point(SDL_Renderer *renderer, int render_width, int render_height, int item_count,
                                     int window_x, int window_y) {
+#ifdef GLOOM_DOS_SDL3
   float render_x = (float)window_x;
   float render_y = (float)window_y;
+#endif
 
   if (renderer != NULL) {
 #ifdef GLOOM_DOS_SDL3
@@ -21371,8 +21575,9 @@ static int menu_row_at_event_point(SDL_Renderer *renderer, int render_width, int
       return menu_row_at_point(render_width, render_height, item_count, (int)render_x, (int)render_y);
     }
 #else
-    SDL_RenderWindowToLogical(renderer, window_x, window_y, &render_x, &render_y);
-    return menu_row_at_point(render_width, render_height, item_count, (int)render_x, (int)render_y);
+    (void)renderer;
+    /* SDL_RenderSetLogicalSize filters SDL2 mouse events into logical renderer coordinates. */
+    return menu_row_at_point(render_width, render_height, item_count, window_x, window_y);
 #endif
   }
   return menu_row_at_point(render_width, render_height, item_count, window_x, window_y);
@@ -21569,6 +21774,9 @@ static bool runtime_renderer_draw_start_menu_frame(RuntimeRenderer *runtime_rend
   }
 #ifndef GLOOM_DOS_SDL3
   if (runtime_renderer_uses_opengl(runtime_renderer) && runtime_opengl_draw_backend_active()) {
+    if (!runtime_renderer_begin_presentation_target(runtime_renderer)) {
+      return false;
+    }
     runtime_gpu_render_start_menu_frame(runtime_renderer_sdl(runtime_renderer), assets, render_width, render_height,
                                         selected_index, selected_visible, violence_mode, control_config);
     return true;
@@ -21927,6 +22135,9 @@ static bool runtime_renderer_draw_combat_menu_frame(RuntimeRenderer *runtime_ren
   }
 #ifndef GLOOM_DOS_SDL3
   if (runtime_renderer_uses_opengl(runtime_renderer) && runtime_opengl_draw_backend_active()) {
+    if (!runtime_renderer_begin_presentation_target(runtime_renderer)) {
+      return false;
+    }
     runtime_gpu_render_combat_menu_frame(runtime_renderer_sdl(runtime_renderer), image, font, render_width,
                                          render_height, selected_index, selected_visible, lives);
     return true;
@@ -22118,6 +22329,9 @@ static bool runtime_renderer_draw_combat_result_frame(RuntimeRenderer *runtime_r
   }
 #ifndef GLOOM_DOS_SDL3
   if (runtime_renderer_uses_opengl(runtime_renderer) && runtime_opengl_draw_backend_active()) {
+    if (!runtime_renderer_begin_presentation_target(runtime_renderer)) {
+      return false;
+    }
     runtime_gpu_render_combat_result_frame(runtime_renderer_sdl(runtime_renderer), image, font, message,
                                            render_width, render_height);
     return true;
@@ -22239,8 +22453,10 @@ static int pause_menu_row_at_point(int render_width, int render_height, int item
 
 static int pause_menu_row_at_event_point(SDL_Renderer *renderer, int render_width, int render_height, int item_count,
                                          int window_x, int window_y) {
+#ifdef GLOOM_DOS_SDL3
   float render_x = (float)window_x;
   float render_y = (float)window_y;
+#endif
 
   if (renderer != NULL) {
 #ifdef GLOOM_DOS_SDL3
@@ -22248,8 +22464,9 @@ static int pause_menu_row_at_event_point(SDL_Renderer *renderer, int render_widt
       return pause_menu_row_at_point(render_width, render_height, item_count, (int)render_x, (int)render_y);
     }
 #else
-    SDL_RenderWindowToLogical(renderer, window_x, window_y, &render_x, &render_y);
-    return pause_menu_row_at_point(render_width, render_height, item_count, (int)render_x, (int)render_y);
+    (void)renderer;
+    /* SDL_RenderSetLogicalSize filters SDL2 mouse events into logical renderer coordinates. */
+    return pause_menu_row_at_point(render_width, render_height, item_count, window_x, window_y);
 #endif
   }
   return pause_menu_row_at_point(render_width, render_height, item_count, window_x, window_y);
@@ -22375,6 +22592,9 @@ static bool runtime_renderer_draw_pause_menu_frame(RuntimeRenderer *runtime_rend
   }
 #ifndef GLOOM_DOS_SDL3
   if (runtime_renderer_uses_opengl(runtime_renderer) && runtime_opengl_draw_backend_active()) {
+    if (!runtime_renderer_begin_presentation_target(runtime_renderer)) {
+      return false;
+    }
     runtime_gpu_render_pause_menu_frame(runtime_renderer_sdl(runtime_renderer), font, background,
                                         background_pitch_pixels, render_width, render_height, selected_index,
                                         selected_visible, two_player_mode);
@@ -22749,6 +22969,9 @@ static bool runtime_renderer_draw_completion_frame(RuntimeRenderer *runtime_rend
   }
 #ifndef GLOOM_DOS_SDL3
   if (runtime_renderer_uses_opengl(runtime_renderer) && runtime_opengl_draw_backend_active()) {
+    if (!runtime_renderer_begin_presentation_target(runtime_renderer)) {
+      return false;
+    }
     runtime_gpu_render_completion_frame(runtime_renderer_sdl(runtime_renderer), image, font, text, render_width,
                                         render_height);
     return true;
@@ -22998,6 +23221,9 @@ static bool runtime_renderer_draw_script_intro_frame(RuntimeRenderer *runtime_re
   }
 #ifndef GLOOM_DOS_SDL3
   if (runtime_renderer_uses_opengl(runtime_renderer) && runtime_opengl_draw_backend_active()) {
+    if (!runtime_renderer_begin_presentation_target(runtime_renderer)) {
+      return false;
+    }
     runtime_gpu_render_script_intro_frame(runtime_renderer_sdl(runtime_renderer), image, font, text, render_width,
                                           render_height);
     return true;
@@ -23534,6 +23760,9 @@ static void render(RuntimeRenderer *runtime_renderer, const AppState *state, con
 
   profile_start_ms = profile_now_ms();
 #ifndef GLOOM_DOS_SDL3
+  if (!runtime_renderer_begin_presentation_target(runtime_renderer)) {
+    return;
+  }
   SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255);
   SDL_RenderClear(renderer);
   if (use_gpu_world_flats) {
@@ -23780,12 +24009,9 @@ static void render(RuntimeRenderer *runtime_renderer, const AppState *state, con
   }
 #endif
 
-  SDL_RenderPresent(renderer);
+  runtime_renderer_present(runtime_renderer);
   profile_add_elapsed(&g_profiler.render_present_ms, profile_start_ms);
   profile_add_elapsed(&g_profiler.render_ms, profile_render_start_ms);
-#ifdef GLOOM_DOS_SDL3
-  audio_dos_pump(&g_audio);
-#endif
 }
 
 static int16_t interpolate_int16(int16_t previous, int16_t current, float alpha) {
@@ -25707,16 +25933,42 @@ static bool runtime_renderer_read_pixels(RuntimeRenderer *renderer, uint32_t *pi
                                          int pitch_pixels) {
   SDL_Renderer *sdl = runtime_renderer_sdl(renderer);
   SDL_Rect read_rect = {0, 0, width, height};
+#ifndef GLOOM_DOS_SDL3
+  SDL_Texture *previous_target = NULL;
+  bool restore_target = false;
+#endif
 
   if (sdl == NULL || pixels == NULL || width <= 0 || height <= 0 || pitch_pixels < width) {
     return false;
   }
   runtime_gpu_finish_direct_draw_for_readback("renderer readback");
+#ifndef GLOOM_DOS_SDL3
+  previous_target = SDL_GetRenderTarget(sdl);
+  if (runtime_renderer_uses_presentation_target(renderer) &&
+      renderer->presentation_target != NULL &&
+      previous_target != renderer->presentation_target) {
+    if (SDL_SetRenderTarget(sdl, renderer->presentation_target) != 0) {
+      runtime_logf("Renderer readback failed: could not bind OpenGL presentation target: %s", SDL_GetError());
+      return false;
+    }
+    restore_target = true;
+  }
+#endif
   if (SDL_RenderReadPixels(sdl, &read_rect, SDL_PIXELFORMAT_ARGB8888, pixels,
                            pitch_pixels * (int)sizeof(*pixels)) != 0) {
     runtime_logf("Renderer readback failed: SDL_RenderReadPixels: %s", SDL_GetError());
+#ifndef GLOOM_DOS_SDL3
+    if (restore_target) {
+      (void)SDL_SetRenderTarget(sdl, previous_target);
+    }
+#endif
     return false;
   }
+#ifndef GLOOM_DOS_SDL3
+  if (restore_target && SDL_SetRenderTarget(sdl, previous_target) != 0) {
+    runtime_logf("Renderer readback warning: could not restore render target: %s", SDL_GetError());
+  }
+#endif
   return true;
 }
 
@@ -28715,7 +28967,9 @@ static SDL_Renderer *create_runtime_renderer(SDL_Window *window, RuntimeRenderer
 #else
     (void)SDL_SetHint(SDL_HINT_RENDER_DRIVER, "opengl");
 #endif
-    renderer = SDL_CreateRenderer(window, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    renderer = SDL_CreateRenderer(window, -1,
+                                  SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC |
+                                      SDL_RENDERER_TARGETTEXTURE);
     memset(&info, 0, sizeof(info));
     if (renderer != NULL && SDL_GetRendererInfo(renderer, &info) == 0 && sdl_renderer_info_is_opengl(&info)) {
       if (out_using_opengl != NULL) {
@@ -28853,6 +29107,9 @@ static void runtime_renderer_destroy(RuntimeRenderer *renderer) {
     return;
   }
 
+#ifndef GLOOM_DOS_SDL3
+  runtime_renderer_destroy_presentation_target(renderer);
+#endif
   free_render_framebuffer(&renderer->framebuffer);
   runtime_destroy_sdl_renderer(&renderer->sdl);
   renderer->backend = RUNTIME_RENDERER_BACKEND_SOFTWARE;
@@ -28891,12 +29148,18 @@ static bool runtime_renderer_create_for_window(RuntimeRenderer *renderer, SDL_Wi
   report_runtime_renderer_backend(renderer->sdl, preference, using_opengl);
   (void)SDL_RenderSetIntegerScale(renderer->sdl, integer_scale ? SDL_TRUE : SDL_FALSE);
   (void)SDL_RenderSetLogicalSize(renderer->sdl, render_width, render_height);
-  log_runtime_sdl_window_metrics(window, renderer->sdl, window_width, window_height, render_width, render_height);
 
   if (!ensure_render_framebuffer(renderer->sdl, &renderer->framebuffer, render_width, render_height)) {
     runtime_renderer_destroy(renderer);
     return false;
   }
+#ifndef GLOOM_DOS_SDL3
+  if (!runtime_renderer_create_presentation_target(renderer, render_width, render_height)) {
+    runtime_renderer_destroy(renderer);
+    return false;
+  }
+#endif
+  log_runtime_sdl_window_metrics(window, renderer->sdl, window_width, window_height, render_width, render_height);
 
   renderer->render_width = render_width;
   renderer->render_height = render_height;

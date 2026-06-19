@@ -35,10 +35,12 @@ HD sprite, billboard, weapon, and chunk replacement PNGs may also use different 
 must be at least as large as the original logical frame, and OpenGL/WebGL samples it through the original frame
 coordinates so presentation resolution does not change gameplay handles, scale, or frame choice.
 
-`GLOOM.INI` controls the software framebuffer size with `resolution=WIDTHxHEIGHT`, the OpenGL/WebGL logical
-render target with `hardware_resolution=WIDTHxHEIGHT` (default 1920x1080), `renderer=auto|opengl|software`, plus
+`GLOOM.INI` controls the software framebuffer size with `resolution=WIDTHxHEIGHT`, the OpenGL/WebGL internal
+presentation target with `hardware_resolution=WIDTHxHEIGHT` (default 1920x1080), `renderer=auto|opengl|software`, plus
 optional viewport, HD art, control-source, and keyboard settings. `--renderer` overrides the INI renderer choice, and
 `--resolution`/`--window-size`/`--boot-resolution` override either configured renderer resolution.
+The OpenGL/WebGL target is rendered to the front buffer for presentation and stretched to the window with its aspect
+ratio preserved.
 On desktop/web, the OpenGL/WebGL backend owns source-backed menu, script, pause, HUD, weapon, SD floor/ceiling
 `flat` texture draws, and SD wall-column draws from original 16-band wall atlases with transparent-column alpha.
 It also draws HD floor/ceiling and wall presentation pixels from the same source-backed layout, blending PNG alpha
