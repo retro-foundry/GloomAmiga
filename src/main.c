@@ -684,7 +684,8 @@ typedef enum {
   PAUSE_MENU_CONTINUE = 0,
   PAUSE_MENU_MAIN_MENU = 1,
   PAUSE_MENU_LOAD_GAME = 2,
-  PAUSE_MENU_TOGGLE_HD_ART = 3
+  PAUSE_MENU_TOGGLE_HD_ART = 3,
+  PAUSE_MENU_TOGGLE_SMOOTH_SHADING = 4
 } PauseMenuResult;
 
 typedef enum {
@@ -721,6 +722,7 @@ typedef struct {
   bool has_hardware_resolution;
   int hardware_resolution_width;
   int hardware_resolution_height;
+  bool hardware_smooth_shading;
   bool has_gameplay_viewport;
   int gameplay_viewport_width;
   int gameplay_viewport_height;
@@ -1262,6 +1264,7 @@ static int control_source_gamepad_index(GloomControlSource source);
 static const char *control_source_menu_name(GloomControlSource source);
 static const char *runtime_renderer_preference_name(RuntimeRendererPreference preference);
 static bool parse_renderer_preference_name(const char *value, RuntimeRendererPreference *out_preference);
+static bool parse_ini_bool_value(const char *value, bool *out_enabled);
 static void initialize_runtime_display_ini_config(RuntimeDisplayIniConfig *config);
 static bool runtime_renderer_preference_prefers_hardware(RuntimeRendererPreference preference);
 static SDL_Renderer *runtime_renderer_sdl(RuntimeRenderer *renderer);
@@ -1891,6 +1894,12 @@ static bool runtime_gpu_direct_world_active(void) {
   return runtime_opengl_draw_backend_active() && !g_runtime_gpu_direct_world_disabled;
 }
 
+#ifndef GLOOM_DOS_SDL3
+static bool hardware_smooth_shading_enabled(void) {
+  return g_runtime_display_ini.hardware_smooth_shading && runtime_opengl_draw_backend_active();
+}
+#endif
+
 static void runtime_gpu_disable_direct_world(const char *reason) {
   if (g_runtime_gpu_direct_world_disabled) {
     return;
@@ -2062,6 +2071,7 @@ typedef struct {
   GLint uniform_roof_hd_enabled;
   GLint uniform_floor_hd_size;
   GLint uniform_roof_hd_size;
+  GLint uniform_smooth_shading;
 } RuntimeGpuFlatRenderer;
 
 typedef struct {
@@ -2074,6 +2084,7 @@ typedef struct {
   GLint uniform_wall_hd_mask_texture;
   GLint uniform_hd_enabled;
   GLint uniform_hd_size;
+  GLint uniform_smooth_shading;
 } RuntimeGpuWallRenderer;
 
 typedef struct {
@@ -2832,17 +2843,27 @@ static bool runtime_gpu_init_flat_renderer(void) {
       "uniform float u_roof_hd_enabled;\n"
       "uniform vec2 u_floor_hd_size;\n"
       "uniform vec2 u_roof_hd_size;\n"
+      "uniform float u_smooth_shading;\n"
       "varying vec2 v_local;\n"
-      "float gloom_shade_index(float depth) {\n"
+      "float gloom_quantized_shade(float depth) {\n"
       "  float z = clamp(floor(depth), 0.0, u_far_depth - 1.0);\n"
       "  float source_z = (u_far_depth - 1.0) - z;\n"
       "  float bucket = floor(sqrt(max(source_z * 8.0, 0.0)) / 8.0);\n"
       "  return clamp(15.0 - bucket, 0.0, 15.0);\n"
       "}\n"
+      "float gloom_smooth_shade(float depth) {\n"
+      "  float z = clamp(depth, 0.0, u_far_depth - 1.0);\n"
+      "  float source_z = (u_far_depth - 1.0) - z;\n"
+      "  return clamp(15.0 - (sqrt(max(source_z * 8.0, 0.0)) / 8.0), 0.0, 15.0);\n"
+      "}\n"
       "vec2 gloom_hd_flat_uv(float world_x, float world_z, vec2 hd_size) {\n"
       "  float hx = mod(floor((world_x * hd_size.x) / 128.0), hd_size.x);\n"
       "  float hz = mod(floor((world_z * hd_size.y) / 128.0), hd_size.y);\n"
       "  return vec2((hx + 0.5) / hd_size.x, (hz + 0.5) / hd_size.y);\n"
+      "}\n"
+      "vec2 gloom_source_flat_uv(float world_x, float world_z, float shade) {\n"
+      "  return vec2((mod(floor(world_x), 128.0) + 0.5) / 128.0,\n"
+      "              ((shade * 128.0) + mod(floor(world_z), 128.0) + 0.5) / 2048.0);\n"
       "}\n"
       "void main(void) {\n"
       "  float row = floor(v_local.y);\n"
@@ -2863,10 +2884,21 @@ static bool runtime_gpu_init_flat_renderer(void) {
       "  float view_x = ((col - floor(u_view_size.x * 0.5)) * depth) / u_focal;\n"
       "  float world_x = u_camera_x + (view_x * u_view_cos) + (depth * u_view_sin);\n"
       "  float world_z = u_camera_z - (view_x * u_view_sin) + (depth * u_view_cos);\n"
-      "  float shade = gloom_shade_index(depth);\n"
-      "  vec2 uv = vec2((mod(floor(world_x), 128.0) + 0.5) / 128.0,\n"
-      "                ((shade * 128.0) + mod(floor(world_z), 128.0) + 0.5) / 2048.0);\n"
-      "  vec4 source_color = is_floor ? texture2D(u_floor_tex, uv) : texture2D(u_roof_tex, uv);\n"
+      "  float shade = u_smooth_shading > 0.5 ? gloom_smooth_shade(depth) : gloom_quantized_shade(depth);\n"
+      "  vec4 source_color;\n"
+      "  if (u_smooth_shading > 0.5) {\n"
+      "    float shade0 = floor(shade);\n"
+      "    float shade1 = min(shade0 + 1.0, 15.0);\n"
+      "    float shade_mix = shade - shade0;\n"
+      "    vec2 uv0 = gloom_source_flat_uv(world_x, world_z, shade0);\n"
+      "    vec2 uv1 = gloom_source_flat_uv(world_x, world_z, shade1);\n"
+      "    vec4 color0 = is_floor ? texture2D(u_floor_tex, uv0) : texture2D(u_roof_tex, uv0);\n"
+      "    vec4 color1 = is_floor ? texture2D(u_floor_tex, uv1) : texture2D(u_roof_tex, uv1);\n"
+      "    source_color = mix(color0, color1, shade_mix);\n"
+      "  } else {\n"
+      "    vec2 uv = gloom_source_flat_uv(world_x, world_z, shade);\n"
+      "    source_color = is_floor ? texture2D(u_floor_tex, uv) : texture2D(u_roof_tex, uv);\n"
+      "  }\n"
       "  vec4 color = source_color;\n"
       "  if (is_floor && u_floor_hd_enabled > 0.5) {\n"
       "    vec4 hd = texture2D(u_floor_hd_tex, gloom_hd_flat_uv(world_x, world_z, u_floor_hd_size));\n"
@@ -2954,6 +2986,7 @@ static bool runtime_gpu_init_flat_renderer(void) {
   g_runtime_gpu_flat_renderer.uniform_roof_hd_enabled = g_runtime_gl.GetUniformLocation(program, "u_roof_hd_enabled");
   g_runtime_gpu_flat_renderer.uniform_floor_hd_size = g_runtime_gl.GetUniformLocation(program, "u_floor_hd_size");
   g_runtime_gpu_flat_renderer.uniform_roof_hd_size = g_runtime_gl.GetUniformLocation(program, "u_roof_hd_size");
+  g_runtime_gpu_flat_renderer.uniform_smooth_shading = g_runtime_gl.GetUniformLocation(program, "u_smooth_shading");
   g_runtime_gpu_flat_renderer.initialized = true;
   runtime_logf("OpenGL flat renderer: initialized shader path for amiga/gloom2.s flat");
   return true;
@@ -2999,6 +3032,7 @@ static bool runtime_gpu_init_wall_renderer(void) {
       "uniform sampler2D u_wall_hd_mask_tex;\n"
       "uniform float u_hd_enabled;\n"
       "uniform vec2 u_hd_size;\n"
+      "uniform float u_smooth_shading;\n"
       "varying float v_tex_x;\n"
       "varying float v_wall_v;\n"
       "varying float v_atlas_y_base;\n"
@@ -3009,8 +3043,19 @@ static bool runtime_gpu_init_wall_renderer(void) {
       "void main(void) {\n"
       "  float wall_v = clamp(v_wall_v, 0.0, 1.0);\n"
       "  float ty = clamp(floor(wall_v * 64.0), 0.0, 63.0);\n"
-      "  vec2 uv = vec2(v_tex_x, (v_atlas_y_base + ty + 0.5) / 1024.0);\n"
-      "  vec4 color = texture2D(u_wall_tex, uv);\n"
+      "  vec4 color;\n"
+      "  if (u_smooth_shading > 0.5) {\n"
+      "    float shade = clamp((v_subtract * 255.0) / 17.0, 0.0, 15.0);\n"
+      "    float shade0 = floor(shade);\n"
+      "    float shade1 = min(shade0 + 1.0, 15.0);\n"
+      "    float shade_mix = shade - shade0;\n"
+      "    vec2 uv0 = vec2(v_tex_x, ((shade0 * 64.0) + ty + 0.5) / 1024.0);\n"
+      "    vec2 uv1 = vec2(v_tex_x, ((shade1 * 64.0) + ty + 0.5) / 1024.0);\n"
+      "    color = mix(texture2D(u_wall_tex, uv0), texture2D(u_wall_tex, uv1), shade_mix);\n"
+      "  } else {\n"
+      "    vec2 uv = vec2(v_tex_x, (v_atlas_y_base + ty + 0.5) / 1024.0);\n"
+      "    color = texture2D(u_wall_tex, uv);\n"
+      "  }\n"
       "  if (color.a < 0.5) {\n"
       "    discard;\n"
       "  }\n"
@@ -3094,6 +3139,7 @@ static bool runtime_gpu_init_wall_renderer(void) {
       g_runtime_gl.GetUniformLocation(program, "u_wall_hd_mask_tex");
   g_runtime_gpu_wall_renderer.uniform_hd_enabled = g_runtime_gl.GetUniformLocation(program, "u_hd_enabled");
   g_runtime_gpu_wall_renderer.uniform_hd_size = g_runtime_gl.GetUniformLocation(program, "u_hd_size");
+  g_runtime_gpu_wall_renderer.uniform_smooth_shading = g_runtime_gl.GetUniformLocation(program, "u_smooth_shading");
   g_runtime_gpu_wall_renderer.initialized = true;
   runtime_logf("OpenGL wall renderer: initialized shader path for amiga/gloom2.s castwalls/renderwalls");
   return true;
@@ -4394,6 +4440,8 @@ static bool runtime_gpu_render_flat_view(SDL_Renderer *renderer, const AppState 
   g_runtime_gl.Uniform2f(g_runtime_gpu_flat_renderer.uniform_roof_hd_size,
                          flats->roof.hd_width > 0 ? (GLfloat)flats->roof.hd_width : 1.0f,
                          flats->roof.hd_height > 0 ? (GLfloat)flats->roof.hd_height : 1.0f);
+  g_runtime_gl.Uniform1f(g_runtime_gpu_flat_renderer.uniform_smooth_shading,
+                         hardware_smooth_shading_enabled() ? 1.0f : 0.0f);
   g_runtime_gl.BindBuffer(GL_ARRAY_BUFFER, g_runtime_gpu_flat_renderer.vbo);
   g_runtime_gl.BufferData(GL_ARRAY_BUFFER, (GLsizeiptr)sizeof(vertices), vertices, GL_STREAM_DRAW);
   g_runtime_gl.EnableVertexAttribArray(0u);
@@ -4451,6 +4499,14 @@ static bool hd_art_menu_available(void) {
 #endif
 }
 
+static bool hardware_smooth_shading_menu_available(void) {
+#ifndef GLOOM_DOS_SDL3
+  return true;
+#else
+  return false;
+#endif
+}
+
 static bool toggle_hd_art_render_enabled(void) {
   if (!hd_art_menu_available()) {
     return false;
@@ -4458,6 +4514,16 @@ static bool toggle_hd_art_render_enabled(void) {
 
   g_hd_art_render_enabled = !g_hd_art_render_enabled;
   printf("HD textures %s\n", g_hd_art_render_enabled ? "enabled" : "disabled");
+  return true;
+}
+
+static bool toggle_hardware_smooth_shading(void) {
+  if (!hardware_smooth_shading_menu_available()) {
+    return false;
+  }
+
+  g_runtime_display_ini.hardware_smooth_shading = !g_runtime_display_ini.hardware_smooth_shading;
+  printf("Smooth shading %s\n", g_runtime_display_ini.hardware_smooth_shading ? "enabled" : "disabled");
   return true;
 }
 
@@ -14466,6 +14532,28 @@ static uint8_t amiga_depth_dark_index(float depth) {
   return g_depth_dark_indices[z];
 }
 
+#ifndef GLOOM_DOS_SDL3
+static float amiga_depth_smooth_shade(float depth) {
+  float z = depth;
+  float source_z = 0.0f;
+  float shade = 0.0f;
+
+  if (z < 0.0f) {
+    z = 0.0f;
+  }
+  if (z > (float)(GLOOM_AMIGA_MAX_Z - 1)) {
+    z = (float)(GLOOM_AMIGA_MAX_Z - 1);
+  }
+
+  /* Optional hardware presentation variant of amiga/gloom2.s:initdarktable without 16-band quantization. */
+  source_z = (float)(GLOOM_AMIGA_MAX_Z - 1) - z;
+  shade = 15.0f - (SDL_sqrtf(source_z * 8.0f) / 8.0f);
+  if (shade < 0.0f) shade = 0.0f;
+  if (shade > 15.0f) shade = 15.0f;
+  return shade;
+}
+#endif
+
 #ifdef GLOOM_DOS_SDL3
 static uint8_t amiga_depth_dark_index_int(int32_t depth) {
   int32_t z = depth;
@@ -16488,6 +16576,8 @@ static bool runtime_gpu_wall_flush_batch(RuntimeGpuWallBatch *batch) {
   g_runtime_gl.Uniform2f(g_runtime_gpu_wall_renderer.uniform_hd_size,
                          batch->hd_width > 0 ? (GLfloat)batch->hd_width : 1.0f,
                          batch->hd_height > 0 ? (GLfloat)batch->hd_height : 1.0f);
+  g_runtime_gl.Uniform1f(g_runtime_gpu_wall_renderer.uniform_smooth_shading,
+                         hardware_smooth_shading_enabled() ? 1.0f : 0.0f);
   g_runtime_gl.BindBuffer(GL_ARRAY_BUFFER, g_runtime_gpu_wall_renderer.vbo);
   g_runtime_gl.BufferData(GL_ARRAY_BUFFER,
                           (GLsizeiptr)((size_t)batch->vertex_count * (size_t)FLOATS_PER_VERTEX *
@@ -16527,10 +16617,10 @@ static bool runtime_gpu_wall_flush_batch(RuntimeGpuWallBatch *batch) {
 
 static bool runtime_gpu_wall_add_quad(RuntimeGpuWallBatch *batch, GLuint texture_id, int screen_x, int y0, int y1,
                                       float wall_top, float wall_height, size_t local_index, size_t texture_x,
-                                      int dark_index, float local_u, GLuint hd_texture_id, GLuint hd_mask_texture_id,
-                                      bool hd_enabled, int hd_atlas_width, int hd_atlas_height, int hd_slot_x,
-                                      int hd_slot_width, int hd_slot_height, int render_width, int render_height,
-                                      bool target_y_inverted) {
+                                      int dark_index, float shade_subtract, float local_u, GLuint hd_texture_id,
+                                      GLuint hd_mask_texture_id, bool hd_enabled, int hd_atlas_width,
+                                      int hd_atlas_height, int hd_slot_x, int hd_slot_width, int hd_slot_height,
+                                      int render_width, int render_height, bool target_y_inverted) {
   enum {
     FLOATS_PER_VERTEX = 9,
     VERTICES_PER_QUAD = 6,
@@ -16598,7 +16688,7 @@ static bool runtime_gpu_wall_add_quad(RuntimeGpuWallBatch *batch, GLuint texture
     hd_height = (GLfloat)hd_slot_height;
   }
   hd_slot_u = (GLfloat)(local_index + 0.5f) / (GLfloat)GLOOM_TEXTURES_PER_SCREEN;
-  subtract = (GLfloat)(dark_index * 17) / 255.0f;
+  subtract = (GLfloat)shade_subtract;
 
   quad[0][0] = left;
   quad[0][1] = top;
@@ -16850,6 +16940,7 @@ static bool runtime_gpu_render_wall_view(SDL_Renderer *renderer, const AppState 
       int y0 = (int)wall_top;
       int y1 = (int)wall_bottom;
       int dark_index = (int)amiga_depth_dark_index(hit->depth);
+      float shade_subtract = 0.0f;
       int tile_index = 0;
       uint8_t texture_index = 0u;
       size_t screen_index = 0u;
@@ -16879,6 +16970,10 @@ static bool runtime_gpu_render_wall_view(SDL_Renderer *renderer, const AppState 
         continue;
       }
 
+      shade_subtract =
+          ((hardware_smooth_shading_enabled() ? amiga_depth_smooth_shade(hit->depth) : (float)dark_index) *
+           17.0f) /
+          255.0f;
       zone_wall_texture_coordinates(zone, hit->wall_u, &tile_index, &local_u, &texture_x);
       texture_index = remap_wall_texture_index(state, zone->textures[tile_index]);
       screen_index = texture_index / (uint8_t)GLOOM_TEXTURES_PER_SCREEN;
@@ -16909,7 +17004,7 @@ static bool runtime_gpu_render_wall_view(SDL_Renderer *renderer, const AppState 
       }
 
       ok = runtime_gpu_wall_add_quad(&batch, screen->gpu_shaded_atlas_texture, screen_x, y0, y1, wall_top,
-                                     wall_height, local_index, texture_x, dark_index, local_u,
+                                     wall_height, local_index, texture_x, dark_index, shade_subtract, local_u,
                                      screen->gpu_hd_atlas_texture, screen->gpu_hd_mask_texture, screen_hd_ready,
                                      hd_atlas_width, hd_atlas_height, hd_slot_x, hd_slot_width, hd_slot_height,
                                      render_width, render_height, target_y_inverted);
@@ -22408,6 +22503,9 @@ static int pause_menu_item_count(bool two_player_mode) {
   if (hd_art_menu_available()) {
     count += 1;
   }
+  if (hardware_smooth_shading_menu_available()) {
+    count += 1;
+  }
   return count;
 }
 
@@ -22415,8 +22513,20 @@ static bool pause_menu_index_is_hd_toggle(int selected_index) {
   return hd_art_menu_available() && selected_index == 1;
 }
 
+static int pause_menu_smooth_shading_index(void) {
+  if (!hardware_smooth_shading_menu_available()) {
+    return -1;
+  }
+  return hd_art_menu_available() ? 2 : 1;
+}
+
+static bool pause_menu_index_is_smooth_shading_toggle(int selected_index) {
+  return selected_index == pause_menu_smooth_shading_index();
+}
+
 static PauseMenuResult pause_menu_result_for_index(int selected_index, bool two_player_mode) {
   int action_index = selected_index;
+  int smooth_shading_index = pause_menu_smooth_shading_index();
 
   if (selected_index == 0) {
     return PAUSE_MENU_CONTINUE;
@@ -22424,7 +22534,13 @@ static PauseMenuResult pause_menu_result_for_index(int selected_index, bool two_
   if (pause_menu_index_is_hd_toggle(selected_index)) {
     return PAUSE_MENU_TOGGLE_HD_ART;
   }
+  if (pause_menu_index_is_smooth_shading_toggle(selected_index)) {
+    return PAUSE_MENU_TOGGLE_SMOOTH_SHADING;
+  }
   if (hd_art_menu_available() && selected_index > 1) {
+    action_index -= 1;
+  }
+  if (smooth_shading_index >= 0 && selected_index > smooth_shading_index) {
     action_index -= 1;
   }
 
@@ -22476,7 +22592,7 @@ static void render_pause_menu_frame(RenderFramebuffer *framebuffer, const HudFon
                                     const uint8_t *dos_index_background, int background_pitch_pixels,
                                     int render_width, int render_height,
                                     int selected_index, bool selected_visible, bool two_player_mode) {
-  const char *items[4];
+  const char *items[5];
   int item_count = pause_menu_item_count(two_player_mode);
   int item_index = 0;
   int scale = 1;
@@ -22507,6 +22623,10 @@ static void render_pause_menu_frame(RenderFramebuffer *framebuffer, const HudFon
   if (hd_art_menu_available()) {
     items[item_index++] = hd_art_render_enabled() ? "HD TEXTURES: ON" : "HD TEXTURES: OFF";
   }
+  if (hardware_smooth_shading_menu_available()) {
+    items[item_index++] =
+        g_runtime_display_ini.hardware_smooth_shading ? "SMOOTH SHADING: ON" : "SMOOTH SHADING: OFF";
+  }
 #if GLOOM_RUNTIME_HAS_AUTOSAVE
   if (gloom_autosave_available(two_player_mode)) {
     items[item_index++] = "LOAD GAME";
@@ -22533,7 +22653,7 @@ static void render_pause_menu_frame(RenderFramebuffer *framebuffer, const HudFon
 static void runtime_gpu_render_pause_menu_frame(SDL_Renderer *renderer, const HudFont *font, const uint32_t *background,
                                                 int background_pitch_pixels, int render_width, int render_height,
                                                 int selected_index, bool selected_visible, bool two_player_mode) {
-  const char *items[4];
+  const char *items[5];
   int item_count = pause_menu_item_count(two_player_mode);
   int item_index = 0;
   int scale = 1;
@@ -22554,6 +22674,10 @@ static void runtime_gpu_render_pause_menu_frame(SDL_Renderer *renderer, const Hu
   items[item_index++] = "CONTINUE";
   if (hd_art_menu_available()) {
     items[item_index++] = hd_art_render_enabled() ? "HD TEXTURES: ON" : "HD TEXTURES: OFF";
+  }
+  if (hardware_smooth_shading_menu_available()) {
+    items[item_index++] =
+        g_runtime_display_ini.hardware_smooth_shading ? "SMOOTH SHADING: ON" : "SMOOTH SHADING: OFF";
   }
 #if GLOOM_RUNTIME_HAS_AUTOSAVE
   if (gloom_autosave_available(two_player_mode)) {
@@ -22610,12 +22734,18 @@ static bool runtime_renderer_draw_pause_menu_frame(RuntimeRenderer *runtime_rend
   return runtime_renderer_blit_framebuffer(runtime_renderer);
 }
 
-static bool pause_menu_apply_hd_toggle(PauseMenuResult result, bool *io_redraw, bool *io_selected_visible,
-                                       int *io_flash_ticks) {
-  if (result != PAUSE_MENU_TOGGLE_HD_ART) {
+static bool pause_menu_apply_renderer_toggle(PauseMenuResult result, bool *io_redraw, bool *io_selected_visible,
+                                             int *io_flash_ticks) {
+  bool toggled = false;
+
+  if (result == PAUSE_MENU_TOGGLE_HD_ART) {
+    toggled = toggle_hd_art_render_enabled();
+  } else if (result == PAUSE_MENU_TOGGLE_SMOOTH_SHADING) {
+    toggled = toggle_hardware_smooth_shading();
+  } else {
     return false;
   }
-  if (toggle_hd_art_render_enabled()) {
+  if (toggled) {
     if (io_redraw != NULL) {
       *io_redraw = true;
     }
@@ -22752,7 +22882,7 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, RuntimeRenderer *runti
         } else if (sym == SDLK_RETURN || sym == SDLK_SPACE || sym == SDLK_LCTRL || sym == SDLK_RCTRL) {
           PauseMenuResult result = pause_menu_result_for_index(selected_index, two_player_mode);
           audio_play_ui_activate();
-          if (pause_menu_apply_hd_toggle(result, &redraw, &selected_visible, &flash_ticks)) {
+          if (pause_menu_apply_renderer_toggle(result, &redraw, &selected_visible, &flash_ticks)) {
             continue;
           }
           menu_pause_after_selection();
@@ -22762,7 +22892,7 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, RuntimeRenderer *runti
         } else if (sym == SDLK_F10) {
           if (hd_art_menu_available()) {
             audio_play_ui_activate();
-            (void)pause_menu_apply_hd_toggle(PAUSE_MENU_TOGGLE_HD_ART, &redraw, &selected_visible, &flash_ticks);
+            (void)pause_menu_apply_renderer_toggle(PAUSE_MENU_TOGGLE_HD_ART, &redraw, &selected_visible, &flash_ticks);
           }
         } else if (sym == SDLK_p) {
           audio_play_ui_activate();
@@ -22792,7 +22922,7 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, RuntimeRenderer *runti
 
             selected_index = click_index;
             audio_play_ui_activate();
-            if (pause_menu_apply_hd_toggle(result, &redraw, &selected_visible, &flash_ticks)) {
+            if (pause_menu_apply_renderer_toggle(result, &redraw, &selected_visible, &flash_ticks)) {
               continue;
             }
             menu_pause_after_selection();
@@ -22818,7 +22948,7 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, RuntimeRenderer *runti
 
           selected_index = click_index;
           audio_play_ui_activate();
-          if (pause_menu_apply_hd_toggle(result, &redraw, &selected_visible, &flash_ticks)) {
+          if (pause_menu_apply_renderer_toggle(result, &redraw, &selected_visible, &flash_ticks)) {
             continue;
           }
           menu_pause_after_selection();
@@ -22860,7 +22990,7 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, RuntimeRenderer *runti
         } else if (gamepad_menu_activate_event(&event)) {
           PauseMenuResult result = pause_menu_result_for_index(selected_index, two_player_mode);
           audio_play_ui_activate();
-          if (pause_menu_apply_hd_toggle(result, &redraw, &selected_visible, &flash_ticks)) {
+          if (pause_menu_apply_renderer_toggle(result, &redraw, &selected_visible, &flash_ticks)) {
             continue;
           }
           menu_pause_after_selection();
@@ -24197,6 +24327,7 @@ static int run_renderer_selftest(void) {
   RuntimeDisplayIniConfig display_config;
   int selected_width = 0;
   int selected_height = 0;
+  bool parsed_bool = false;
 
   if (!input_selftest_expect(parse_renderer_preference_name("auto", &preference) &&
                                  preference == GLOOM_RENDERER_AUTO,
@@ -24235,6 +24366,15 @@ static int run_renderer_selftest(void) {
                                  display_config.hardware_resolution_width == DEFAULT_HARDWARE_RENDER_WIDTH &&
                                  display_config.hardware_resolution_height == DEFAULT_HARDWARE_RENDER_HEIGHT,
                              "hardware renderer defaults were not initialized to 1080p")) {
+    return 1;
+  }
+  if (!input_selftest_expect(!display_config.hardware_smooth_shading,
+                             "hardware smooth shading default should preserve quantized Amiga shading")) {
+    return 1;
+  }
+  if (!input_selftest_expect(parse_ini_bool_value("true", &parsed_bool) && parsed_bool &&
+                                 parse_ini_bool_value("off", &parsed_bool) && !parsed_bool,
+                             "INI boolean parser did not accept hardware smooth shading values")) {
     return 1;
   }
   display_config.has_resolution = true;
@@ -25491,6 +25631,7 @@ static int run_menu_selftest(void) {
     bool old_hd_art_render_enabled = g_hd_art_render_enabled;
 #ifndef GLOOM_DOS_SDL3
     bool old_opengl_draw_backend = g_runtime_opengl_draw_backend;
+    bool old_hardware_smooth_shading = g_runtime_display_ini.hardware_smooth_shading;
 #endif
     int y = 0;
 
@@ -25585,6 +25726,39 @@ static int run_menu_selftest(void) {
         free_menu_assets(&assets);
         return 1;
       }
+      g_runtime_opengl_draw_backend = true;
+      g_hd_art_enabled = true;
+      g_hd_art_render_enabled = true;
+      g_runtime_display_ini.hardware_smooth_shading = false;
+      if (pause_menu_result_for_index(1, false) != PAUSE_MENU_TOGGLE_HD_ART ||
+          pause_menu_result_for_index(2, false) != PAUSE_MENU_TOGGLE_SMOOTH_SHADING ||
+          !pause_menu_apply_renderer_toggle(PAUSE_MENU_TOGGLE_SMOOTH_SHADING, NULL, NULL, NULL) ||
+          !g_runtime_display_ini.hardware_smooth_shading) {
+        g_runtime_opengl_draw_backend = old_opengl_draw_backend;
+        g_hd_art_enabled = old_hd_art_enabled;
+        g_hd_art_render_enabled = old_hd_art_render_enabled;
+        g_runtime_display_ini.hardware_smooth_shading = old_hardware_smooth_shading;
+        fprintf(stderr, "Menu selftest failed: OpenGL pause-menu smooth shading toggle mapping was wrong\n");
+        free_menu_assets(&assets);
+        return 1;
+      }
+      g_hd_art_enabled = false;
+      g_runtime_display_ini.hardware_smooth_shading = false;
+      if (pause_menu_result_for_index(1, false) != PAUSE_MENU_TOGGLE_SMOOTH_SHADING ||
+          !pause_menu_apply_renderer_toggle(PAUSE_MENU_TOGGLE_SMOOTH_SHADING, NULL, NULL, NULL) ||
+          !g_runtime_display_ini.hardware_smooth_shading) {
+        g_runtime_opengl_draw_backend = old_opengl_draw_backend;
+        g_hd_art_enabled = old_hd_art_enabled;
+        g_hd_art_render_enabled = old_hd_art_render_enabled;
+        g_runtime_display_ini.hardware_smooth_shading = old_hardware_smooth_shading;
+        fprintf(stderr, "Menu selftest failed: OpenGL pause-menu smooth shading row was unavailable without HD art\n");
+        free_menu_assets(&assets);
+        return 1;
+      }
+      g_runtime_opengl_draw_backend = old_opengl_draw_backend;
+      g_hd_art_enabled = old_hd_art_enabled;
+      g_hd_art_render_enabled = old_hd_art_render_enabled;
+      g_runtime_display_ini.hardware_smooth_shading = old_hardware_smooth_shading;
     }
     {
       MenuImage bounds_image = hd_sample_image;
@@ -28463,6 +28637,38 @@ static bool parse_renderer_preference_name(const char *value, RuntimeRendererPre
   return false;
 }
 
+static bool parse_ini_bool_value(const char *value, bool *out_enabled) {
+  char normalized[24];
+  size_t write_index = 0u;
+  size_t read_index = 0u;
+
+  if (value == NULL || out_enabled == NULL) {
+    return false;
+  }
+  for (read_index = 0u; value[read_index] != '\0' && write_index + 1u < sizeof(normalized); ++read_index) {
+    unsigned char ch = (unsigned char)value[read_index];
+
+    if (isalnum(ch)) {
+      normalized[write_index++] = (char)tolower(ch);
+    }
+  }
+  normalized[write_index] = '\0';
+
+  if (strcmp(normalized, "1") == 0 || strcmp(normalized, "true") == 0 ||
+      strcmp(normalized, "yes") == 0 || strcmp(normalized, "on") == 0 ||
+      strcmp(normalized, "enabled") == 0) {
+    *out_enabled = true;
+    return true;
+  }
+  if (strcmp(normalized, "0") == 0 || strcmp(normalized, "false") == 0 ||
+      strcmp(normalized, "no") == 0 || strcmp(normalized, "off") == 0 ||
+      strcmp(normalized, "disabled") == 0) {
+    *out_enabled = false;
+    return true;
+  }
+  return false;
+}
+
 static void initialize_runtime_display_ini_config(RuntimeDisplayIniConfig *config) {
   if (config == NULL) {
     return;
@@ -28824,6 +29030,18 @@ static void load_runtime_display_ini(RuntimeDisplayIniConfig *config) {
       if (!set_hd_art_root(value)) {
         fprintf(stderr, "Ignoring GLOOM.INI %s=%s; expected an HD art root path\n", key, value);
       }
+    } else if (strcmp(key, "hardware_smooth_shading") == 0 ||
+               strcmp(key, "opengl_smooth_shading") == 0 ||
+               strcmp(key, "webgl_smooth_shading") == 0 ||
+               strcmp(key, "gpu_smooth_shading") == 0) {
+      bool enabled = false;
+
+      if (parse_ini_bool_value(value, &enabled)) {
+        config->hardware_smooth_shading = enabled;
+      } else {
+        fprintf(stderr, "Ignoring GLOOM.INI %s=%s; expected true/false, yes/no, on/off, or 1/0\n", key,
+                value);
+      }
     } else if (strcmp(key, "renderer") == 0 || strcmp(key, "render_backend") == 0 ||
                strcmp(key, "video_renderer") == 0) {
       RuntimeRendererPreference preference = GLOOM_RENDERER_AUTO;
@@ -28914,8 +29132,9 @@ static void log_runtime_display_config(const RuntimeDisplayIniConfig *config, in
   runtime_logf("Display config: DOS indexed software framebuffer resolution=%s framebuffer=%dx%d window=%dx%d renderer=software",
                resolution, render_width, render_height, window_width, window_height);
 #else
-  runtime_logf("Display config: software_resolution=%s hardware_resolution=%s selected=%s framebuffer=%dx%d window=%dx%d renderer=%s",
+  runtime_logf("Display config: software_resolution=%s hardware_resolution=%s hardware_smooth_shading=%s selected=%s framebuffer=%dx%d window=%dx%d renderer=%s",
                resolution, hardware_resolution,
+               config->hardware_smooth_shading ? "smooth" : "quantized",
                runtime_renderer_preference_prefers_hardware(renderer_preference) ? "hardware" : "software",
                render_width, render_height, window_width, window_height,
                runtime_renderer_preference_name(renderer_preference));

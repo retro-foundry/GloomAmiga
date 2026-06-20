@@ -59,6 +59,7 @@
          resolution=320x200
          renderer=auto
          hardware_resolution=1920x1080
+         hardware_smooth_shading=false
          viewport_size=160x100
          viewport_pixel_size=2x2
 
@@ -67,7 +68,11 @@
        opengl, or software; auto prefers OpenGL/WebGL on desktop/web and
        uses software on DOS. hardware_resolution controls the OpenGL/WebGL
        internal presentation target, defaults to 1920x1080, and is stretched
-       to the window with its aspect ratio preserved.
+       to the window with its aspect ratio preserved. hardware_smooth_shading
+       defaults to false to keep the original 16-band quantized Amiga depth
+       shading; true enables optional continuous OpenGL/WebGL shading. The
+       desktop/web pause menu exposes the same option as SMOOTH SHADING,
+       though it only affects OpenGL/WebGL rendering.
        The OpenGL/WebGL path renders SD and HD floors/walls,
        sprites/effects, blood, gun, HUD, menus, red flash, and pixelate
        transitions on the GPU.
