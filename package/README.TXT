@@ -56,20 +56,23 @@
        DOS and Windows native builds also read GLOOM.INI from the game
        directory before command-line options are applied:
 
-         resolution=320x200
-         renderer=auto
-         hardware_resolution=1920x1080
-         hardware_smooth_shading=false
-         viewport_size=160x100
-         viewport_pixel_size=2x2
+          resolution=320x200
+          renderer=auto
+          fullscreen=false
+          hardware_resolution=1920x1080
+          hardware_smooth_shading=false
+          viewport_size=160x100
+          viewport_pixel_size=2x2
 
        resolution accepts the same WIDTHxHEIGHT values as --resolution and
        controls the software/DOS framebuffer size. renderer accepts auto,
        opengl, or software; auto prefers OpenGL/WebGL on desktop/web and
-       uses software on DOS. hardware_resolution controls the OpenGL/WebGL
-       internal presentation target, defaults to 1920x1080, and is stretched
-       to the window with its aspect ratio preserved. hardware_smooth_shading
-       defaults to false to keep the original 16-band quantized Amiga depth
+       uses software on DOS. fullscreen defaults to false; true starts native
+       desktop builds in fullscreen-desktop mode. hardware_resolution controls
+       the OpenGL/WebGL internal presentation target, defaults to 1920x1080,
+       and is stretched to the window with its aspect ratio preserved.
+       hardware_smooth_shading defaults to false to keep the original
+       16-band quantized Amiga depth
        shading; true enables optional continuous OpenGL/WebGL shading. The
        desktop/web pause menu exposes the same option as SMOOTH SHADING,
        though it only affects OpenGL/WebGL rendering.
@@ -80,8 +83,9 @@
        viewport_pixel_size accepts 1x1 or 2x2.
 
        GLOOM.INI controls the source-derived software framebuffer size,
-       optional hardware render target, renderer backend, viewport, HD art,
-       control-source, and keyboard settings. Windows writes the loaded
+       optional hardware render target, renderer backend, startup fullscreen,
+       viewport, HD art, control-source, and keyboard settings. Windows
+       writes the loaded
        GLOOM.INI path and final framebuffer/window size to GLOOM.LOG next
        to gloom_pc.exe.
 

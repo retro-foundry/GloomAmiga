@@ -723,6 +723,7 @@ typedef struct {
   int hardware_resolution_width;
   int hardware_resolution_height;
   bool hardware_smooth_shading;
+  bool fullscreen;
   bool has_gameplay_viewport;
   int gameplay_viewport_width;
   int gameplay_viewport_height;
@@ -1307,6 +1308,8 @@ void runtime_emscripten_install_fullscreen_listeners(void);
 void runtime_emscripten_canvas_fullscreen_toggle(void);
 void runtime_emscripten_hide_loading_overlay(void);
 static bool runtime_emscripten_consume_fullscreen_resize(void);
+static bool runtime_handle_fullscreen_key(SDL_Renderer *renderer, const SDL_Event *event);
+static bool runtime_handle_fullscreen_resize(SDL_Renderer *renderer, int render_width, int render_height);
 #ifndef GLOOM_DOS_SDL3
 static void select_aspect_720p_resolution(int *io_width, int *io_height);
 #endif
@@ -10912,9 +10915,13 @@ static int run_iff_preview(const char *path) {
   while (running) {
     SDL_Event event;
 
+    (void)runtime_handle_fullscreen_resize(renderer, (int)image.width, (int)image.height);
     while (SDL_PollEvent(&event) != 0) {
       if (event.type == SDL_QUIT) {
         running = false;
+      }
+      if (runtime_handle_fullscreen_key(renderer, &event)) {
+        continue;
       }
       if (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE) {
         running = false;
@@ -21973,11 +21980,18 @@ static int run_start_menu(RuntimeRenderer *runtime_renderer, const MenuAssets *a
     uint32_t now = SDL_GetTicks();
     const int item_count = start_menu_item_count();
 
+    if (runtime_handle_fullscreen_resize(renderer, render_width, render_height)) {
+      redraw = true;
+    }
     while (SDL_PollEvent(&event) != 0) {
       gamepad_handle_event(&event);
       if (event.type == SDL_QUIT) {
         menu_music_stop();
         return -1;
+      }
+      if (runtime_handle_fullscreen_key(renderer, &event)) {
+        redraw = true;
+        continue;
       }
       if (event.type == SDL_KEYDOWN && event.key.repeat == 0) {
         SDL_Keycode sym = event.key.keysym.sym;
@@ -22279,12 +22293,19 @@ static int run_combat_menu(RuntimeRenderer *runtime_renderer, int render_width, 
     SDL_Event event;
     uint32_t now = SDL_GetTicks();
 
+    if (runtime_handle_fullscreen_resize(renderer, render_width, render_height)) {
+      redraw = true;
+    }
     while (SDL_PollEvent(&event) != 0) {
       gamepad_handle_event(&event);
       if (event.type == SDL_QUIT) {
         free_menu_image(&image);
         free_hud_font(&font);
         return -1;
+      }
+      if (runtime_handle_fullscreen_key(renderer, &event)) {
+        redraw = true;
+        continue;
       }
       if (event.type == SDL_KEYDOWN && event.key.repeat == 0) {
         SDL_Keycode sym = event.key.keysym.sym;
@@ -22466,12 +22487,16 @@ static bool run_combat_result_screen(RuntimeRenderer *runtime_renderer, int rend
   while (running) {
     SDL_Event event;
 
+    (void)runtime_handle_fullscreen_resize(renderer, render_width, render_height);
     while (SDL_PollEvent(&event) != 0) {
       gamepad_handle_event(&event);
       if (event.type == SDL_QUIT) {
         free_menu_image(&image);
         free_hud_font(&font);
         return false;
+      }
+      if (runtime_handle_fullscreen_key(renderer, &event)) {
+        continue;
       }
       if (event.type == SDL_KEYDOWN || (runtime_menu_accepts_mouse() && event.type == SDL_MOUSEBUTTONDOWN) ||
           event.type == SDL_CONTROLLERBUTTONDOWN) {
@@ -22855,12 +22880,19 @@ static PauseMenuResult run_pause_menu(SDL_Window *window, RuntimeRenderer *runti
     }
 #endif
 
+    if (runtime_handle_fullscreen_resize(renderer, render_width, render_height)) {
+      redraw = true;
+    }
     while (SDL_PollEvent(&event) != 0) {
       gamepad_handle_event(&event);
       if (event.type == SDL_QUIT) {
         audio_pause_output(&g_audio, false, false);
         free_hud_font(&font);
         return PAUSE_MENU_QUIT;
+      }
+      if (runtime_handle_fullscreen_key(renderer, &event)) {
+        redraw = true;
+        continue;
       }
       if (event.type == SDL_KEYDOWN && event.key.repeat == 0) {
         SDL_Keycode sym = event.key.keysym.sym;
@@ -23145,12 +23177,16 @@ static bool run_completion_screen(RuntimeRenderer *runtime_renderer, const Scrip
   while (running) {
     SDL_Event event;
 
+    (void)runtime_handle_fullscreen_resize(renderer, render_width, render_height);
     while (SDL_PollEvent(&event) != 0) {
       gamepad_handle_event(&event);
       if (event.type == SDL_QUIT) {
         free_hud_font(&font);
         free_menu_image(&image);
         return false;
+      }
+      if (runtime_handle_fullscreen_key(renderer, &event)) {
+        continue;
       }
       if (event.type == SDL_KEYDOWN || (runtime_menu_accepts_mouse() && event.type == SDL_MOUSEBUTTONDOWN) ||
           event.type == SDL_CONTROLLERBUTTONDOWN) {
@@ -23424,10 +23460,14 @@ static bool run_script_intro_screen(RuntimeRenderer *runtime_renderer, const Scr
     }
     can_continue = elapsed >= minimum_seconds;
 
+    (void)runtime_handle_fullscreen_resize(renderer, render_width, render_height);
     while (SDL_PollEvent(&event) != 0) {
       gamepad_handle_event(&event);
       if (event.type == SDL_QUIT) {
         return false;
+      }
+      if (runtime_handle_fullscreen_key(renderer, &event)) {
+        continue;
       }
       if ((event.type == SDL_KEYDOWN && event.key.repeat == 0) ||
           (runtime_menu_accepts_mouse() && event.type == SDL_MOUSEBUTTONDOWN) ||
@@ -24369,12 +24409,16 @@ static int run_renderer_selftest(void) {
     return 1;
   }
   if (!input_selftest_expect(!display_config.hardware_smooth_shading,
-                             "hardware smooth shading default should preserve quantized Amiga shading")) {
+                              "hardware smooth shading default should preserve quantized Amiga shading")) {
+    return 1;
+  }
+  if (!input_selftest_expect(!display_config.fullscreen,
+                              "fullscreen default should start windowed")) {
     return 1;
   }
   if (!input_selftest_expect(parse_ini_bool_value("true", &parsed_bool) && parsed_bool &&
                                  parse_ini_bool_value("off", &parsed_bool) && !parsed_bool,
-                             "INI boolean parser did not accept hardware smooth shading values")) {
+                              "INI boolean parser did not accept hardware smooth shading values")) {
     return 1;
   }
   display_config.has_resolution = true;
@@ -28353,6 +28397,57 @@ static bool runtime_emscripten_consume_fullscreen_resize(void) {
 }
 #endif
 
+static bool runtime_handle_fullscreen_key(SDL_Renderer *renderer, const SDL_Event *event) {
+  if (event == NULL || event->type != SDL_KEYDOWN || event->key.keysym.sym != SDLK_F11) {
+    return false;
+  }
+  if (event->key.repeat != 0) {
+    return true;
+  }
+
+#ifdef __EMSCRIPTEN__
+  (void)renderer;
+  runtime_emscripten_canvas_fullscreen_toggle();
+  return true;
+#elif defined(GLOOM_DOS_SDL3)
+  (void)renderer;
+  return false;
+#else
+  if (renderer != NULL) {
+    SDL_Window *window = SDL_RenderGetWindow(renderer);
+
+    if (window != NULL) {
+      Uint32 flags = SDL_GetWindowFlags(window);
+
+      if ((flags & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP)) != 0u) {
+        (void)SDL_SetWindowFullscreen(window, 0);
+      } else {
+        (void)SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP);
+      }
+    }
+  }
+  return true;
+#endif
+}
+
+static bool runtime_handle_fullscreen_resize(SDL_Renderer *renderer, int render_width, int render_height) {
+#ifdef __EMSCRIPTEN__
+  if (!runtime_emscripten_consume_fullscreen_resize()) {
+    return false;
+  }
+  SDL_PumpEvents();
+  if (renderer != NULL && render_width > 0 && render_height > 0) {
+    (void)SDL_RenderSetLogicalSize(renderer, render_width, render_height);
+  }
+  return true;
+#else
+  (void)renderer;
+  (void)render_width;
+  (void)render_height;
+  return false;
+#endif
+}
+
 #ifndef GLOOM_DOS_SDL3
 static void select_aspect_720p_resolution(int *io_width, int *io_height) {
   static const int common_aspects[][2] = {{16, 9}, {16, 10}, {3, 2}, {4, 3}, {21, 9}, {32, 9}};
@@ -29042,6 +29137,18 @@ static void load_runtime_display_ini(RuntimeDisplayIniConfig *config) {
         fprintf(stderr, "Ignoring GLOOM.INI %s=%s; expected true/false, yes/no, on/off, or 1/0\n", key,
                 value);
       }
+    } else if (strcmp(key, "fullscreen") == 0 ||
+               strcmp(key, "start_fullscreen") == 0 ||
+               strcmp(key, "startup_fullscreen") == 0 ||
+               strcmp(key, "fullscreen_desktop") == 0) {
+      bool enabled = false;
+
+      if (parse_ini_bool_value(value, &enabled)) {
+        config->fullscreen = enabled;
+      } else {
+        fprintf(stderr, "Ignoring GLOOM.INI %s=%s; expected true/false, yes/no, on/off, or 1/0\n", key,
+                value);
+      }
     } else if (strcmp(key, "renderer") == 0 || strcmp(key, "render_backend") == 0 ||
                strcmp(key, "video_renderer") == 0) {
       RuntimeRendererPreference preference = GLOOM_RENDERER_AUTO;
@@ -29132,9 +29239,9 @@ static void log_runtime_display_config(const RuntimeDisplayIniConfig *config, in
   runtime_logf("Display config: DOS indexed software framebuffer resolution=%s framebuffer=%dx%d window=%dx%d renderer=software",
                resolution, render_width, render_height, window_width, window_height);
 #else
-  runtime_logf("Display config: software_resolution=%s hardware_resolution=%s hardware_smooth_shading=%s selected=%s framebuffer=%dx%d window=%dx%d renderer=%s",
+  runtime_logf("Display config: software_resolution=%s hardware_resolution=%s hardware_smooth_shading=%s fullscreen=%s selected=%s framebuffer=%dx%d window=%dx%d renderer=%s",
                resolution, hardware_resolution,
-               config->hardware_smooth_shading ? "smooth" : "quantized",
+               config->hardware_smooth_shading ? "smooth" : "quantized", config->fullscreen ? "on" : "off",
                runtime_renderer_preference_prefers_hardware(renderer_preference) ? "hardware" : "software",
                render_width, render_height, window_width, window_height,
                runtime_renderer_preference_name(renderer_preference));
@@ -30647,8 +30754,17 @@ int main(int argc, char **argv) {
   (void)SDL_SetHint(SDL_HINT_DOS_ALLOW_DIRECT_FRAMEBUFFER, "1");
 #endif
 
-  window = SDL_CreateWindow(runtime_title(), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, window_width,
-                            window_height, SDL_WINDOW_RESIZABLE);
+  {
+    Uint32 window_flags = SDL_WINDOW_RESIZABLE;
+
+#if !defined(__EMSCRIPTEN__) && !defined(GLOOM_DOS_SDL3)
+    if (g_runtime_display_ini.fullscreen) {
+      window_flags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+    }
+#endif
+    window = SDL_CreateWindow(runtime_title(), SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, window_width,
+                              window_height, window_flags);
+  }
   if (window == NULL) {
     fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
     audio_shutdown(&g_audio);
@@ -30975,11 +31091,8 @@ int main(int argc, char **argv) {
       pause_menu_requested = true;
       SDL_FlushEvent(SDL_MOUSEMOTION);
     }
-    if (runtime_emscripten_consume_fullscreen_resize()) {
-      SDL_PumpEvents();
-      (void)SDL_RenderSetLogicalSize(renderer, render_width, render_height);
-    }
 #endif
+    (void)runtime_handle_fullscreen_resize(renderer, render_width, render_height);
 
     profile_start_ms = profile_now_ms();
 #ifdef GLOOM_DOS_SDL3
@@ -30991,6 +31104,9 @@ int main(int argc, char **argv) {
         gamepad_handle_event(&event);
         if (event.type == SDL_QUIT) {
           running = false;
+        }
+        if (runtime_handle_fullscreen_key(renderer, &event)) {
+          continue;
         }
         if (event.type == SDL_KEYDOWN && event.key.repeat == 0) {
           if (event.key.keysym.sym == SDLK_ESCAPE) {
@@ -31012,17 +31128,6 @@ int main(int argc, char **argv) {
               autosave_notice_timer = 2.0;
 #endif
             }
-          } else if (event.key.keysym.sym == SDLK_F11) {
-#ifdef __EMSCRIPTEN__
-            runtime_emscripten_canvas_fullscreen_toggle();
-#else
-            Uint32 flags = SDL_GetWindowFlags(window);
-            if ((flags & (SDL_WINDOW_FULLSCREEN | SDL_WINDOW_FULLSCREEN_DESKTOP)) != 0u) {
-              (void)SDL_SetWindowFullscreen(window, 0);
-            } else {
-              (void)SDL_SetWindowFullscreen(window, SDL_WINDOW_FULLSCREEN_DESKTOP);
-            }
-#endif
           }
         }
         if (event.type == SDL_CONTROLLERBUTTONDOWN && event.cbutton.button == SDL_CONTROLLER_BUTTON_START) {
