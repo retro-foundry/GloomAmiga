@@ -23,6 +23,14 @@ $versionMajor = $versionMatch.Groups[1].Value
 $versionMinor = $versionMatch.Groups[2].Value
 $versionPatch = $versionMatch.Groups[3].Value
 
+function Assert-NativeCommandSucceeded {
+  param([string] $Description)
+
+  if ($LASTEXITCODE -ne 0) {
+    throw "$Description failed with exit code $LASTEXITCODE"
+  }
+}
+
 if (-not (Test-Path -LiteralPath (Join-Path $djgppBin 'i586-pc-msdosdjgpp-gcc.exe'))) {
   throw "Missing DJGPP compiler under $djgppBin"
 }
@@ -209,6 +217,7 @@ $2
 
 if (Test-Path -LiteralPath $sdlBuild) {
   & cmake --build $sdlBuild --config Release
+  Assert-NativeCommandSucceeded "DOS SDL3 build"
 }
 if (-not (Test-Path -LiteralPath $sdlLib)) {
   throw "Missing DOS SDL3 library $sdlLib"
@@ -336,9 +345,11 @@ try {
     -Isrc "-I$sdlInclude" "-I$xmpInclude" `
     src\main.c src\map.c src\iff.c $sdlLib $xmpLib -lm `
     -o $outExe
+  Assert-NativeCommandSucceeded "DOS Gloom compile"
 } finally {
   Pop-Location
 }
 
 & $stubEdit $outExe minstack=8M
+Assert-NativeCommandSucceeded "DOS stub edit"
 Write-Host "Built $outExe"

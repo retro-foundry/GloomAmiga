@@ -1877,6 +1877,7 @@ static bool g_hd_art_render_enabled = false;
 static char g_hd_art_root[1024];
 static char g_live_menu_frame_dump_path[1024];
 static bool g_live_menu_frame_dump_written = false;
+static DebugSprite g_runtime_debug_sprite_scratch[GLOOM_MAX_DEBUG_SPRITES];
 #ifndef GLOOM_DOS_SDL3
 static bool g_runtime_opengl_draw_backend = false;
 static bool g_runtime_gpu_direct_world_disabled = false;
@@ -2144,7 +2145,6 @@ static RuntimeGpuBloodRenderer g_runtime_gpu_blood_renderer;
 static RuntimeGpuSpriteRenderer g_runtime_gpu_sprite_renderer;
 static RuntimeGpuRedRenderer g_runtime_gpu_red_renderer;
 static RuntimeGpuPixelateRenderer g_runtime_gpu_pixelate_renderer;
-static DebugSprite g_runtime_debug_sprite_scratch[GLOOM_MAX_DEBUG_SPRITES];
 static DebugSprite g_runtime_gpu_sprites_left[GLOOM_MAX_DEBUG_SPRITES];
 static DebugSprite g_runtime_gpu_sprites_right[GLOOM_MAX_DEBUG_SPRITES];
 
@@ -29367,6 +29367,7 @@ static void log_runtime_display_config(const RuntimeDisplayIniConfig *config, in
 #endif
 }
 
+#ifndef GLOOM_DOS_SDL3
 static bool sdl_renderer_info_is_opengl(const SDL_RendererInfo *info) {
   char lower_name[64];
   size_t i = 0u;
@@ -29380,6 +29381,7 @@ static bool sdl_renderer_info_is_opengl(const SDL_RendererInfo *info) {
   lower_name[i] = '\0';
   return strstr(lower_name, "opengl") != NULL || strstr(lower_name, "gles") != NULL;
 }
+#endif
 
 /* amiga/gloom2.s drawall_/drawscene render into chunky pixels, then doc2p presents them.
    The OpenGL/WebGL option uses SDL's OpenGL-family backend for GPU-owned 2D draw
