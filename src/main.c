@@ -724,6 +724,7 @@ typedef struct {
   int hardware_resolution_height;
   bool hardware_smooth_shading;
   bool fullscreen;
+  int audio_volume_percent;
   bool has_gameplay_viewport;
   int gameplay_viewport_width;
   int gameplay_viewport_height;
@@ -1265,6 +1266,7 @@ static int control_source_gamepad_index(GloomControlSource source);
 static const char *control_source_menu_name(GloomControlSource source);
 static const char *runtime_renderer_preference_name(RuntimeRendererPreference preference);
 static bool parse_renderer_preference_name(const char *value, RuntimeRendererPreference *out_preference);
+static bool parse_ini_percent_value(const char *value, int *out_percent);
 static bool parse_ini_bool_value(const char *value, bool *out_enabled);
 static void initialize_runtime_display_ini_config(RuntimeDisplayIniConfig *config);
 static bool runtime_renderer_preference_prefers_hardware(RuntimeRendererPreference preference);
@@ -1324,6 +1326,7 @@ static void update_with_controls(AppState *state, const PlayerControls *controls
                                  const ObjectVisualSet *object_visuals);
 
 static AudioSystem g_audio;
+static int g_audio_master_volume_percent = 100;
 #if GLOOM_USE_SDL_MIXER
 static Mix_Music *g_menu_music;
 static int g_menu_music_volume_percent = 100;
@@ -4995,11 +4998,34 @@ static bool audio_load_sfx_bank(AudioSystem *audio) {
   return true;
 }
 
+static int audio_clamp_volume_percent(int percent) {
+  if (percent < 0) {
+    return 0;
+  }
+  if (percent > 100) {
+    return 100;
+  }
+  return percent;
+}
+
+static void audio_set_master_volume_percent(int percent) {
+  g_audio_master_volume_percent = audio_clamp_volume_percent(percent);
+}
+
+static float audio_master_volume_scale_float(void) {
+  return (float)g_audio_master_volume_percent / 100.0f;
+}
+
+static int audio_apply_master_volume_i32(int value) {
+  return (int)(((int64_t)value * (int64_t)g_audio_master_volume_percent) / 100);
+}
+
 static void audio_mix_sfx_float(AudioSystem *audio, Uint8 *stream, int len, bool clear_stream) {
   float *out = (float *)stream;
   int frames = len / (int)(sizeof(float) * 2u);
   int frame = 0;
   static const double pi = 3.14159265358979323846;
+  const float master_volume = audio_master_volume_scale_float();
 
   if (clear_stream) {
     memset(stream, 0, (size_t)len);
@@ -5061,8 +5087,8 @@ static void audio_mix_sfx_float(AudioSystem *audio, Uint8 *stream, int len, bool
       audio->ui_beep_remaining -= 1u;
     }
 
-    out[frame * 2] = clampf(left, -1.0f, 1.0f);
-    out[frame * 2 + 1] = clampf(right, -1.0f, 1.0f);
+    out[frame * 2] = clampf(left * master_volume, -1.0f, 1.0f);
+    out[frame * 2 + 1] = clampf(right * master_volume, -1.0f, 1.0f);
   }
 }
 
@@ -5357,6 +5383,28 @@ static void audio_dos_mix_menu_music(AudioSystem *audio, uint8_t *stream, int le
 }
 #endif
 
+static void audio_dos_apply_master_volume(AudioSystem *audio, uint8_t *stream, int len) {
+  int i = 0;
+
+  if (audio == NULL || stream == NULL || len <= 0 || g_audio_master_volume_percent >= 100) {
+    return;
+  }
+  if (audio->obtained.format == SDL_AUDIO_U8) {
+    for (i = 0; i < len; ++i) {
+      int centered = (int)stream[i] - 128;
+
+      stream[i] = audio_clamp_u8(128 + audio_apply_master_volume_i32(centered));
+    }
+  } else {
+    int16_t *samples = (int16_t *)stream;
+    int sample_count = len / (int)sizeof(int16_t);
+
+    for (i = 0; i < sample_count; ++i) {
+      samples[i] = audio_clamp_s16(audio_apply_master_volume_i32((int)samples[i]));
+    }
+  }
+}
+
 static void audio_dos_mix_device_format(AudioSystem *audio, uint8_t *stream, int len) {
   if (audio == NULL || stream == NULL || len <= 0) {
     return;
@@ -5369,6 +5417,7 @@ static void audio_dos_mix_device_format(AudioSystem *audio, uint8_t *stream, int
 #if GLOOM_USE_DOS_MENU_MUSIC
   audio_dos_mix_menu_music(audio, stream, len);
 #endif
+  audio_dos_apply_master_volume(audio, stream, len);
 }
 
 static void audio_dos_pump(AudioSystem *audio) {
@@ -5426,6 +5475,7 @@ static void audio_dos_stream_callback(void *userdata, SDL_AudioStream *stream, i
     }
 
     audio_dos_callback_s16(audio, audio->mix_buffer, bytes);
+    audio_dos_apply_master_volume(audio, audio->mix_buffer, bytes);
     if (!SDL_PutAudioStreamData(stream, audio->mix_buffer, bytes)) {
       dos_logf("DOS Sound Blaster: SDL_PutAudioStreamData failed: %s", SDL_GetError());
       break;
@@ -24367,6 +24417,7 @@ static int run_renderer_selftest(void) {
   RuntimeDisplayIniConfig display_config;
   int selected_width = 0;
   int selected_height = 0;
+  int parsed_percent = 0;
   bool parsed_bool = false;
 
   if (!input_selftest_expect(parse_renderer_preference_name("auto", &preference) &&
@@ -24416,9 +24467,19 @@ static int run_renderer_selftest(void) {
                               "fullscreen default should start windowed")) {
     return 1;
   }
+  if (!input_selftest_expect(display_config.audio_volume_percent == 100,
+                              "audio volume default should be 100 percent")) {
+    return 1;
+  }
   if (!input_selftest_expect(parse_ini_bool_value("true", &parsed_bool) && parsed_bool &&
                                  parse_ini_bool_value("off", &parsed_bool) && !parsed_bool,
                               "INI boolean parser did not accept hardware smooth shading values")) {
+    return 1;
+  }
+  if (!input_selftest_expect(parse_ini_percent_value("75%", &parsed_percent) && parsed_percent == 75 &&
+                                 parse_ini_percent_value("0", &parsed_percent) && parsed_percent == 0 &&
+                                 !parse_ini_percent_value("101", &parsed_percent),
+                              "INI volume parser did not enforce 0..100 percent")) {
     return 1;
   }
   display_config.has_resolution = true;
@@ -25183,6 +25244,7 @@ static int run_sfx_selftest(void) {
   size_t i = 0u;
 
   memset(&audio, 0, sizeof(audio));
+  audio_set_master_volume_percent(100);
   if (!audio_load_sfx_bank(&audio)) {
     return 1;
   }
@@ -25223,6 +25285,29 @@ static int run_sfx_selftest(void) {
     if (stream[0] <= 0.0f || stream[2] <= 0.0f || stream[4] != 0.0f || stream[6] != 0.0f ||
         repeat_audio.channels[0].active) {
       fprintf(stderr, "SFX selftest failed: one-shot SFX looped or held the channel after completion\n");
+      audio_free_sfx_bank(&audio);
+      return 1;
+    }
+  }
+
+  {
+    AudioSystem volume_audio;
+    int8_t fake_samples[2] = {64, 64};
+    float stream[8];
+
+    memset(&volume_audio, 0, sizeof(volume_audio));
+    memset(stream, 0, sizeof(stream));
+    volume_audio.obtained.freq = 1;
+    volume_audio.samples[GLOOM_SFX_SHOOT].loaded = true;
+    volume_audio.samples[GLOOM_SFX_SHOOT].sample_count = 2u;
+    volume_audio.samples[GLOOM_SFX_SHOOT].sample_rate = 1.0;
+    volume_audio.samples[GLOOM_SFX_SHOOT].samples = fake_samples;
+    audio_set_master_volume_percent(50);
+    audio_start_channel_locked(&volume_audio, &volume_audio.channels[0], GLOOM_SFX_SHOOT, 64, 0);
+    audio_callback(&volume_audio, (Uint8 *)stream, (int)sizeof(stream));
+    audio_set_master_volume_percent(100);
+    if (stream[0] < 0.24f || stream[0] > 0.26f) {
+      fprintf(stderr, "SFX selftest failed: master volume did not scale mixed Paula SFX output\n");
       audio_free_sfx_bank(&audio);
       return 1;
     }
@@ -28685,6 +28770,27 @@ static bool parse_ini_pixel_size_value(const char *value, int *out_width, int *o
   return true;
 }
 
+static bool parse_ini_percent_value(const char *value, int *out_percent) {
+  char *end = NULL;
+  long parsed = 0;
+
+  if (value == NULL || out_percent == NULL) {
+    return false;
+  }
+  parsed = strtol(value, &end, 10);
+  if (end == value) {
+    return false;
+  }
+  if (*end == '%') {
+    ++end;
+  }
+  if (*end != '\0' || parsed < 0 || parsed > 100) {
+    return false;
+  }
+  *out_percent = (int)parsed;
+  return true;
+}
+
 static const char *runtime_renderer_preference_name(RuntimeRendererPreference preference) {
   switch (preference) {
     case GLOOM_RENDERER_SOFTWARE:
@@ -28774,6 +28880,7 @@ static void initialize_runtime_display_ini_config(RuntimeDisplayIniConfig *confi
   config->renderer_preference = GLOOM_RENDERER_AUTO;
   config->hardware_resolution_width = DEFAULT_HARDWARE_RENDER_WIDTH;
   config->hardware_resolution_height = DEFAULT_HARDWARE_RENDER_HEIGHT;
+  config->audio_volume_percent = 100;
 }
 
 static bool runtime_renderer_preference_prefers_hardware(RuntimeRendererPreference preference) {
@@ -29149,6 +29256,17 @@ static void load_runtime_display_ini(RuntimeDisplayIniConfig *config) {
         fprintf(stderr, "Ignoring GLOOM.INI %s=%s; expected true/false, yes/no, on/off, or 1/0\n", key,
                 value);
       }
+    } else if (strcmp(key, "volume") == 0 ||
+               strcmp(key, "audio_volume") == 0 ||
+               strcmp(key, "master_volume") == 0 ||
+               strcmp(key, "sound_volume") == 0) {
+      int percent = 0;
+
+      if (parse_ini_percent_value(value, &percent)) {
+        config->audio_volume_percent = percent;
+      } else {
+        fprintf(stderr, "Ignoring GLOOM.INI %s=%s; expected 0 through 100 or 0%% through 100%%\n", key, value);
+      }
     } else if (strcmp(key, "renderer") == 0 || strcmp(key, "render_backend") == 0 ||
                strcmp(key, "video_renderer") == 0) {
       RuntimeRendererPreference preference = GLOOM_RENDERER_AUTO;
@@ -29236,12 +29354,13 @@ static void log_runtime_display_config(const RuntimeDisplayIniConfig *config, in
   runtime_logf("Display config: GLOOM.INI=%s",
                config->ini_loaded ? config->ini_path : "not found; using built-in defaults");
 #ifdef GLOOM_DOS_SDL3
-  runtime_logf("Display config: DOS indexed software framebuffer resolution=%s framebuffer=%dx%d window=%dx%d renderer=software",
-               resolution, render_width, render_height, window_width, window_height);
+  runtime_logf("Display config: DOS indexed software framebuffer resolution=%s audio_volume=%d%% framebuffer=%dx%d window=%dx%d renderer=software",
+               resolution, config->audio_volume_percent, render_width, render_height, window_width, window_height);
 #else
-  runtime_logf("Display config: software_resolution=%s hardware_resolution=%s hardware_smooth_shading=%s fullscreen=%s selected=%s framebuffer=%dx%d window=%dx%d renderer=%s",
+  runtime_logf("Display config: software_resolution=%s hardware_resolution=%s hardware_smooth_shading=%s fullscreen=%s audio_volume=%d%% selected=%s framebuffer=%dx%d window=%dx%d renderer=%s",
                resolution, hardware_resolution,
                config->hardware_smooth_shading ? "smooth" : "quantized", config->fullscreen ? "on" : "off",
+               config->audio_volume_percent,
                runtime_renderer_preference_prefers_hardware(renderer_preference) ? "hardware" : "software",
                render_width, render_height, window_width, window_height,
                runtime_renderer_preference_name(renderer_preference));
@@ -30073,6 +30192,7 @@ int main(int argc, char **argv) {
   runtime_renderer_init(&runtime_renderer);
   initialize_default_keyboard_config(&g_keyboard_config);
   load_runtime_display_ini(&g_runtime_display_ini);
+  audio_set_master_volume_percent(g_runtime_display_ini.audio_volume_percent);
   renderer_preference = g_runtime_display_ini.renderer_preference;
   if (argc > 1 && strcmp(argv[1], "--version") == 0) {
     printf("%s\n", runtime_title());

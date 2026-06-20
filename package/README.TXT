@@ -59,6 +59,7 @@
           resolution=320x200
           renderer=auto
           fullscreen=false
+          volume=100
           hardware_resolution=1920x1080
           hardware_smooth_shading=false
           viewport_size=160x100
@@ -68,12 +69,13 @@
        controls the software/DOS framebuffer size. renderer accepts auto,
        opengl, or software; auto prefers OpenGL/WebGL on desktop/web and
        uses software on DOS. fullscreen defaults to false; true starts native
-       desktop builds in fullscreen-desktop mode. hardware_resolution controls
-       the OpenGL/WebGL internal presentation target, defaults to 1920x1080,
-       and is stretched to the window with its aspect ratio preserved.
-       hardware_smooth_shading defaults to false to keep the original
-       16-band quantized Amiga depth
-       shading; true enables optional continuous OpenGL/WebGL shading. The
+       desktop builds in fullscreen-desktop mode. volume accepts 0 through
+       100 and scales original SFX, menu music, and UI beeps. hardware_resolution
+       controls the OpenGL/WebGL internal presentation target, defaults to
+       1920x1080, and is stretched to the window with its aspect ratio preserved.
+       hardware_smooth_shading defaults to false to keep the original 16-band
+       quantized Amiga depth shading; true enables optional continuous
+       OpenGL/WebGL shading. The
        desktop/web pause menu exposes the same option as SMOOTH SHADING,
        though it only affects OpenGL/WebGL rendering.
        The OpenGL/WebGL path renders SD and HD floors/walls,
@@ -84,8 +86,8 @@
 
        GLOOM.INI controls the source-derived software framebuffer size,
        optional hardware render target, renderer backend, startup fullscreen,
-       viewport, HD art, control-source, and keyboard settings. Windows
-       writes the loaded
+       master volume, viewport, HD art, control-source, and keyboard settings.
+       Windows writes the loaded
        GLOOM.INI path and final framebuffer/window size to GLOOM.LOG next
        to gloom_pc.exe.
 

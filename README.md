@@ -38,12 +38,14 @@ coordinates so presentation resolution does not change gameplay handles, scale, 
 `GLOOM.INI` controls the software framebuffer size with `resolution=WIDTHxHEIGHT`, the OpenGL/WebGL internal
 presentation target with `hardware_resolution=WIDTHxHEIGHT` (default 1920x1080),
 `hardware_smooth_shading=false|true`, startup window mode with `fullscreen=false|true`,
-`renderer=auto|opengl|software`, plus
+master audio output with `volume=0..100`, `renderer=auto|opengl|software`, plus
 optional viewport, HD art, control-source, and keyboard settings. `--renderer` overrides the INI renderer choice, and
 `--resolution`/`--window-size`/`--boot-resolution` override either configured renderer resolution.
 The OpenGL/WebGL target is rendered to the front buffer for presentation and stretched to the window with its aspect
 ratio preserved.
 On native desktop builds, `fullscreen=true` starts the SDL window in fullscreen-desktop mode; it defaults to `false`.
+`volume` defaults to `100` and scales original SFX, menu music, and PC-only UI beeps without changing source assets or
+per-effect Amiga volume values.
 The OpenGL/WebGL world renderer keeps the original 16-band quantized depth shading unless
 `hardware_smooth_shading=true` enables optional continuous presentation shading; the desktop/web pause menu exposes
 the same choice as `SMOOTH SHADING`, though it only affects OpenGL/WebGL rendering.
