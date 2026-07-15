@@ -10702,19 +10702,6 @@ static uint32_t sample_object_frame_logical_argb(const ObjectFrame *frame, float
   return sample_object_frame_argb(frame, source_x / (float)frame->width, source_y / (float)frame->height);
 }
 
-static uint32_t sample_object_frame_shader_coord_argb(const ObjectFrame *frame, float source_x, float source_y) {
-  float u = 0.0f;
-  float v = 0.0f;
-
-  if (frame == NULL || frame->width <= 0 || frame->height <= 0) {
-    return 0u;
-  }
-
-  u = frame->width > 1 ? source_x / (float)(frame->width - 1) : 0.0f;
-  v = frame->height > 1 ? source_y / (float)(frame->height - 1) : 0.0f;
-  return sample_object_frame_argb(frame, u, v);
-}
-
 static const ObjectFrame *select_object_visual_frame_number(const ObjectVisual *visual, const GloomObjectSpawn *spawn,
                                                             const AppState *state, size_t frame_number) {
   size_t rotation_count = 1u;
@@ -18714,10 +18701,10 @@ static bool runtime_renderer_prepare_gpu_drawshape_view(RuntimeRenderer *runtime
   }
 
   /*
-   * amiga/gloom2.s drawshapes clips against the represented wall-column mask before
-   * later sprites update that same mask. Until the GL path grows an FBO/depth target
-   * that can represent transparent wall columns directly, keep this source-derived
-   * prep isolated from the software framebuffer presentation path.
+   * amiga/gloom2.s drawshapes clips against represented wall-column depth. Until
+   * the GL path grows an FBO/depth target that can represent transparent wall
+   * columns directly, keep this source-derived wall-depth prep isolated from the
+   * software framebuffer presentation path.
    */
   render_wall_debug(framebuffer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals,
                     x, y, w, h, false, false, false, out_sprites, out_sprite_capacity, &sprite_count, false);
@@ -18760,33 +18747,6 @@ static bool debug_sprite_source_x_coord(const DebugSprite *sprite, const ObjectF
     *out_src_x = frame->width > 1 ? (source_x / (float)frame->width) * (float)(frame->width - 1) : 0.0f;
   } else {
     *out_src_x = frame->width > 1 ? tu * (float)(frame->width - 1) : 0.0f;
-  }
-  return true;
-}
-
-static bool debug_sprite_source_y_coord_for_pixel(const DebugSprite *sprite, const ObjectFrame *frame, int screen_y,
-                                                  float *out_src_y) {
-  float tv = 0.0f;
-
-  if (sprite == NULL || frame == NULL || out_src_y == NULL || frame->height <= 0 || sprite->screen_h <= 0.0f) {
-    return false;
-  }
-
-  tv = ((float)screen_y + 0.5f - sprite->screen_y) / sprite->screen_h;
-  if (tv < 0.0f || tv > 1.0f) {
-    return false;
-  }
-
-  if (sprite->source_pad > 0) {
-    float padded_height = (float)(frame->height + (sprite->source_pad * 2));
-    float source_y = (tv * padded_height) - (float)sprite->source_pad;
-
-    if (source_y < 0.0f || source_y >= (float)frame->height) {
-      return false;
-    }
-    *out_src_y = frame->height > 1 ? (source_y / (float)frame->height) * (float)(frame->height - 1) : 0.0f;
-  } else {
-    *out_src_y = frame->height > 1 ? tv * (float)(frame->height - 1) : 0.0f;
   }
   return true;
 }
@@ -18946,14 +18906,14 @@ static bool runtime_gpu_prepare_debug_sprite_textures(SDL_Renderer *renderer, co
 }
 
 static bool runtime_gpu_render_debug_sprites(SDL_Renderer *renderer, const DebugSprite *sprites, size_t sprite_count,
-                                             float *sprite_depth_buffer, int x, int y, int w, int h,
+                                             const float *wall_depth_buffer, int x, int y, int w, int h,
                                              int render_width, int render_height) {
   size_t i = 0u;
   double profile_start_ms = 0.0;
   bool target_y_inverted = false;
   bool ok = true;
 
-  if (renderer == NULL || sprites == NULL || sprite_depth_buffer == NULL || sprite_count == 0u || w <= 0 ||
+  if (renderer == NULL || sprites == NULL || wall_depth_buffer == NULL || sprite_count == 0u || w <= 0 ||
       h <= 0 || render_width <= 0 || render_height <= 0 ||
       !runtime_opengl_draw_backend_active()) {
     return false;
@@ -19029,55 +18989,22 @@ static bool runtime_gpu_render_debug_sprites(SDL_Renderer *renderer, const Debug
 
     for (screen_x = x0; screen_x <= x1; ++screen_x) {
       int rel_x = screen_x - x;
-      int draw_y = 0;
-      int first_y = -1;
-      int last_y = -1;
       float src_x = 0.0f;
-      float src_y = 0.0f;
-      int sx = 0;
+      float src_y0 = 0.0f;
+      float src_y1 = 0.0f;
 
-      if (rel_x < 0 || rel_x >= w || sp->depth >= sprite_depth_buffer[rel_x]) {
+      if (rel_x < 0 || rel_x >= w || sp->depth >= wall_depth_buffer[rel_x]) {
         continue;
       }
       if (!debug_sprite_source_x_coord(sp, frame, screen_x, &src_x)) {
         continue;
       }
-      sx = (int)src_x;
-      if (sx < 0 || sx >= frame->width) {
-        continue;
-      }
-
-      for (draw_y = y0; draw_y <= y1; ++draw_y) {
-        int sy = 0;
-        uint32_t argb = 0u;
-
-        if (!debug_sprite_source_y_coord_for_pixel(sp, frame, draw_y, &src_y)) {
-          continue;
-        }
-        sy = (int)src_y;
-        if (sy < 0 || sy >= frame->height) {
-          continue;
-        }
-        argb = sample_object_frame_shader_coord_argb(frame, src_x, src_y);
-        if ((argb >> 24u) == 0u) {
-          continue;
-        }
-        if (first_y < 0) {
-          first_y = draw_y;
-        }
-        last_y = draw_y;
-      }
-
-      if (first_y >= 0 && last_y >= first_y) {
-        float src_y0 = debug_sprite_source_y_coord_for_screen_position(sp, frame, (float)first_y);
-        float src_y1 = debug_sprite_source_y_coord_for_screen_position(sp, frame, (float)(last_y + 1));
-
-        if (!runtime_gpu_sprite_add_column_quad(batch, screen_x, first_y, last_y, src_x, src_y0, src_y1,
-                                                render_width, render_height, target_y_inverted)) {
-          ok = false;
-          break;
-        }
-        sprite_depth_buffer[rel_x] = sp->depth;
+      src_y0 = debug_sprite_source_y_coord_for_screen_position(sp, frame, (float)y0);
+      src_y1 = debug_sprite_source_y_coord_for_screen_position(sp, frame, (float)(y1 + 1));
+      if (!runtime_gpu_sprite_add_column_quad(batch, screen_x, y0, y1, src_x, src_y0, src_y1,
+                                              render_width, render_height, target_y_inverted)) {
+        ok = false;
+        break;
       }
     }
 
@@ -29528,7 +29455,7 @@ static void report_runtime_renderer_backend(SDL_Renderer *renderer, RuntimeRende
                  info.name, runtime_renderer_preference_name(preference), using_opengl ? "yes" : "no",
                  (info.flags & SDL_RENDERER_PRESENTVSYNC) != 0u ? "yes" : "no",
                  using_opengl ? "flats(sd+hd)/walls(sd+hd)/sprites(sd+hd)/blood/red/pixelate/menus/hud/weapon" : "no",
-                 using_opengl ? "gpu world with source drawshape mask" : "software framebuffer");
+                 using_opengl ? "gpu world with source wall-depth sprite clipping" : "software framebuffer");
   } else {
     runtime_logf("Presentation backend: software framebuffer (requested=%s)",
                  runtime_renderer_preference_name(preference));

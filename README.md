@@ -53,7 +53,8 @@ On desktop/web, the OpenGL/WebGL backend owns source-backed menu, script, pause,
 `flat` texture draws, and SD wall-column draws from original 16-band wall atlases with transparent-column alpha.
 It also draws HD floor/ceiling and wall presentation pixels from the same source-backed layout, blending PNG alpha
 over the original source texel without adding non-Amiga wall holes, draws SD and HD `drawshapes` billboards/effects
-as GPU column quads using the existing source-backed sprite layout and source-derived drawshape mask, draws represented `drawblood`
+as back-to-front GPU column quads using the existing source-backed sprite layout, sprite texture alpha, and
+represented wall-depth clipping, draws represented `drawblood`
 one-pixel splots on the GPU, and applies the original red-palette injury feedback and pixelate transition as GPU
 post-processes.
 Use `--frame-dump out.bmp --renderer software|opengl` for one-frame gameplay captures from the selected renderer.
