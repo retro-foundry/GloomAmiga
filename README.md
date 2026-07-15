@@ -47,8 +47,10 @@ On native desktop builds, `fullscreen=true` starts the SDL window in fullscreen-
 `volume` defaults to `100` and scales original SFX, menu music, and PC-only UI beeps without changing source assets or
 per-effect Amiga volume values.
 The OpenGL/WebGL world renderer keeps the original 16-band quantized depth shading unless
-`hardware_smooth_shading=true` enables optional continuous presentation shading; the desktop/web pause menu exposes
-the same choice as `SMOOTH SHADING`, though it only affects OpenGL/WebGL rendering.
+`hardware_smooth_shading=true` enables optional continuous presentation shading with the original shade ramp preserved,
+a longer hardware-only wall/billboard draw distance, and a wider scan of the original wall-grid candidates for that
+extended OpenGL/WebGL view; the desktop/web pause menu exposes the same choice as `SMOOTH SHADING`, though it only
+affects OpenGL/WebGL rendering.
 On desktop/web, the OpenGL/WebGL backend owns source-backed menu, script, pause, HUD, weapon, SD floor/ceiling
 `flat` texture draws, and SD wall-column draws from original 16-band wall atlases with transparent-column alpha.
 It also draws HD floor/ceiling and wall presentation pixels from the same source-backed layout, blending PNG alpha

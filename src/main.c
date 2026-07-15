@@ -185,6 +185,7 @@ enum {
   GLOOM_AMIGA_VIEW_ROWS = 80,
   GLOOM_AMIGA_DARK_SHIFT = 7,
   GLOOM_AMIGA_MAX_Z = 16 << GLOOM_AMIGA_DARK_SHIFT,
+  GLOOM_HARDWARE_SMOOTH_MAX_Z = 32 << GLOOM_AMIGA_DARK_SHIFT,
   GLOOM_PLAYER_EYE_Y = -110,
   GLOOM_WALL_TOP_Y = -256,
   GLOOM_WALL_BOTTOM_Y = 0,
@@ -1905,6 +1906,10 @@ static bool runtime_gpu_direct_world_active(void) {
 static bool hardware_smooth_shading_enabled(void) {
   return g_runtime_display_ini.hardware_smooth_shading && runtime_opengl_draw_backend_active();
 }
+
+static float runtime_gpu_world_far_depth(void) {
+  return hardware_smooth_shading_enabled() ? (float)GLOOM_HARDWARE_SMOOTH_MAX_Z : (float)GLOOM_AMIGA_MAX_Z;
+}
 #endif
 
 static void runtime_gpu_disable_direct_world(const char *reason) {
@@ -2074,6 +2079,7 @@ typedef struct {
   GLint uniform_view_sin;
   GLint uniform_focal;
   GLint uniform_far_depth;
+  GLint uniform_shade_far_depth;
   GLint uniform_floor_hd_enabled;
   GLint uniform_roof_hd_enabled;
   GLint uniform_floor_hd_size;
@@ -2845,6 +2851,7 @@ static bool runtime_gpu_init_flat_renderer(void) {
       "uniform float u_view_sin;\n"
       "uniform float u_focal;\n"
       "uniform float u_far_depth;\n"
+      "uniform float u_shade_far_depth;\n"
       "uniform float u_floor_hd_enabled;\n"
       "uniform float u_roof_hd_enabled;\n"
       "uniform vec2 u_floor_hd_size;\n"
@@ -2852,14 +2859,14 @@ static bool runtime_gpu_init_flat_renderer(void) {
       "uniform float u_smooth_shading;\n"
       "varying vec2 v_local;\n"
       "float gloom_quantized_shade(float depth) {\n"
-      "  float z = clamp(floor(depth), 0.0, u_far_depth - 1.0);\n"
-      "  float source_z = (u_far_depth - 1.0) - z;\n"
+      "  float z = clamp(floor(depth), 0.0, u_shade_far_depth - 1.0);\n"
+      "  float source_z = (u_shade_far_depth - 1.0) - z;\n"
       "  float bucket = floor(sqrt(max(source_z * 8.0, 0.0)) / 8.0);\n"
       "  return clamp(15.0 - bucket, 0.0, 15.0);\n"
       "}\n"
       "float gloom_smooth_shade(float depth) {\n"
-      "  float z = clamp(depth, 0.0, u_far_depth - 1.0);\n"
-      "  float source_z = (u_far_depth - 1.0) - z;\n"
+      "  float z = clamp(depth, 0.0, u_shade_far_depth - 1.0);\n"
+      "  float source_z = (u_shade_far_depth - 1.0) - z;\n"
       "  return clamp(15.0 - (sqrt(max(source_z * 8.0, 0.0)) / 8.0), 0.0, 15.0);\n"
       "}\n"
       "vec2 gloom_hd_flat_uv(float world_x, float world_z, vec2 hd_size) {\n"
@@ -2988,6 +2995,7 @@ static bool runtime_gpu_init_flat_renderer(void) {
   g_runtime_gpu_flat_renderer.uniform_view_sin = g_runtime_gl.GetUniformLocation(program, "u_view_sin");
   g_runtime_gpu_flat_renderer.uniform_focal = g_runtime_gl.GetUniformLocation(program, "u_focal");
   g_runtime_gpu_flat_renderer.uniform_far_depth = g_runtime_gl.GetUniformLocation(program, "u_far_depth");
+  g_runtime_gpu_flat_renderer.uniform_shade_far_depth = g_runtime_gl.GetUniformLocation(program, "u_shade_far_depth");
   g_runtime_gpu_flat_renderer.uniform_floor_hd_enabled = g_runtime_gl.GetUniformLocation(program, "u_floor_hd_enabled");
   g_runtime_gpu_flat_renderer.uniform_roof_hd_enabled = g_runtime_gl.GetUniformLocation(program, "u_roof_hd_enabled");
   g_runtime_gpu_flat_renderer.uniform_floor_hd_size = g_runtime_gl.GetUniformLocation(program, "u_floor_hd_size");
@@ -4429,7 +4437,8 @@ static bool runtime_gpu_render_flat_view(SDL_Renderer *renderer, const AppState 
   g_runtime_gl.Uniform1f(g_runtime_gpu_flat_renderer.uniform_view_cos, (GLfloat)view_cos);
   g_runtime_gl.Uniform1f(g_runtime_gpu_flat_renderer.uniform_view_sin, (GLfloat)view_sin);
   g_runtime_gl.Uniform1f(g_runtime_gpu_flat_renderer.uniform_focal, (GLfloat)focal);
-  g_runtime_gl.Uniform1f(g_runtime_gpu_flat_renderer.uniform_far_depth, (GLfloat)GLOOM_AMIGA_MAX_Z);
+  g_runtime_gl.Uniform1f(g_runtime_gpu_flat_renderer.uniform_far_depth, (GLfloat)runtime_gpu_world_far_depth());
+  g_runtime_gl.Uniform1f(g_runtime_gpu_flat_renderer.uniform_shade_far_depth, (GLfloat)GLOOM_AMIGA_MAX_Z);
   g_runtime_gl.Uniform1f(g_runtime_gpu_flat_renderer.uniform_floor_hd_enabled,
                          hd_art_opengl_render_enabled() && flats->floor.gpu_hd_texture_valid &&
                                  flats->floor.gpu_hd_texture != 0u
@@ -14577,20 +14586,25 @@ static uint8_t amiga_depth_dark_index(float depth) {
 }
 
 #ifndef GLOOM_DOS_SDL3
-static float amiga_depth_smooth_shade(float depth) {
+static float amiga_depth_smooth_shade(float depth, float far_depth) {
   float z = depth;
+  float max_z = far_depth - 1.0f;
   float source_z = 0.0f;
   float shade = 0.0f;
 
+  if (far_depth < 2.0f) {
+    far_depth = (float)GLOOM_AMIGA_MAX_Z;
+    max_z = far_depth - 1.0f;
+  }
   if (z < 0.0f) {
     z = 0.0f;
   }
-  if (z > (float)(GLOOM_AMIGA_MAX_Z - 1)) {
-    z = (float)(GLOOM_AMIGA_MAX_Z - 1);
+  if (z > max_z) {
+    z = max_z;
   }
 
   /* Optional hardware presentation variant of amiga/gloom2.s:initdarktable without 16-band quantization. */
-  source_z = (float)(GLOOM_AMIGA_MAX_Z - 1) - z;
+  source_z = max_z - z;
   shade = 15.0f - (SDL_sqrtf(source_z * 8.0f) / 8.0f);
   if (shade < 0.0f) shade = 0.0f;
   if (shade > 15.0f) shade = 15.0f;
@@ -14901,6 +14915,82 @@ static bool append_wall_candidate_unique(const GloomMap *map, WallCandidate *can
   *candidate_count += 1u;
   return true;
 }
+
+#ifndef GLOOM_DOS_SDL3
+static size_t collect_wall_candidates_from_grid_radius(const GloomMap *map, float cam_x, float cam_z,
+                                                       float far_depth, WallCandidate *out_candidates,
+                                                       size_t candidate_capacity) {
+  size_t candidate_count = 0u;
+  int base_x = 0;
+  int base_z = 0;
+  int radius_cells = 0;
+  int gz = 0;
+
+  if (map == NULL || out_candidates == NULL || candidate_capacity == 0u || !map->has_grid_cells ||
+      map->ppnt_blob == NULL || map->ppnt_blob_size < 2u || map->zone_count > (size_t)GLOOM_MAX_RENDER_ZONES ||
+      cam_x < 0.0f || cam_z < 0.0f) {
+    return 0u;
+  }
+
+  base_x = (int)cam_x >> 8;
+  base_z = (int)cam_z >> 8;
+  if (base_x < 0 || base_x >= GLOOM_GRID_WIDTH || base_z < 0 || base_z >= GLOOM_GRID_HEIGHT) {
+    return 0u;
+  }
+
+  if (far_depth < 1.0f) {
+    far_depth = (float)GLOOM_AMIGA_MAX_Z;
+  }
+  radius_cells = ((int)SDL_ceilf(far_depth / 256.0f)) + 1;
+  if (radius_cells < 1) {
+    radius_cells = 1;
+  }
+
+  for (gz = base_z - radius_cells; gz <= base_z + radius_cells; ++gz) {
+    int gx = 0;
+
+    if (gz < 0 || gz >= GLOOM_GRID_HEIGHT) {
+      continue;
+    }
+
+    for (gx = base_x - radius_cells; gx <= base_x + radius_cells; ++gx) {
+      size_t cell_index = 0u;
+      const GloomGridCell *cell = NULL;
+      size_t poly_count = 0u;
+      size_t poly_index = 0u;
+
+      if (gx < 0 || gx >= GLOOM_GRID_WIDTH) {
+        continue;
+      }
+
+      cell_index = (size_t)gz * (size_t)GLOOM_GRID_WIDTH + (size_t)gx;
+      cell = &map->wall_grid[cell_index];
+      if (cell->count_minus_one < 0) {
+        continue;
+      }
+
+      poly_count = (size_t)cell->count_minus_one + 1u;
+      if (((size_t)cell->ppnt_word_offset + poly_count) * 2u > map->ppnt_blob_size) {
+        continue;
+      }
+
+      for (poly_index = 0u; poly_index < poly_count; ++poly_index) {
+        size_t word_offset = (size_t)cell->ppnt_word_offset + poly_index;
+        size_t zone_index = (size_t)main_read_be16(map->ppnt_blob + (word_offset * 2u));
+
+        if (!append_wall_candidate_unique(map, out_candidates, &candidate_count, candidate_capacity,
+                                          zone_index, cam_x, cam_z)) {
+          sort_wall_candidates(out_candidates, candidate_count);
+          return candidate_count;
+        }
+      }
+    }
+  }
+
+  sort_wall_candidates(out_candidates, candidate_count);
+  return candidate_count;
+}
+#endif
 
 static void append_runtime_rotpoly_wall_candidates(const AppState *state, WallCandidate *candidates,
                                                    size_t *candidate_count, size_t candidate_capacity, float cam_x,
@@ -16808,7 +16898,7 @@ static bool runtime_gpu_render_wall_view(SDL_Renderer *renderer, const AppState 
   float view_cos = 0.0f;
   float view_sin = 0.0f;
   float focal = 0.0f;
-  float far_depth = (float)GLOOM_AMIGA_MAX_Z;
+  float far_depth = runtime_gpu_world_far_depth();
   int horizon_y = y + (h / 2);
   WallCandidate wall_candidates[GLOOM_MAX_WALL_CANDIDATES];
   SceneWall scene_walls[GLOOM_MAX_WALL_CANDIDATES];
@@ -16819,6 +16909,7 @@ static bool runtime_gpu_render_wall_view(SDL_Renderer *renderer, const AppState 
   double profile_start_ms = 0.0;
   double profile_phase_start_ms = 0.0;
   bool target_y_inverted = false;
+  bool use_extended_grid_candidates = hardware_smooth_shading_enabled();
   bool ok = true;
 
   if (renderer == NULL || state == NULL || grid_offsets == NULL || wall_textures == NULL ||
@@ -16843,9 +16934,15 @@ static bool runtime_gpu_render_wall_view(SDL_Renderer *renderer, const AppState 
   target_y_inverted = runtime_gpu_direct_draw_target_y_is_inverted(renderer);
 
   profile_phase_start_ms = profile_now_ms();
-  wall_candidate_count =
-      collect_wall_candidates_from_grid(&state->map, grid_offsets, cam_x, cam_z, wall_candidates,
-                                        sizeof(wall_candidates) / sizeof(wall_candidates[0]));
+  if (use_extended_grid_candidates) {
+    wall_candidate_count =
+        collect_wall_candidates_from_grid_radius(&state->map, cam_x, cam_z, far_depth, wall_candidates,
+                                                 sizeof(wall_candidates) / sizeof(wall_candidates[0]));
+  } else {
+    wall_candidate_count =
+        collect_wall_candidates_from_grid(&state->map, grid_offsets, cam_x, cam_z, wall_candidates,
+                                          sizeof(wall_candidates) / sizeof(wall_candidates[0]));
+  }
   append_runtime_rotpoly_wall_candidates(state, wall_candidates, &wall_candidate_count,
                                          sizeof(wall_candidates) / sizeof(wall_candidates[0]), cam_x, cam_z);
   sort_wall_candidates(wall_candidates, wall_candidate_count);
@@ -17015,7 +17112,9 @@ static bool runtime_gpu_render_wall_view(SDL_Renderer *renderer, const AppState 
       }
 
       shade_subtract =
-          ((hardware_smooth_shading_enabled() ? amiga_depth_smooth_shade(hit->depth) : (float)dark_index) *
+          ((hardware_smooth_shading_enabled()
+                ? amiga_depth_smooth_shade(hit->depth, (float)GLOOM_AMIGA_MAX_Z)
+                : (float)dark_index) *
            17.0f) /
           255.0f;
       zone_wall_texture_coordinates(zone, hit->wall_u, &tile_index, &local_u, &texture_x);
@@ -17631,7 +17730,7 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
                               const ObjectVisualSet *object_visuals, const WeaponVisualSet *weapon_visuals, int x,
                               int y, int w, int h, bool draw_flats, bool draw_walls, bool draw_blood,
                               DebugSprite *out_sprites, size_t out_sprite_capacity, size_t *out_sprite_count,
-                              bool draw_sprites) {
+                              bool draw_sprites, float far_depth, bool use_extended_grid_candidates) {
   float near_plane = 1.0f;
   float view_angle = state->camera_angle;
   float cam_x = state->camera_x;
@@ -17640,7 +17739,6 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
   float view_sin = SDL_sinf(view_angle);
   float focal = projection_focal_for_viewport(w, h);
   float frustum_ratio = ((float)w * 0.5f) / focal;
-  float far_depth = (float)GLOOM_AMIGA_MAX_Z;
 #ifdef GLOOM_DOS_SDL3
   int32_t *depth_buffer_int = NULL;
   int32_t *sprite_depth_buffer_int = NULL;
@@ -17670,6 +17768,13 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
     *out_sprite_count = 0u;
   }
 
+  if (far_depth < 2.0f) {
+    far_depth = (float)GLOOM_AMIGA_MAX_Z;
+  }
+#ifdef GLOOM_DOS_SDL3
+  (void)use_extended_grid_candidates;
+#endif
+
   if (w <= 0 || h <= 0) {
     return;
   }
@@ -17696,9 +17801,18 @@ static void render_wall_debug(RenderFramebuffer *framebuffer, const AppState *st
   }
   memset(debug_sprites, 0, (size_t)GLOOM_MAX_DEBUG_SPRITES * sizeof(*debug_sprites));
 
-  wall_candidate_count =
-      collect_wall_candidates_from_grid(&state->map, grid_offsets, cam_x, cam_z, wall_candidates,
-                                        sizeof(wall_candidates) / sizeof(wall_candidates[0]));
+#ifndef GLOOM_DOS_SDL3
+  if (use_extended_grid_candidates) {
+    wall_candidate_count =
+        collect_wall_candidates_from_grid_radius(&state->map, cam_x, cam_z, far_depth, wall_candidates,
+                                                 sizeof(wall_candidates) / sizeof(wall_candidates[0]));
+  } else
+#endif
+  {
+    wall_candidate_count =
+        collect_wall_candidates_from_grid(&state->map, grid_offsets, cam_x, cam_z, wall_candidates,
+                                          sizeof(wall_candidates) / sizeof(wall_candidates[0]));
+  }
   append_runtime_rotpoly_wall_candidates(state, wall_candidates, &wall_candidate_count,
                                          sizeof(wall_candidates) / sizeof(wall_candidates[0]), cam_x, cam_z);
   if (g_profiler.enabled) {
@@ -18707,7 +18821,8 @@ static bool runtime_renderer_prepare_gpu_drawshape_view(RuntimeRenderer *runtime
    * software framebuffer presentation path.
    */
   render_wall_debug(framebuffer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals,
-                    x, y, w, h, false, false, false, out_sprites, out_sprite_capacity, &sprite_count, false);
+                    x, y, w, h, false, false, false, out_sprites, out_sprite_capacity, &sprite_count, false,
+                    runtime_gpu_world_far_depth(), hardware_smooth_shading_enabled());
   if (out_sprite_count != NULL) {
     *out_sprite_count = sprite_count;
   }
@@ -19695,7 +19810,7 @@ static void render_scene_contents(RenderFramebuffer *framebuffer, const AppState
   double profile_start_ms = 0.0;
 
   render_wall_debug(framebuffer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals, x, y,
-                    w, h, true, true, true, NULL, 0u, NULL, true);
+                    w, h, true, true, true, NULL, 0u, NULL, true, (float)GLOOM_AMIGA_MAX_Z, false);
   profile_start_ms = profile_now_ms();
   render_player_weapon(framebuffer, state, weapon_visuals, x, y, w, h);
   profile_add_elapsed(&g_profiler.render_weapon_ms, profile_start_ms);
@@ -19733,15 +19848,18 @@ static bool render_source_world_for_gpu_overlay(RenderFramebuffer *framebuffer, 
 
     capture_primary_player_state(state, &player1_state);
     render_wall_debug(framebuffer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals,
-                      0, 0, left_w, render_height, true, true, true, NULL, 0u, NULL, true);
+                      0, 0, left_w, render_height, true, true, true, NULL, 0u, NULL, true,
+                      (float)GLOOM_AMIGA_MAX_Z, false);
     apply_primary_player_state(&player2_state, &state->player2);
     player2_state.player2 = player1_state;
     player2_state.active_player_index = 1u;
     render_wall_debug(framebuffer, &player2_state, grid_offsets, wall_textures, flat_textures, object_visuals,
-                      weapon_visuals, left_w, 0, right_w, render_height, true, true, true, NULL, 0u, NULL, true);
+                      weapon_visuals, left_w, 0, right_w, render_height, true, true, true, NULL, 0u, NULL, true,
+                      (float)GLOOM_AMIGA_MAX_Z, false);
   } else {
     render_wall_debug(framebuffer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals,
-                      0, 0, render_width, render_height, true, true, true, NULL, 0u, NULL, true);
+                      0, 0, render_width, render_height, true, true, true, NULL, 0u, NULL, true,
+                      (float)GLOOM_AMIGA_MAX_Z, false);
   }
 
   end_render_framebuffer(framebuffer);
@@ -23798,7 +23916,8 @@ static void render(RuntimeRenderer *runtime_renderer, const AppState *state, con
       render_wall_debug(framebuffer, state, grid_offsets, wall_textures, flat_textures, object_visuals, weapon_visuals,
                         0, 0, left_w, gameplay_viewport.source_height, !use_gpu_world_flats,
                         !use_gpu_world_walls, !use_gpu_world_blood, gpu_sprites_left,
-                        GLOOM_MAX_DEBUG_SPRITES, &gpu_sprite_count_left, !use_gpu_world_sprites);
+                        GLOOM_MAX_DEBUG_SPRITES, &gpu_sprite_count_left, !use_gpu_world_sprites,
+                        (float)GLOOM_AMIGA_MAX_Z, false);
       if (use_gpu_world_sprites && framebuffer->gpu_sprite_depth_buffer != NULL && left_w > 0) {
         memcpy(framebuffer->gpu_sprite_depth_buffer, framebuffer->sprite_depth_buffer,
                (size_t)left_w * sizeof(*framebuffer->gpu_sprite_depth_buffer));
@@ -23827,7 +23946,7 @@ static void render(RuntimeRenderer *runtime_renderer, const AppState *state, con
                         weapon_visuals, left_w, 0, right_w, gameplay_viewport.source_height,
                         !use_gpu_world_flats, !use_gpu_world_walls, !use_gpu_world_blood,
                         gpu_sprites_right, GLOOM_MAX_DEBUG_SPRITES, &gpu_sprite_count_right,
-                        !use_gpu_world_sprites);
+                        !use_gpu_world_sprites, (float)GLOOM_AMIGA_MAX_Z, false);
       if (use_gpu_world_sprites) {
         gpu_sprite_right_active = true;
       }
@@ -23852,7 +23971,7 @@ static void render(RuntimeRenderer *runtime_renderer, const AppState *state, con
                         0, 0, gameplay_viewport.source_width, gameplay_viewport.source_height,
                         !use_gpu_world_flats, !use_gpu_world_walls, !use_gpu_world_blood,
                         gpu_sprites_left, GLOOM_MAX_DEBUG_SPRITES, &gpu_sprite_count_left,
-                        !use_gpu_world_sprites);
+                        !use_gpu_world_sprites, (float)GLOOM_AMIGA_MAX_Z, false);
       if (use_gpu_world_sprites && framebuffer->gpu_sprite_depth_buffer != NULL &&
           gameplay_viewport.source_width > 0) {
         memcpy(framebuffer->gpu_sprite_depth_buffer, framebuffer->sprite_depth_buffer,
@@ -24438,6 +24557,48 @@ static int run_renderer_selftest(void) {
                                  selected_width == 1920 && selected_height == 1080,
                              "auto renderer did not select the default hardware resolution")) {
     return 1;
+  }
+  {
+    bool old_opengl_draw_backend = g_runtime_opengl_draw_backend;
+    bool old_hardware_smooth_shading = g_runtime_display_ini.hardware_smooth_shading;
+    bool far_depth_ok = true;
+    float smooth_near_shade = 0.0f;
+    float smooth_old_cutoff_shade = 0.0f;
+    float smooth_extended_depth_shade = 0.0f;
+
+    g_runtime_opengl_draw_backend = true;
+    g_runtime_display_ini.hardware_smooth_shading = false;
+    if (!input_selftest_expect(runtime_gpu_world_far_depth() == (float)GLOOM_AMIGA_MAX_Z,
+                               "quantized OpenGL renderer changed the Amiga maxz cutoff")) {
+      far_depth_ok = false;
+    }
+
+    g_runtime_display_ini.hardware_smooth_shading = true;
+    smooth_near_shade = amiga_depth_smooth_shade(1.0f, (float)GLOOM_AMIGA_MAX_Z);
+    smooth_old_cutoff_shade = amiga_depth_smooth_shade((float)GLOOM_AMIGA_MAX_Z, (float)GLOOM_AMIGA_MAX_Z);
+    smooth_extended_depth_shade =
+        amiga_depth_smooth_shade((float)(GLOOM_HARDWARE_SMOOTH_MAX_Z - 1), (float)GLOOM_AMIGA_MAX_Z);
+    if (!input_selftest_expect(runtime_gpu_world_far_depth() == (float)GLOOM_HARDWARE_SMOOTH_MAX_Z,
+                               "smooth OpenGL renderer did not extend the hardware presentation maxz cutoff")) {
+      far_depth_ok = false;
+    }
+    if (!input_selftest_expect(smooth_near_shade < 1.0f && smooth_old_cutoff_shade > 14.9f &&
+                                   smooth_extended_depth_shade > 14.9f,
+                               "smooth OpenGL fade did not preserve the Amiga maxz shade ramp")) {
+      far_depth_ok = false;
+    }
+
+    g_runtime_opengl_draw_backend = false;
+    if (!input_selftest_expect(runtime_gpu_world_far_depth() == (float)GLOOM_AMIGA_MAX_Z,
+                               "smooth shading changed maxz outside the OpenGL backend")) {
+      far_depth_ok = false;
+    }
+
+    g_runtime_opengl_draw_backend = old_opengl_draw_backend;
+    g_runtime_display_ini.hardware_smooth_shading = old_hardware_smooth_shading;
+    if (!far_depth_ok) {
+      return 1;
+    }
   }
 #else
   if (!input_selftest_expect(select_configured_runtime_resolution(&display_config, GLOOM_RENDERER_OPENGL, false,
@@ -26500,6 +26661,66 @@ static int run_wall_selftest(void) {
       return 1;
     }
   }
+#ifndef GLOOM_DOS_SDL3
+  {
+    uint8_t ppnt_blob[6] = {0, 0, 0, 1, 0, 3};
+    bool found_far_zone = false;
+    size_t grid_index = 0u;
+
+    memset(zones, 0, sizeof(zones));
+    memset(candidates, 0, sizeof(candidates));
+    state.map.zones = zones;
+    state.map.zone_count = 4u;
+    state.map.has_grid_cells = true;
+    state.map.ppnt_blob = ppnt_blob;
+    state.map.ppnt_blob_size = sizeof(ppnt_blob);
+    for (grid_index = 0u; grid_index < (size_t)GLOOM_GRID_CELL_COUNT; ++grid_index) {
+      state.map.wall_grid[grid_index].count_minus_one = -1;
+      state.map.wall_grid[grid_index].ppnt_word_offset = 0u;
+    }
+    state.map.wall_grid[0].count_minus_one = 0;
+    state.map.wall_grid[0].ppnt_word_offset = 0u;
+    state.map.wall_grid[16].count_minus_one = 1;
+    state.map.wall_grid[16].ppnt_word_offset = 1u;
+    zones[0].x1 = 0;
+    zones[0].z1 = 0;
+    zones[0].x2 = 64;
+    zones[0].z2 = 0;
+    zones[1].x1 = 4096;
+    zones[1].z1 = 0;
+    zones[1].x2 = 4160;
+    zones[1].z2 = 0;
+    zones[2].x1 = 2048;
+    zones[2].z1 = 0;
+    zones[2].x2 = 2112;
+    zones[2].z2 = 0;
+    zones[3].event_id = -1;
+
+    candidate_count = collect_wall_candidates_from_grid_radius(&state.map, 0.0f, 0.0f,
+                                                               (float)GLOOM_HARDWARE_SMOOTH_MAX_Z, candidates,
+                                                               sizeof(candidates) / sizeof(candidates[0]));
+    for (i = 0; i < (int)candidate_count; ++i) {
+      if (candidates[i].zone_index == 1u) {
+        found_far_zone = true;
+      }
+      if (candidates[i].zone_index == 2u) {
+        fprintf(stderr, "Wall selftest failed: hardware grid-radius candidates included a zone outside wall_grid\n");
+        return 1;
+      }
+      if (candidates[i].zone_index == 3u) {
+        fprintf(stderr, "Wall selftest failed: hardware grid-radius candidates included a hidden event wall\n");
+        return 1;
+      }
+    }
+    if (candidate_count != 2u || !found_far_zone) {
+      fprintf(stderr, "Wall selftest failed: hardware grid-radius candidates missed a far wall_grid zone\n");
+      return 1;
+    }
+    state.map.has_grid_cells = false;
+    state.map.ppnt_blob = NULL;
+    state.map.ppnt_blob_size = 0u;
+  }
+#endif
   initialize_wall_texture_remap(&state);
   anim.frame_count = 3u;
   anim.first_frame = 10u;
